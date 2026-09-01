@@ -118,7 +118,7 @@ you will find in most existing documentation.
 | `kickstart -k <d>/<L>` | `start <L>` | `run` (alias `runnow`) | execute the program **now**, without waiting for its trigger |
 | `kill <sig> <d>/<L>` | `stop <L>` | `kill [SIG]` | signal the running process — a KeepAlive service comes straight back |
 | — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
-| — | — | `delete` | stop it and move its plist to a dated backup (always confirms) |
+| — | — | `delete` | stop it, disable it, and move its plist to a dated backup (always confirms) |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
 Three levels of permanence: `kill` touches the **process** only ·
@@ -223,6 +223,10 @@ a way to learn the raw commands.
   is *not* the default — a daemon that runs as root and an agent that runs
   as its session user say nothing, but `run 2d1h as _www` tells you the
   plist set `UserName`. `-V` shows it always.
+- **The plan before a destructive action is in plain words**, one bullet per
+  step, not launchctl's vocabulary — `- stop it`, `- disable it, so it stays
+  off even if its plist comes back`. `-V` adds the exact `launchctl` line
+  underneath for anyone who wants it.
 - **Every mutating command narrates itself** — `* stopping X ... done` —
   and a step already in the wanted state says `* X is already stopped`
   rather than pretending it did something. `-Q` silences the narration;

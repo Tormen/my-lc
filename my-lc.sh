@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="78a1858"
+SCRIPT_COMMIT="ce979c4"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1473,6 +1473,15 @@ v_delete() {
     msgn "stopping $_label ..."; [ "$VRB" = 1 ] && printf '\n'
     if lc bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
   fi
+  # Disable as well as remove: if whatever installed this plist puts it back
+  # - an app re-blessing its helper, say - the flag keeps the service off,
+  # which removing the file alone would not.
+  case "$_state" in
+    off|@off) ;;
+    *) msgn "disabling $_label ..."; [ "$VRB" = 1 ] && printf '\n'
+       det "so it stays off even if its plist is reinstalled later"
+       if lc disable "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi ;;
+  esac
   if ensure_state_dir && mkdir -p "$STATE_DIR/deleted" 2>/dev/null; then
     _bk="$STATE_DIR/deleted/$_label.plist.$(date '+%Y%m%d-%H%M%S')"
     msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
@@ -1485,9 +1494,7 @@ v_delete() {
     msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
     if run rm -f "$_plist"; then step_ok; else step_fail 'could not remove the plist (needs root?)'; fi
   fi
-  case "$_state" in
-    off|@off) msg "note: $_label stays listed as disabled in the override database" ;;
-  esac
+  msg "$_label is now stopped, disabled, and its plist is out of the way"
 }
 
 # Open the plist in the user's editor, then check what came back.
@@ -1911,8 +1918,15 @@ do_action() {
     if [ "$_n" = 1 ]; then printf 'this would %s 1 service:\n\n' "$VERB"
     else                   printf 'this would %s %s services:\n\n' "$VERB" "$_n"; fi
     while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of; do
-      printf '  %-46s %s\n' "$_l" "$(plan_line "$_l" "$_d" "$_p" "$_st")"
+      printf '  %s%s%s\n' "$C_HDR" "$_l" "$C_OFF"
+      plan_steps | sed 's/^/      /'
+      case "$VERB" in
+        delete|edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '        %s\n' "$_p" ;;
+      esac
+      [ "$VRB" = 1 ] && printf '      %s%s%s\n' "$C_DIM" "$(plan_raw "$_l" "$_d" "$_p")" "$C_OFF"
+      printf '\n'
     done < "$_sel"
+    :
     printf '\nadd --go to carry it out, or type go: '
     if [ -t 0 ]; then read -r _ans; else _ans=; fi
     [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
@@ -1932,19 +1946,44 @@ do_action() {
   done < "$_sel"
 }
 
-plan_line() {
+# What the action will DO, one bullet per step, in plain words. The plan is
+# the last thing shown before something irreversible, so it is no place for
+# launchctl's vocabulary - that is what -V is for.
+plan_steps() {
+  case "$VERB" in
+    start)   printf -- '- start it in this boot session\n' ;;
+    stop)    printf -- '- stop it, and leave it stopped until the next reboot\n' ;;
+    restart) printf -- '- stop it\n- start it again\n' ;;
+    run)     printf -- '- run its program now, without waiting for its trigger\n' ;;
+    kill)    printf -- '- send SIG%s to the running process\n' "$KILLSIG" ;;
+    enable)  printf -- '- arm it to run at every boot from now on\n'
+             [ "$NOW" = 1 ] && printf -- '- start it now as well\n'
+             [ "$NOW" = 1 ] || printf -- '  (it is NOT started now; add --now for that)\n' ;;
+    disable) [ "$NOW" = 1 ] && printf -- '- stop it now\n'
+             printf -- '- stop it coming back at any future boot\n'
+             [ "$NOW" = 1 ] || printf -- '  (it keeps running for now; add --now to stop it too)\n' ;;
+    delete)  printf -- '- stop it\n'
+             printf -- '- disable it, so it stays off even if its plist comes back\n'
+             printf -- '- move its plist to a dated backup:\n' ;;
+    edit)    printf -- '- open its plist in the editor\n' ;;
+  esac
+}
+
+# The literal launchctl commands, shown only under -V, for anyone who wants
+# to know exactly what is about to run.
+plan_raw() {
   case "$VERB" in
     start)   printf 'launchctl bootstrap %s %s' "$2" "$3" ;;
     stop)    printf 'launchctl bootout %s/%s' "$2" "$1" ;;
-    restart) printf 'launchctl bootout + bootstrap %s' "$2" ;;
+    restart) printf 'launchctl bootout %s/%s ; bootstrap %s %s' "$2" "$1" "$2" "$3" ;;
     run)     printf 'launchctl kickstart -k %s/%s' "$2" "$1" ;;
     kill)    printf 'launchctl kill %s %s/%s' "$KILLSIG" "$2" "$1" ;;
-    enable)  [ "$NOW" = 1 ] && printf 'launchctl enable %s/%s + bootstrap' "$2" "$1" \
-                            || printf 'launchctl enable %s/%s' "$2" "$1" ;;
-    disable) [ "$NOW" = 1 ] && printf 'launchctl bootout + disable %s/%s' "$2" "$1" \
-                            || printf 'launchctl disable %s/%s' "$2" "$1" ;;
-    delete)  printf 'bootout %s/%s, then move %s away' "$2" "$1" "$3" ;;
-    edit)    printf 'open %s in an editor' "$3" ;;
+    enable)  if [ "$NOW" = 1 ]; then printf 'launchctl enable %s/%s ; bootstrap %s %s' "$2" "$1" "$2" "$3"
+             else printf 'launchctl enable %s/%s' "$2" "$1"; fi ;;
+    disable) if [ "$NOW" = 1 ]; then printf 'launchctl bootout %s/%s ; disable %s/%s' "$2" "$1" "$2" "$1"
+             else printf 'launchctl disable %s/%s' "$2" "$1"; fi ;;
+    delete)  printf 'launchctl bootout %s/%s ; disable %s/%s ; mv %s' "$2" "$1" "$2" "$1" "$3" ;;
+    edit)    printf '%s %s' "${EDITOR_CMD:-${VISUAL:-${EDITOR:-vi}}}" "$3" ;;
   esac
 }
 
@@ -2477,6 +2516,18 @@ t_editdelete() {
   _o=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" delete < /dev/null 2>&1)
   case "$_o" in *'this would delete 1 service:'*) t_ok 'delete confirms even for one service' ;;
     *) t_no 'delete confirmation' 'this would delete 1 service:' "$_o" ;; esac
+  # the plan must be in plain words, not launchctl's vocabulary
+  case "$_o" in
+    *bootout*|*kickstart*|*"gui/"*|*"system/"*)
+      t_no 'the plan avoids launchctl jargon' 'plain words' "$_o" ;;
+    *) t_ok 'the plan is in plain words, not launchctl terms' ;;
+  esac
+  case "$_o" in *'- stop it'*'- disable it'*) t_ok 'the plan lists each step as a bullet' ;;
+    *) t_no 'plan bullets' 'one bullet per step' "$_o" ;; esac
+  # ...and -V still exposes the exact commands
+  _ov=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf -V "$_lab" delete < /dev/null 2>&1)
+  case "$_ov" in *'launchctl bootout'*) t_ok '-V still shows the exact launchctl commands' ;;
+    *) t_no '-V shows raw commands' 'launchctl bootout ...' "$_ov" ;; esac
   if [ -f "$_ed/$_lab.plist" ]; then t_ok 'delete without go removes nothing'
   else t_no 'delete without go is a no-op' 'the plist still there' 'it was deleted'; fi
 
@@ -2487,6 +2538,11 @@ t_editdelete() {
   if ls "$_ed"/st/deleted/"$_lab".plist.* >/dev/null 2>&1; then
     t_ok 'delete keeps a dated backup, so it can be undone'
   else t_no 'delete backs up the plist' 'a file under st/deleted/' 'no backup found'; fi
+  # delete must DISABLE as well as remove, so a reinstalled plist stays off
+  if launchctl print-disabled "$DOMAIN" 2>/dev/null \
+     | awk -F'"' '/=> *disabled/ { print $2 }' | grep -qxF "$_lab"; then
+    t_ok 'delete leaves the service disabled, not merely removed'
+  else t_no 'delete disables too' "$_lab listed as disabled" 'it is not disabled'; fi
   cleanup_fixtures
 }
 
