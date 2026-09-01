@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0c67163"
+SCRIPT_COMMIT="55a4499"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -53,6 +53,7 @@ DAEMON_DIRS="/Library/LaunchDaemons /System/Library/LaunchDaemons"
 AGENT_DIRS=
 STATE_DIR=
 ERR_TAIL=10
+BIG_DELTA=1048576
 WIDTH_LABEL=auto
 COLOR=auto
 
@@ -246,6 +247,50 @@ setup_color() {
 # column that had to be self-explanatory into noise.
 state_render() { printf '%s' "$1"; }
 
+# What an exit code MEANS. A bare 'FAIL 78' makes the reader go and look it
+# up, which is the same failure as launchctl's numeric errors. 64-78 are the
+# sysexits.h conventions, 128+N is death by signal N.
+#   $2 = 'short' for the table, anything else for the record view
+exit_meaning() {
+  case "$1" in
+    1)   _em='general error' ;;
+    2)   _em='misuse of a shell builtin' ;;
+    64)  _em='usage error'            ; _el='EX_USAGE: the command line was wrong' ;;
+    65)  _em='data error'             ; _el='EX_DATAERR: the input data was wrong' ;;
+    66)  _em='no input'               ; _el='EX_NOINPUT: an input file was missing or unreadable' ;;
+    67)  _em='no such user'           ; _el='EX_NOUSER' ;;
+    68)  _em='no such host'           ; _el='EX_NOHOST' ;;
+    69)  _em='unavailable'            ; _el='EX_UNAVAILABLE: a service it needed was not available' ;;
+    70)  _em='internal error'         ; _el='EX_SOFTWARE: an internal software error' ;;
+    71)  _em='OS error'               ; _el='EX_OSERR: an operating-system error, e.g. a failed kext load' ;;
+    72)  _em='missing system file'    ; _el='EX_OSFILE' ;;
+    73)  _em='cannot create'          ; _el='EX_CANTCREAT: an output file could not be created' ;;
+    74)  _em='I/O error'              ; _el='EX_IOERR' ;;
+    75)  _em='temporary failure'      ; _el='EX_TEMPFAIL: retrying later may work' ;;
+    76)  _em='protocol error'         ; _el='EX_PROTOCOL' ;;
+    77)  _em='permission denied'      ; _el='EX_NOPERM' ;;
+    78)  _em='config error'           ; _el='EX_CONFIG: the program rejected its own configuration' ;;
+    126) _em='not executable'         ; _el='found, but not executable' ;;
+    127) _em='not found'              ; _el='the program was not found - check the plist path' ;;
+    129) _em='killed: HUP'  ;; 130) _em='killed: INT'  ;; 131) _em='killed: QUIT' ;;
+    134) _em='killed: ABRT' ;; 137) _em='killed: KILL' ;; 139) _em='killed: SEGV' ;;
+    141) _em='killed: PIPE' ;; 143) _em='killed: TERM' ;;
+    *)   _em= ;;
+  esac
+  [ -n "${_el:-}" ] && [ "$2" != short ] && { printf '%s' "$_el"; _el=; return 0; }
+  _el=
+  printf '%s' "$_em"
+}
+
+# Bytes as a compact human size, for deltas too large to count by line.
+human_size() {
+  _hs=$1
+  if   [ "$_hs" -ge 1073741824 ] 2>/dev/null; then printf '%s.%sGB' $((_hs/1073741824)) $(( (_hs%1073741824)*10/1073741824 ))
+  elif [ "$_hs" -ge 1048576 ]   2>/dev/null; then printf '%s.%sMB' $((_hs/1048576))    $(( (_hs%1048576)*10/1048576 ))
+  elif [ "$_hs" -ge 1024 ]      2>/dev/null; then printf '%sKB'    $((_hs/1024))
+  else printf '%sB' "$_hs"; fi
+}
+
 human_age() {
   # seconds -> compact 4d2h / 3h12m / 45m / 12s
   _ha=$1
@@ -304,6 +349,11 @@ STATE_DIR="/var/lib/mine/$(id -un)/my-lc"
 
 # Lines of stderr/stdout shown by 'status' when no watermark exists yet.
 ERR_TAIL=10
+
+# A log delta larger than this (bytes) is reported as a size rather than a
+# line count: counting lines means reading the whole thing, and a
+# crash-looping daemon can leave a gigabyte behind.
+BIG_DELTA=1048576
 
 # Label column width: 'auto' fits the widest label, or give a number.
 WIDTH_LABEL=auto
@@ -493,36 +543,61 @@ path_verdict() {
   printf 'MISSING'
 }
 
-# Worst verdict across a service's watched paths: ok | ! (missing) | ? 
-# For a watched path that exists, say WHEN it last changed - that change is
-# the event that would have fired the service - and for a directory, WHAT
-# changed, since the directory's own mtime moves when an entry appears or
-# disappears. A change newer than the service's last run is flagged: it
-# means the trigger has not (yet) been acted on.
-watch_detail() {
-  _wp=$1
-  case "$2" in ok*) ;; *) return 0 ;; esac
-  _mt=$(file_epoch "$_wp")
-  [ -n "$_mt" ] || return 0
-  _ago=$(human_age $(( $(now_epoch) - _mt )) )
-  _when=$(date -r "$_mt" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
-  printf '  %-10s   last change %s ago (%s)\n' '' "$_ago" "$_when"
-  # For a directory, name the newest entry: that is what arrived.
-  if [ -d "$_wp" ] && [ -r "$_wp" ] && [ -x "$_wp" ]; then
-    # shellcheck disable=SC2012  # newest-by-mtime; BSD find has no -printf
-    _new=$(ls -t "$_wp" 2>/dev/null | head -n 1)
-    if [ -n "$_new" ]; then
-      _nmt=$(file_epoch "$_wp/$_new")
-      if [ -n "$_nmt" ]; then
-        printf '  %-10s   newest entry: %s (%s ago)\n' '' "$_new" \
-          "$(human_age $(( $(now_epoch) - _nmt )) )"
-      else
-        printf '  %-10s   newest entry: %s\n' '' "$_new"
-      fi
-    else
-      printf '  %-10s   the directory is empty\n' ''
+# Is the program actually runnable? A missing or non-executable program is
+# precisely what produces exit 127 / 126, and launchd says nothing about it.
+# Cheap form: no forks, so the table can afford it for every service.
+#   ok | MISSING | EMPTY | NOT EXECUTABLE | ? <component>
+program_verdict() {
+  [ -n "$1" ] || { printf 'ok'; return; }
+  case "$(path_verdict "$1")" in
+    MISSING) printf 'MISSING'; return ;;
+    '?'*)    printf '%s' "$(path_verdict "$1")"; return ;;
+    'ok dir') printf 'NOT A FILE'; return ;;
+  esac
+  [ -s "$1" ] || { printf 'EMPTY'; return; }
+  [ -x "$1" ] || { printf 'NOT EXECUTABLE'; return; }
+  printf 'ok'
+}
+
+# Can USER actually reach and run it? Checked component by component, since
+# a directory the user cannot traverse makes the program unreachable however
+# permissive the file itself is. Uses stat, so this is the record-view form.
+#   ok | <reason>
+program_access() {
+  _pa=$1; _pu=$2
+  [ -n "$_pa" ] && [ -n "$_pu" ] || { printf 'ok'; return; }
+  _uid=$(id -u "$_pu" 2>/dev/null) || { printf '? no such user: %s' "$_pu"; return; }
+  [ "$_uid" = 0 ] && { printf 'ok (root)'; return; }
+  _gids=" $(id -G "$_pu" 2>/dev/null) "
+  # every parent directory must be traversable
+  _dirs=; _d=$(dirname "$_pa")
+  while [ "$_d" != / ] && [ -n "$_d" ] && [ "$_d" != . ]; do
+    _dirs="$_d
+$_dirs"
+    _d=$(dirname "$_d")
+  done
+  printf '%s\n' "$_dirs" | while IFS= read -r _c; do
+    [ -n "$_c" ] || continue
+    _st=$(stat -f '%u %g %Lp' "$_c" 2>/dev/null) || continue
+    _o=${_st%% *}; _rest=${_st#* }; _g=${_rest%% *}; _m=${_rest##* }
+    if   [ "$_o" = "$_uid" ];        then _bit=$(( (0$_m / 64) % 8 ))
+    elif case "$_gids" in *" $_g "*) true ;; *) false ;; esac
+                                     then _bit=$(( (0$_m / 8) % 8 ))
+    else                                  _bit=$((  0$_m       % 8 ))
     fi
+    [ $(( _bit % 2 )) = 1 ] || printf 'cannot traverse %s\n' "$_c"
+  done > "$TMPD/pacc" 2>/dev/null
+  if [ -s "$TMPD/pacc" ]; then head -n 1 "$TMPD/pacc" | tr -d '\n'; return; fi
+  # ...and the file itself must be executable by that user
+  _st=$(stat -f '%u %g %Lp' "$_pa" 2>/dev/null) || { printf 'ok'; return; }
+  _o=${_st%% *}; _rest=${_st#* }; _g=${_rest%% *}; _m=${_rest##* }
+  if   [ "$_o" = "$_uid" ];        then _bit=$(( (0$_m / 64) % 8 ))
+  elif case "$_gids" in *" $_g "*) true ;; *) false ;; esac
+                                   then _bit=$(( (0$_m / 8) % 8 ))
+  else                                  _bit=$((  0$_m       % 8 ))
   fi
+  if [ $(( _bit % 2 )) = 1 ]; then printf 'ok'
+  else printf 'not executable by %s' "$_pu"; fi
 }
 
 # Worst verdict across a service's watched paths: ok | ! (missing) | ?
@@ -702,7 +777,7 @@ discover_scope() {
         status = (p in start) ? ("run " age(now - start[p]) " pid " p extra) \
                               : ("run pid " p extra)
       } else if (e != "" && e != "-" && e != "0") {
-        status = "FAIL " e extra
+        status = "FAIL " e "\002" extra
       } else if (ld || st == "@off") {
         if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); status="every " iv extra }
         else if (trig ~ /cal/)   status = "cal" extra
@@ -739,6 +814,38 @@ discover_scope() {
         esac ;;
     esac
     SEEN="$SEEN$_lab "
+    # \002 marks where the exit code's meaning goes; awk cannot know it
+    case "$_su" in
+      *"$(printf '\002')"*)
+        _code=${_su#FAIL }; _code=${_code%%"$(printf '\002')"*}
+        _mn=$(exit_meaning "$_code" short)
+        if [ -n "$_mn" ]; then _su=$(printf '%s' "$_su" | sed "s/$(printf '\002')/ $_mn/")
+        else                   _su=$(printf '%s' "$_su" | sed "s/$(printf '\002')//"); fi ;;
+    esac
+    # A broken program is WHY a stopped service is stopped, so for one that
+    # is not running it is the fact worth showing. A running service proves
+    # its program works, so it is not re-checked there.
+    case "$_su" in
+      run\ *) ;;
+      *) if [ -n "$_pr" ]; then
+           _pw=
+           case "$(program_verdict "$_pr")" in
+             ok|'?'*)          ;;
+             MISSING)          _pw='program MISSING' ;;
+             EMPTY)            _pw='program EMPTY' ;;
+             'NOT EXECUTABLE') _pw='program NOT EXECUTABLE' ;;
+             'NOT A FILE')     _pw='program is a DIRECTORY' ;;
+           esac
+           if [ -n "$_pw" ]; then
+             # keep the exit code when there is one: it says HOW it died,
+             # while the program verdict says why it cannot start again
+             case "$_su" in
+               FAIL*) _su="$_su, $_pw" ;;
+               *)     _su=$_pw ;;
+             esac
+           fi
+         fi ;;
+    esac
     [ "$_ei" = '?PENDING' ] && _ei=$(log_indicator "$_ef")
     [ "$_oi" = '?PENDING' ] && _oi=$(log_indicator "$_of")
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
@@ -904,8 +1011,34 @@ render_record() {
   printf '  %-10s %s\n' 'state:'   "$(state_render "$_st")  $(state_meaning "$_st")"
   printf '  %-10s %s\n' 'trigger:' "$_tr"
   printf '  %-10s %s\n' 'status:'  "$_su"
+  case "$_su" in
+    FAIL\ *) _code=${_su#FAIL }; _code=${_code%% *}
+             _long=$(exit_meaning "$_code" long)
+             [ -n "$_long" ] && printf '  %-10s %s\n' '' "exit $_code = $_long" ;;
+  esac
   [ -n "$_p" ]  && printf '  %-10s %s\n' 'plist:'   "$_p"
-  [ -n "$_pr" ] && printf '  %-10s %s\n' 'program:' "$_pr"
+  if [ -n "$_pr" ]; then
+    _pv=$(program_verdict "$_pr")
+    printf '  %-10s %s\n' 'program:' "$_pr"
+    case "$_d" in
+      system) _asuser=${_us:-root} ;;
+      *)      _asuser=${_us:-$(id -un "$DOMAIN_UID" 2>/dev/null)} ;;
+    esac
+    case "$_pv" in
+      ok)
+        _pac=$(program_access "$_pr" "$_asuser")
+        if [ "$_pac" = ok ] || [ "$_pac" = 'ok (root)' ]; then
+          printf '  %-10s %s\n' '' "exists, executable, reachable by $_asuser"
+        else
+          printf '  %-10s %s%s%s\n' '' "$C_BAD" "UNREACHABLE by $_asuser: $_pac" "$C_OFF"
+        fi ;;
+      MISSING)          printf '  %-10s %s%s%s\n' '' "$C_BAD" 'MISSING - this is why it cannot start (exit 127)' "$C_OFF" ;;
+      EMPTY)            printf '  %-10s %s%s%s\n' '' "$C_BAD" 'the file is EMPTY (0 bytes)' "$C_OFF" ;;
+      'NOT EXECUTABLE') printf '  %-10s %s%s%s\n' '' "$C_BAD" 'NOT EXECUTABLE - no execute bit (exit 126)' "$C_OFF" ;;
+      'NOT A FILE')     printf '  %-10s %s%s%s\n' '' "$C_BAD" 'this path is a DIRECTORY, not a program' "$C_OFF" ;;
+      '?'*)             printf '  %-10s %s\n' '' "$_pv - rerun as root to tell" ;;
+    esac
+  fi
   if [ -n "$_us" ]; then printf '  %-10s %s\n' 'runs as:' "$_us"
   else
     case "$_d" in
@@ -1001,7 +1134,7 @@ show_log_delta() {
   elif [ -n "$_runs" ] && [ "$_runs" = 1 ]; then
     _eo=0; _oo=0; _hdr='the whole log (this service has run once)'
   else
-    _hdr="no watermark yet - last $ERR_TAIL lines"
+    _hdr='no watermark yet - showing what the log holds'
   fi
 
   _shown=0
@@ -1014,33 +1147,61 @@ show_log_delta() {
       continue
     fi
     _sz=$(wc -c < "$_lf" | tr -d ' ')
-    if [ -n "$_off" ]; then
-      # a shorter file than the mark means it was rotated or truncated
-      if [ "$_sz" -lt "$_off" ] 2>/dev/null; then
-        _off=0; _hdr="$_hdr [log was truncated, showing from the start]"
-      fi
-      # tail -c +N seeks straight to the offset. dd bs=1 was used here at
-      # first and made a 50 MB log take minutes: one syscall per byte.
-      tail -c "+$((_off + 1))" "$_lf" 2>/dev/null > "$TMPD/delta"
-    else
-      tail -n "$ERR_TAIL" "$_lf" 2>/dev/null > "$TMPD/delta"
+    [ -n "$_off" ] || _off=$(( _sz > 0 ? 0 : 0 ))
+    # a shorter file than the mark means it was rotated or truncated
+    if [ "$_sz" -lt "$_off" ] 2>/dev/null; then
+      _off=0; _hdr="$_hdr [log was truncated, showing from the start]"
     fi
-    [ -s "$TMPD/delta" ] || continue
-    _nl=$(wc -l < "$TMPD/delta" | tr -d ' ')
+    _dsz=$(( _sz - _off ))
     [ "$_shown" = 0 ] && { printf '\n  %s%s%s\n' "$C_DIM" "$_hdr" "$C_OFF"; _shown=1; }
-    # A daemon that crash-loops can produce hundreds of thousands of lines.
-    # Printing them all is useless and hides the count, which is the fact
-    # that actually tells you what happened.
+
+    # Nothing new is an answer, not a reason to show nothing: the tail of
+    # the log is still the context you came for.
+    if [ "$_dsz" -le 0 ] 2>/dev/null; then
+      if [ "$_sz" -gt 0 ] 2>/dev/null; then
+        printf '  %s%s:%s nothing new, last %s lines:\n' \
+          "$C_HDR" "$_which" "$C_OFF" "$ERR_TAIL"
+        tail -n "$ERR_TAIL" "$_lf" 2>/dev/null | sed 's/^/    /'
+      else
+        printf '  %s%s:%s empty\n' "$C_HDR" "$_which" "$C_OFF"
+      fi
+      continue
+    fi
+
+    # A crash-looping daemon can leave a gigabyte behind. Counting its lines
+    # means reading all of it - 18 seconds of CPU to print ten lines - so a
+    # large delta is measured in bytes, which is free, and the last lines are
+    # taken with tail -n, which seeks from the END. When the delta is big,
+    # the file's last N lines ARE the delta's last N lines.
+    if [ "$_dsz" -gt "$BIG_DELTA" ] 2>/dev/null; then
+      printf '  %s%s:%s %s new, last %s lines:\n' \
+        "$C_HDR" "$_which" "$C_OFF" "$(human_size "$_dsz")" "$ERR_TAIL"
+      tail -n "$ERR_TAIL" "$_lf" 2>/dev/null | sed 's/^/    /'
+      continue
+    fi
+
+    # Small enough to read: an exact line count is worth having.
+    # From offset 0 the file IS the delta, so count and tail it directly -
+    # copying it first would read it twice and write it once for nothing.
+    # From a non-zero offset, wc cannot count "lines after byte N", so the
+    # delta has to be materialised; under BIG_DELTA that is cheap.
+    if [ "$_off" -gt 0 ] 2>/dev/null; then
+      tail -c "+$((_off + 1))" "$_lf" 2>/dev/null > "$TMPD/delta"
+      _src="$TMPD/delta"
+    else
+      _src="$_lf"
+    fi
+    _nl=$(wc -l < "$_src" | tr -d ' ')
     if [ "$_nl" -gt "$ERR_TAIL" ] 2>/dev/null; then
       printf '  %s%s:%s %s new lines, last %s:\n' \
         "$C_HDR" "$_which" "$C_OFF" "$_nl" "$ERR_TAIL"
-      tail -n "$ERR_TAIL" "$TMPD/delta" | sed 's/^/    /'
+      tail -n "$ERR_TAIL" "$_src" | sed 's/^/    /'
     else
       printf '  %s%s:%s\n' "$C_HDR" "$_which" "$C_OFF"
-      sed 's/^/    /' "$TMPD/delta"
+      sed 's/^/    /' "$_src"
     fi
   done
-  [ "$_shown" = 0 ] && printf '\n  %s%s: nothing new%s\n' "$C_DIM" "$_hdr" "$C_OFF"
+  [ "$_shown" = 0 ] && printf '\n  %s%s: no log files exist yet%s\n' "$C_DIM" "$_hdr" "$C_OFF"
   # Refresh the approximate boundary for next time.
   [ "$_kind" = exact ] || write_mark "$_l" "$_ef" "$_of" approx
   return 0
@@ -1764,7 +1925,7 @@ run_tests() {
     printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
   } > "$T_CONF"
 
   # and the suite's own view of the machine
@@ -1777,6 +1938,8 @@ run_tests() {
   t_matrix
   t_hints
   t_version
+  t_exitcodes
+  t_program
   t_watch
   t_logs
   t_completion
@@ -2030,6 +2193,60 @@ t_version() {
   t_eq 'an identical file reports the same build id' "$_b1" "$_b3"
 }
 
+t_program() {
+  t_sec 'J. the program is checked, not assumed'
+  _pd="$TMPD/prog"; mkdir -p "$_pd/sub"
+  printf '#!/bin/sh\ntrue\n' > "$_pd/good";   chmod 755 "$_pd/good"
+  : > "$_pd/empty";                            chmod 755 "$_pd/empty"
+  printf 'x' > "$_pd/noexec";                  chmod 644 "$_pd/noexec"
+
+  t_eq 'a real executable is ok'        ok               "$(program_verdict "$_pd/good")"
+  t_eq 'a 0-byte program is EMPTY'      EMPTY            "$(program_verdict "$_pd/empty")"
+  t_eq 'a non-executable is caught'     'NOT EXECUTABLE' "$(program_verdict "$_pd/noexec")"
+  t_eq 'an absent program is MISSING'   MISSING          "$(program_verdict "$_pd/nope")"
+  t_eq 'a directory is not a program'   'NOT A FILE'     "$(program_verdict "$_pd")"
+  t_eq 'no program at all is not an error' ok            "$(program_verdict '')"
+
+  # the MISSING / ? distinction matters here exactly as it does for watches:
+  # a program under an unreadable directory is unknown, not absent
+  mkdir -p "$_pd/closed"; printf 'x' > "$_pd/closed/hidden"; chmod 000 "$_pd/closed"
+  if [ "$(id -u)" = 0 ]; then
+    t_skip 'unreadable-parent program' 'root can read everything'
+  else
+    case "$(program_verdict "$_pd/closed/hidden")" in
+      '?'*) t_ok 'a program under an unreadable dir is ?, never MISSING' ;;
+      *)    t_no 'unreadable parent -> ?' '?' "$(program_verdict "$_pd/closed/hidden")" ;;
+    esac
+  fi
+  chmod 755 "$_pd/closed"
+
+  # reachability is about the user the service runs AS
+  t_eq 'reachable by its own user' ok "$(program_access "$_pd/good" "$(id -un)")"
+  case "$(program_access "$_pd/good" no-such-user-xyz)" in
+    '?'*) t_ok 'an unknown user is reported, not silently passed' ;;
+    *)    t_no 'unknown user' '? no such user' "$(program_access "$_pd/good" no-such-user-xyz)" ;;
+  esac
+  t_eq 'root reaches everything' 'ok (root)' "$(program_access "$_pd/good" root)"
+}
+
+t_exitcodes() {
+  t_sec 'I. exit codes are explained, not just numbered'
+  t_eq 'sysexits 78 is a config error'    'config error'      "$(exit_meaning 78 short)"
+  t_eq 'sysexits 71 is an OS error'       'OS error'          "$(exit_meaning 71 short)"
+  t_eq '127 is a missing program'         'not found'         "$(exit_meaning 127 short)"
+  t_eq '137 is death by SIGKILL'          'killed: KILL'      "$(exit_meaning 137 short)"
+  t_eq '143 is death by SIGTERM'          'killed: TERM'      "$(exit_meaning 143 short)"
+  t_eq 'an unknown code gets no invented meaning' '' "$(exit_meaning 200 short)"
+  case "$(exit_meaning 78 long)" in
+    EX_CONFIG*) t_ok 'the record view gets the long form' ;;
+    *) t_no 'long form for 78' 'EX_CONFIG...' "$(exit_meaning 78 long)" ;;
+  esac
+  # the short and long forms must not be confused with each other
+  if [ "$(exit_meaning 78 short)" != "$(exit_meaning 78 long)" ]; then
+    t_ok 'short and long forms differ'
+  else t_no 'short and long differ' 'two different strings' 'identical'; fi
+}
+
 t_watch() {
   t_sec 'E. WatchPaths — MISSING and ? are never conflated'
   _wd="$TMPD/wtest"; mkdir -p "$_wd/open" "$_wd/closed"
@@ -2087,26 +2304,51 @@ t_logs() {
       *new-out-2*) t_ok 'stdout is shown as well as stderr' ;;
       *) t_no 'stdout in the delta' 'new-out-2' "$_o" ;;
     esac
-    # A crash-looping daemon produces enormous logs: this must stay fast
-    # and must not print the lot. dd bs=1 used to sit here and made a
-    # 50 MB log take minutes.
+    # A crash-looping daemon can leave hundreds of MB. This must stay fast
+    # AND must not print the lot: counting 12.6M lines took 18s of CPU on a
+    # real 1 GB log and produced ten lines of output.
     _big="$_ld/big"
-    awk 'BEGIN { for (i = 1; i <= 200000; i++) print "line " i }' > "$_big"
+    awk 'BEGIN { for (i = 1; i <= 400000; i++) print "line " i " padded out to make it wide enough to matter" }' > "$_big"
     write_mark "$_lab" "$_big" "$_ol" exact
-    awk 'BEGIN { for (i = 1; i <= 200000; i++) print "new " i }' >> "$_big"
+    awk 'BEGIN { for (i = 1; i <= 400000; i++) print "new " i " padded out to make it wide enough to matter" }' >> "$_big"
     _t0=$(date '+%s')
     _o=$(show_log_delta "$_lab" "$_big" "$_ol")
     _el2=$(( $(date '+%s') - _t0 ))
-    if [ "$_el2" -le 5 ]; then t_ok "a 400k-line log renders in ${_el2}s"
-    else t_no 'large log stays fast' 'at most 5s' "${_el2}s"; fi
+    if [ "$_el2" -le 2 ]; then t_ok "a 400k-line delta renders in ${_el2}s"
+    else t_no 'a large delta stays fast' 'at most 2s' "${_el2}s"; fi
     case "$_o" in
-      *"200000 new lines"*) t_ok 'the delta reports the line count instead of printing them all' ;;
-      *) t_no 'large delta is summarised' '200000 new lines, last 10' "$(printf '%s' "$_o" | head -n 3)" ;;
+      *MB*new*) t_ok 'a large delta is reported by size, not by counting lines' ;;
+      *) t_no 'large delta reported by size' 'NN.NMB new' "$(printf '%s' "$_o" | head -n 3)" ;;
+    esac
+    case "$_o" in
+      *"new 400000"*) t_ok 'the last lines shown come from the END of the delta' ;;
+      *) t_no 'large delta shows the newest lines' 'new 400000' "$(printf '%s' "$_o" | tail -n 3)" ;;
     esac
     _lines=$(printf '%s\n' "$_o" | wc -l | tr -d ' ')
     if [ "$_lines" -lt 40 ]; then t_ok "the output stays short ($_lines lines)"
     else t_no 'large delta output is capped' 'under 40 lines' "$_lines lines"; fi
-    rm -f "$_big"
+    # a SMALL delta still gets an exact line count, which is the useful fact
+    _sm="$_ld/small"; printf 'a\nb\nc\n' > "$_sm"
+    write_mark "$_lab" "$_sm" "$_ol" exact
+    printf 'd\ne\n' >> "$_sm"
+    _o=$(show_log_delta "$_lab" "$_sm" "$_ol")
+    case "$_o" in
+      *d*e*) t_ok 'a small delta is still shown line by line' ;;
+      *) t_no 'small delta shown in full' 'd and e' "$_o" ;;
+    esac
+    # nothing new must STILL show the tail: an empty delta is an answer,
+    # but leaving the reader with no log content is not
+    write_mark "$_lab" "$_sm" "$_ol" exact
+    _o=$(show_log_delta "$_lab" "$_sm" "$_ol")
+    case "$_o" in
+      *"nothing new"*) t_ok 'an empty delta says so' ;;
+      *) t_no 'empty delta reported' 'nothing new' "$_o" ;;
+    esac
+    case "$_o" in
+      *e*) t_ok 'an empty delta still shows the tail of the log' ;;
+      *) t_no 'empty delta shows the tail' 'the last lines' "$_o" ;;
+    esac
+    rm -f "$_big" "$_sm"
 
     # truncation must not produce a negative offset
     write_mark "$_lab" "$_el" "$_ol" exact
