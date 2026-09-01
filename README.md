@@ -266,6 +266,9 @@ a way to learn the raw commands.
   and gives the `chmod`/`chown` to fix it, and also flags invalid XML, a
   missing `Label`, no `Program` at all, and a `Label` that disagrees with
   the filename.
+- **Each log says how big it is**, behind its path — `(315L, 25KB)`, or
+  just the size once it is too large to count cheaply, or `empty` /
+  `does not exist yet`.
 - **`status` shows the command line, not just the program** — every
   argument as launchd would run it, quoted where needed:
   `/bin/sh -c "echo hi there"`. `program: /bin/sh` on its own says almost

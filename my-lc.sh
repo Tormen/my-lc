@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="68fc872"
+SCRIPT_COMMIT="b464ed8"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -304,6 +304,24 @@ exit_meaning() {
   [ -n "${_el:-}" ] && [ "$2" != short ] && { printf '%s' "$_el"; _el=; return 0; }
   _el=
   printf '%s' "$_em"
+}
+
+# How big a log is, for the record view. The size is free from stat; the
+# line count is not, so a log past BIG_DELTA is reported by size alone
+# rather than reading a gigabyte to produce one number.
+log_size_note() {
+  [ -n "$1" ] || return 0
+  if [ ! -e "$1" ]; then printf 'does not exist yet'; return; fi
+  if [ ! -f "$1" ]; then printf 'not a regular file'; return; fi
+  if [ ! -r "$1" ]; then printf 'not readable as %s' "$(id -un)"; return; fi
+  _lsz=$(stat -f '%z' "$1" 2>/dev/null)
+  [ -n "$_lsz" ] || return 0
+  if [ "$_lsz" = 0 ]; then printf 'empty'; return; fi
+  if [ "$_lsz" -le "$BIG_DELTA" ] 2>/dev/null; then
+    printf '%sL, %s' "$(wc -l < "$1" 2>/dev/null | tr -d ' ')" "$(human_size "$_lsz")"
+  else
+    printf '%s, too big to count cheaply' "$(human_size "$_lsz")"
+  fi
 }
 
 # Bytes as a compact human size, for deltas too large to count by line.
@@ -804,22 +822,39 @@ load_loaded_set() {
 # One ps call for every process start time, instead of two forks per
 # running service. Written to a file, so the join can read it in awk.
 load_ps_map() {
-  ps -eo pid=,lstart= 2>/dev/null | awk -v S="$FS1" '
+  # 'ps -o lstart' prints LOCAL time with no offset, and the civil-days
+  # arithmetic below necessarily treats it as UTC - so every process start
+  # came out shifted by the timezone offset (two hours here).
+  #
+  # Rather than parse an offset and guess about DST, calibrate against a
+  # process whose true start time is known exactly: pid 1 is launchd, and it
+  # starts at boot, which kern.boottime gives as a real epoch. The difference
+  # between its naive value and that IS the correction for every other row.
+  _psboot=$(sysctl -n kern.boottime 2>/dev/null \
+            | sed -n 's/^{ *sec *= *\([0-9][0-9]*\).*/\1/p')
+  ps -eo pid=,lstart= 2>/dev/null | awk -v S="$FS1" -v boot="${_psboot:-0}" '
     BEGIN { OFS=S; split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
-            for (i=1;i<=12;i++) m[mn[i]]=i }
+            for (i = 1; i <= 12; i++) m[mn[i]] = i }
     {
-      pid=$1; mon=m[$3]; day=$4; split($5,t,":"); yr=$6
-      # days since the epoch, civil-from-days (Howard Hinnant), then seconds
+      pid = $1; mon = m[$3]; day = $4; split($5, t, ":"); yr = $6
       y = yr; mo = mon; d = day
       y -= (mo <= 2)
-      era = int((y >= 0 ? y : y-399) / 400)
+      era = int((y >= 0 ? y : y - 399) / 400)
       yoe = y - era * 400
       doy = int((153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5) + d - 1
-      doe = yoe * 365 + int(yoe/4) - int(yoe/100) + doy
+      doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
       days = era * 146097 + doe - 719468
-      printf "%s%s%d\n", pid, S, days*86400 + t[1]*3600 + t[2]*60 + t[3]
-    }' > "$TMPD/psmap"
+      naive[pid] = days * 86400 + t[1] * 3600 + t[2] * 60 + t[3]
+      order[++n] = pid
+    }
+    END {
+      # pid 1 is launchd; its start IS the boot time.
+      delta = (boot > 0 && (1 in naive)) ? naive[1] - boot : 0
+      for (i = 1; i <= n; i++) print order[i], naive[order[i]] - delta
+    }
+  ' > "$TMPD/psmap"
 }
+
 
 
 is_apple() {
@@ -1363,8 +1398,18 @@ render_record() {
     esac
   fi
 
-  [ -n "$_ef" ] && printf '  %-10s %s\n' 'stderr:' "$_ef"
-  [ -n "$_of" ] && printf '  %-10s %s\n' 'stdout:' "$_of"
+  if [ -n "$_ef" ]; then
+    _n1=$(log_size_note "$_ef")
+    printf '  %-10s %s%s\n' 'stderr:' "$_ef" "$( [ -n "$_n1" ] && printf '   (%s)' "$_n1" )"
+  fi
+  if [ -n "$_of" ]; then
+    if [ "$_of" = "$_ef" ]; then
+      printf '  %-10s %s   (the same file)\n' 'stdout:' "$_of"
+    else
+      _n2=$(log_size_note "$_of")
+      printf '  %-10s %s%s\n' 'stdout:' "$_of" "$( [ -n "$_n2" ] && printf '   (%s)' "$_n2" )"
+    fi
+  fi
   show_log_delta "$_l" "$_ef" "$_of"
 }
 
@@ -2905,6 +2950,8 @@ run_tests() {
   t_truncate
   t_undelete
   t_loadeddiff
+  t_pstime
+  t_logsizes
   t_plistchecks
   t_restartrace
   t_chain
@@ -3430,6 +3477,54 @@ t_truncate() {
   cleanup_fixtures
 }
 
+
+t_pstime() {
+  t_sec 'U. process start times are in local time'
+  # 'ps -o lstart' prints local time with no offset, and the civil-days
+  # arithmetic treats it as UTC - every start time came out shifted by the
+  # timezone (two hours here). pid 1 calibrates it: launchd starts at boot,
+  # and kern.boottime gives that as a true epoch.
+  [ -s "$TMPD/psmap" ] || { t_no 'a ps map exists' 'entries' 'empty'; return; }
+  _p1=$(awk -F"$FS1" '$1==1 { print $2; exit }' "$TMPD/psmap")
+  if [ -z "$_p1" ]; then t_skip 'pid 1 calibration' 'pid 1 not in the ps map'; return; fi
+  if [ -z "$BOOT_EPOCH" ]; then t_skip 'pid 1 calibration' 'no boot time'; return; fi
+  _skew=$(( _p1 - BOOT_EPOCH ))
+  [ "$_skew" -lt 0 ] && _skew=$(( -_skew ))
+  if [ "$_skew" -le 2 ]; then
+    t_ok "launchd's start time matches kern.boottime (${_skew}s apart)"
+  else
+    t_no 'pid 1 start matches boot time' 'within 2s' "${_skew}s - a timezone offset would be 3600 or 7200"
+  fi
+  # and a running service's start must agree with ps, not be hours off
+  _rp=$(awk -F"$FS1" '$7 ~ /^run / { print $7; exit }' "$DB" | sed 's/.*pid //; s/ .*//')
+  if [ -n "$_rp" ]; then
+    _mine=$(awk -F"$FS1" -v p="$_rp" '$1==p { print $2; exit }' "$TMPD/psmap")
+    _real=$(date -j -f '%a %b %d %T %Y' "$(ps -o lstart= -p "$_rp" 2>/dev/null)" '+%s' 2>/dev/null)
+    if [ -n "$_mine" ] && [ -n "$_real" ]; then
+      _d=$(( _mine - _real )); [ "$_d" -lt 0 ] && _d=$(( -_d ))
+      t_eq "a running service's start matches date(1) parsing of ps" 0 "$_d"
+    else t_skip 'cross-check against date(1)' 'could not parse'; fi
+  else t_skip 'cross-check against date(1)' 'nothing running'; fi
+}
+
+t_logsizes() {
+  t_sec 'V. each log says how big it is'
+  _lg="$TMPD/lsz"; mkdir -p "$_lg"
+  printf 'a\nb\nc\n' > "$_lg/three"
+  : > "$_lg/empty"
+  t_eq 'a small log gives lines and bytes' '3L, 6B' "$(log_size_note "$_lg/three")"
+  t_eq 'an empty log says so'              'empty'  "$(log_size_note "$_lg/empty")"
+  t_eq 'a missing log says so'             'does not exist yet' "$(log_size_note "$_lg/nope")"
+  t_eq 'a directory is not a log'          'not a regular file' "$(log_size_note "$_lg")"
+  # counting lines in a huge log means reading it all, so past BIG_DELTA it
+  # is reported by size alone
+  _sv=$BIG_DELTA; BIG_DELTA=1   # the file is 6 bytes, so this makes it "large"
+  case "$(log_size_note "$_lg/three")" in
+    *'too big to count cheaply'*) t_ok 'a large log is reported by size alone' ;;
+    *) t_no 'large log note' 'too big to count cheaply' "$(log_size_note "$_lg/three")" ;;
+  esac
+  BIG_DELTA=$_sv
+}
 
 t_plistchecks() {
   t_sec 'T. the plist itself is checked, and the command line shown'
