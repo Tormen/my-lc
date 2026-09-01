@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0086c8a"
+SCRIPT_COMMIT="68fc872"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3366,6 +3366,74 @@ t_truncate() {
   _td="$TMPD/trunc"; mkdir -p "$_td/st"
   _lab="$SELFTEST_PREFIX-trunc"
   t_guard "$_lab"
+  _mk() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+      printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$1"
+      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$2"
+      printf '</dict></plist>\n'; } > "$_td/$_lab.plist"
+  }
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_td" "$_td" "$_td" > "$_td/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _run() { MY_LC_CONFIG="$_td/conf" "$0" $_sf "$_lab" truncate "$@" 2>&1; }
+  _sz() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+  _mk "$_td/e.log" "$_td/o.log"
+  printf 'aaaa\nbbbb\n' > "$_td/e.log"; printf 'cccc\n' > "$_td/o.log"
+
+  # it must CONFIRM: truncating discards data
+  _o=$(_run < /dev/null)
+  case "$_o" in *'this would truncate 1 service:'*) t_ok 'truncate confirms before discarding anything' ;;
+    *) t_no 'truncate confirms' 'this would truncate 1 service:' "$_o" ;; esac
+  t_eq 'truncate without go changes nothing' 10 "$(_sz "$_td/e.log")"
+  # ...and the plan says how much would go
+  case "$_o" in *'(10B)'*) t_ok 'the plan says how much would be discarded' ;;
+    *) t_no 'plan shows sizes' '(10B)' "$_o" ;; esac
+
+  # err only
+  _run err --go >/dev/null 2>&1
+  t_eq 'truncate err empties stderr'        0 "$(_sz "$_td/e.log")"
+  t_eq 'truncate err leaves stdout alone'   5 "$(_sz "$_td/o.log")"
+
+  # out only
+  printf 'aaaa\nbbbb\n' > "$_td/e.log"
+  _run out --go >/dev/null 2>&1
+  t_eq 'truncate out empties stdout'        0 "$(_sz "$_td/o.log")"
+  t_eq 'truncate out leaves stderr alone'   10 "$(_sz "$_td/e.log")"
+
+  # both by default
+  printf 'cccc\n' > "$_td/o.log"
+  _run --go >/dev/null 2>&1
+  t_eq 'truncate with no argument does both (stderr)' 0 "$(_sz "$_td/e.log")"
+  t_eq 'truncate with no argument does both (stdout)' 0 "$(_sz "$_td/o.log")"
+
+  # the file must SURVIVE: launchd holds it open, so unlinking would orphan it
+  if [ -f "$_td/e.log" ]; then t_ok 'the log file survives, it is only emptied'
+  else t_no 'truncate keeps the file' 'the file still exists' 'it was removed'; fi
+
+  # one file serving both streams is emptied once, and named as one
+  _mk "$_td/both.log" "$_td/both.log"
+  printf 'xxxx\n' > "$_td/both.log"
+  _o=$(_run --go)
+  case "$_o" in *'stderr+stdout'*) t_ok 'a shared log is emptied once, and named as one' ;;
+    *) t_no 'shared log' 'stderr+stdout' "$_o" ;; esac
+  t_eq 'the shared log is empty afterwards' 0 "$(_sz "$_td/both.log")"
+
+  # an already-empty log is said so, not silently "done"
+  _o=$(_run --go)
+  case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
+    *) t_no 'already empty' 'already empty' "$_o" ;; esac
+  cleanup_fixtures
+}
+
+
+t_plistchecks() {
+  t_sec 'T. the plist itself is checked, and the command line shown'
+  _pd2="$TMPD/plchk"; mkdir -p "$_pd2/st"
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
     "$_pd2" "$_pd2" "$_pd2" > "$_pd2/conf"
   _sf=; [ "$SCOPE" = agents ] && _sf=--agents
