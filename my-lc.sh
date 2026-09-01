@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="531283c"
+SCRIPT_COMMIT="a943b8b"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1914,6 +1914,14 @@ parse_args() {
         exit 1 ;;
       -*)
         die "unknown option: $_a  (try -h)" ;;
+      # 'go' releases the confirmation AT THE PROMPT, never on the command
+      # line. Left as a filter word it silently matched anything containing
+      # 'go' - com.paragon-software, for one - and looked like it worked.
+      go)
+        printf "%s: 'go' is not a filter word.\n" "$SCRIPT_NAME" >&2
+        printf "    > type 'go' at the confirmation prompt, or pass --go\n" >&2
+        printf "    > e.g. my-lc <service> delete --go\n" >&2
+        exit 1 ;;
       *)
         if is_verb "$_a"; then
           [ -n "$VERB" ] && die "two verbs given: $VERB and $_a"
@@ -2743,6 +2751,16 @@ t_editdelete() {
   if ls "$_ed"/st/deleted/"$_lab".plist.* >/dev/null 2>&1; then
     t_ok 'delete keeps a dated backup, so it can be undone'
   else t_no 'delete backs up the plist' 'a file under st/deleted/' 'no backup found'; fi
+  # A bare 'go' on the command line must be named, not silently taken as a
+  # filter: it matched anything containing 'go' (com.paragon-software) and
+  # so appeared to work.
+  _o=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" delete go < /dev/null 2>&1); _rc=$?
+  case "$_o" in
+    *"'go' is not a filter word"*) t_ok "a bare 'go' argument is named, not used as a filter" ;;
+    *) t_no 'bare go rejected' "'go' is not a filter word" "$_o" ;;
+  esac
+  t_eq "a bare 'go' exits non-zero" 1 "$_rc"
+
   # An interactive verb must inherit the CALLER's stdin. The action loop
   # used to read its work list on stdin, so vim got a file as its input,
   # reported "Input is not from a terminal", and left the terminal mode
