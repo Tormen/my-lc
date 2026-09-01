@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="7777c27"
+SCRIPT_COMMIT="d40cb83"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -559,23 +559,32 @@ program_verdict() {
     'ok dir') printf 'NOT A FILE'; return ;;
   esac
   [ -s "$1" ] || { printf 'EMPTY'; return; }
-  # Fast path: if I can execute it, so can anyone the bits allow.
-  [ -x "$1" ] && { printf 'ok'; return; }
+
+  # Who are we judging this for? The service's own user, not the caller.
+  _pusr=${2:-$(id -un)}
+  _pu2=$(id -u "$_pusr" 2>/dev/null) || { printf 'ok'; return; }
+
+  # Only when the target IS the caller does '[ -x ]' answer the question,
+  # and then it answers it exactly, with no fork.
+  if [ "$_pu2" = "$(id -u)" ]; then
+    [ -x "$1" ] && { printf 'ok'; return; }
+  fi
+
   _pst=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || { printf '?'; return; }
   _po=${_pst%% *}; _pr2=${_pst#* }; _pg=${_pr2%% *}; _pm=${_pr2##* }
-  # No execute bit at all is definitive, for every user.
+
+  # No execute bit at all is definitive, for every user including root.
   [ $(( 0$_pm & 73 )) = 0 ] && { printf 'NOT EXECUTABLE'; return; }
-  # Some bit is set, so it depends who asks.
-  [ -n "$2" ] || { printf 'ok'; return; }
-  _pu2=$(id -u "$2" 2>/dev/null) || { printf 'ok'; return; }
+  # root may execute anything that carries any execute bit.
   [ "$_pu2" = 0 ] && { printf 'ok'; return; }
-  if   [ "$_po" = "$_pu2" ];                      then _pb=$(( (0$_pm / 64) % 8 ))
-  elif case " $(id -G "$2" 2>/dev/null) " in *" $_pg "*) true ;; *) false ;; esac
-                                                  then _pb=$(( (0$_pm / 8) % 8 ))
-  else                                                 _pb=$((  0$_pm       % 8 ))
+  # Otherwise it depends which class this user falls into.
+  if   [ "$_po" = "$_pu2" ];                          then _pb=$(( (0$_pm / 64) % 8 ))
+  elif case " $(id -G "$_pusr" 2>/dev/null) " in *" $_pg "*) true ;; *) false ;; esac
+                                                      then _pb=$(( (0$_pm / 8) % 8 ))
+  else                                                     _pb=$((  0$_pm       % 8 ))
   fi
   if [ $(( _pb % 2 )) = 1 ]; then printf 'ok'
-  else printf 'NOT EXECUTABLE by %s' "$2"; fi
+  else printf 'NOT EXECUTABLE by %s' "$_pusr"; fi
 }
 
 # Can USER actually reach and run it? Checked component by component, since
@@ -2248,13 +2257,20 @@ t_program() {
   # calling that NOT EXECUTABLE was a real false alarm.
   printf 'x' > "$_pd/rootonly"; chmod 544 "$_pd/rootonly"
   t_eq 'mode 544 is executable for root'  ok "$(program_verdict "$_pd/rootonly" root)"
-  chmod 500 "$_pd/rootonly"
-  if [ "$(id -u)" = 0 ]; then
-    t_skip 'mode 500 owned by me' 'running as root, owner test differs'
-  else
-    t_eq 'a mode-500 file owned by me is fine for me' \
-         ok "$(program_verdict "$_pd/rootonly" "$(id -un)")"
-  fi
+
+  # The full matrix, because the caller's own access is NOT the answer: a
+  # mode-700 file is runnable by its owner and by root, and by nobody else.
+  # Judging it by '[ -x ]' - can *I* run it - was wrong twice over.
+  _own="$_pd/own700"; printf 'x' > "$_own"; chmod 700 "$_own"
+  _all="$_pd/all755"; printf 'x' > "$_all"; chmod 755 "$_all"
+  _me=$(id -un)
+  t_eq 'mode 700: root may run it'          ok "$(program_verdict "$_own" root)"
+  t_eq 'mode 700: its owner may run it'     ok "$(program_verdict "$_own" "$_me")"
+  t_eq 'mode 700: a stranger may NOT'       "NOT EXECUTABLE by nobody" \
+       "$(program_verdict "$_own" nobody)"
+  t_eq 'mode 755: anyone may run it'        ok "$(program_verdict "$_all" nobody)"
+  t_eq 'mode 644: nobody may, not even root' 'NOT EXECUTABLE' \
+       "$(program_verdict "$_pd/noexec" root)"
   t_eq 'an absent program is MISSING'   MISSING          "$(program_verdict "$_pd/nope")"
   t_eq 'a directory is not a program'   'NOT A FILE'     "$(program_verdict "$_pd")"
   t_eq 'no program at all is not an error' ok            "$(program_verdict '')"
