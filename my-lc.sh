@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="488f3fe"
+SCRIPT_COMMIT="531283c"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1658,6 +1658,12 @@ v_edit() {
     || warn "$_plist is not writable by $(id -un); the editor may refuse to save"
   _before=$(shasum -a 256 "$_plist" 2>/dev/null | cut -d' ' -f1)
   msg "editing $_plist with $_ed"
+  # The editor inherits my-lc's own stdin, which is the terminal. That only
+  # works because the action loop reads its work list on fd 3: while it read
+  # on stdin, the editor got a FILE as its input, reported "Input is not from
+  # a terminal", and left the terminal mode broken afterwards. Redirecting
+  # from /dev/tty here instead would fail outright where there is no
+  # controlling terminal, e.g. under a test harness or from cron.
   run "$_ed" "$_plist"
   _after=$(shasum -a 256 "$_plist" 2>/dev/null | cut -d' ' -f1)
   if [ "$_before" = "$_after" ]; then
@@ -2113,7 +2119,7 @@ do_action() {
   fi
   # Sequential, one launchctl call at a time, so the narration is
   # consecutive and a failure is unambiguously attributable.
-  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat <&3; do
     [ -n "$_l" ] || continue
     if [ "$_a" = 1 ] && [ "${_p#/System/Library/}" != "$_p" ]; then
       msg "$_l is SIP-protected (/System/Library); launchd will not let anyone change it"
@@ -2122,7 +2128,7 @@ do_action() {
     fi
     DOMAIN=$_d
     act_on "$_l" "$_p" "$_st" "$_tr" "$_ef" "$_of"
-  done < "$_sel"
+  done 3< "$_sel"
 }
 
 # What the action will DO, one bullet per step, in plain words. The plan is
@@ -2737,6 +2743,20 @@ t_editdelete() {
   if ls "$_ed"/st/deleted/"$_lab".plist.* >/dev/null 2>&1; then
     t_ok 'delete keeps a dated backup, so it can be undone'
   else t_no 'delete backs up the plist' 'a file under st/deleted/' 'no backup found'; fi
+  # An interactive verb must inherit the CALLER's stdin. The action loop
+  # used to read its work list on stdin, so vim got a file as its input,
+  # reported "Input is not from a terminal", and left the terminal mode
+  # broken. Feeding a known marker in proves stdin reaches the editor.
+  cp "$_pl" "$_ed/$_lab.plist"
+  # shellcheck disable=SC2016  # $line belongs to the generated script
+  printf '#!/bin/sh\nread -r line\nprintf "STDIN[%%s]\\n" "$line"\n' > "$_ed/readin"
+  chmod 755 "$_ed/readin"
+  _o=$(printf 'MARKER\n' | EDITOR="$_ed/readin" MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" edit 2>&1)
+  case "$_o" in
+    *'STDIN[MARKER]'*) t_ok 'the editor inherits the caller stdin, not the match list' ;;
+    *) t_no 'editor stdin' 'STDIN[MARKER]' "$_o" ;;
+  esac
+
   # trash mode, exercised with HOME redirected so the real Trash is untouched
   _th="$_ed/home"; mkdir -p "$_th"
   cp "$_pl" "$_ed/$_lab.plist"
