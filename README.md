@@ -119,6 +119,7 @@ you will find in most existing documentation.
 | `kill <sig> <d>/<L>` | `stop <L>` | `kill [SIG]` | signal the running process — a KeepAlive service comes straight back |
 | — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
 | — | — | `delete` | stop it, disable it, and move its plist to the Trash (always confirms) |
+| — | — | `truncate [err\|out]` | empty its logs to 0 bytes, both streams by default (always confirms) |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
 Three levels of permanence: `kill` touches the **process** only ·
@@ -219,9 +220,15 @@ a way to learn the raw commands.
 - **Exit codes are translated** — `FAIL 78 config error`, and in the record
   view `exit 78 = EX_CONFIG: the program rejected its own configuration`.
   `128+N` is reported as death by signal N.
-- **"dead since"** — for a failed service, when it last did anything, taken
-  from the newest of its log files. "It is broken" and "it has been broken
-  since July" are different problems.
+- **"dead since"** — for a failed service, when it last did anything.
+  Normally the newest of its log files; for a service with no logs at all,
+  launchd records no timestamp, but a `boot`-triggered service that ran and
+  is not running failed **at boot**, so the date is recovered from
+  `kern.boottime`. "It is broken" and "it has been broken since August" are
+  different problems.
+- **Moments are timestamps by default** (`2026-08-17_1334`), because a
+  timestamp can be lined up against other logs and an age cannot.
+  `TIME_FORMAT=relative` switches to `15d9h`; `TIME_FMT` sets the format.
 - **Who it runs as** is merged into the status text, and shown only when it
   is *not* the default — a daemon that runs as root and an agent that runs
   as its session user say nothing, but `run 2d1h as _www` tells you the

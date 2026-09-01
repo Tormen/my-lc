@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="22202cc"
+SCRIPT_COMMIT="488f3fe"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -35,6 +35,7 @@ WANT_FAILED=0
 WANT_STDERR=0
 WANT_STDOUT=0
 VERB=
+TRUNC_WHAT=both
 WANT_VERSION=0
 WANT_STAMP=0
 KILLSIG=TERM
@@ -58,7 +59,7 @@ WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
 DELETE_MODE=trash
-TIME_FORMAT=relative
+TIME_FORMAT=absolute
 TIME_FMT="%Y-%m-%d_%H%M"
 
 # --- internal ----------------------------------------------------------
@@ -90,7 +91,8 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
            program path. Several words are ANDed. A .plist path, a bare
            label and system/<label> are interchangeable.
   VERB     status (default) | list | start | stop | restart | run | kill
-           | enable | disable | edit | delete   (any position)
+           | enable | disable | edit | delete | truncate [err|out]
+           (recognised in any position)
 
   status   one match -> the record view; otherwise the table
   list     always the table
@@ -102,7 +104,9 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   enable   arm it for boot; add --now to also start it
   disable  stop it coming back at boot; add --now to also stop it now
   edit     open the plist in $EDITOR, then check it is still valid
-  delete   stop it and move its plist to a dated backup (always confirms)
+  delete   stop it and move its plist to the Trash (always confirms)
+  truncate empty its logs to 0 bytes. 'truncate err' or 'truncate out' to
+           pick one; both by default
 
   --enabled          only services that could run or are running (default)
   --disabled         only services that are switched off
@@ -389,7 +393,7 @@ DELETE_MODE=trash
 
 # How ages are shown: 'relative' gives 44d0h, 'absolute' gives a timestamp
 # in TIME_FMT. Absolute is easier to correlate with other logs.
-TIME_FORMAT=relative
+TIME_FORMAT=absolute
 TIME_FMT="%Y-%m-%d_%H%M"
 
 # Editor used by the 'edit' verb. Empty means: $VISUAL, then $EDITOR, then
@@ -945,11 +949,18 @@ discover_scope() {
       [ -z "$_last" ] && _last=$_lm
       [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
     done
-    if [ -n "$_last" ]; then
-      _lage=$(when "$_last")
+    # No log to date it by? A boot-triggered failure happened at boot.
+    _since=$_last; _sincewhat=dead
+    if [ -z "$_since" ] && [ -n "$BOOT_EPOCH" ]; then
+      case "$_su" in
+        FAIL*) case "$_tg" in *boot*) _since=$BOOT_EPOCH; _sincewhat='dead since boot' ;; esac ;;
+      esac
+    fi
+    if [ -n "$_since" ]; then
+      _lage=$(when "$_since")
       case "$_su" in
         run\ *) ;;
-        FAIL*)  _su="$_su, dead $_lage" ;;
+        FAIL*)  _su="$_su, $_sincewhat $_lage" ;;
         *)      [ "$VRB" = 1 ] && _su="$_su, last $_lage" ;;
       esac
     fi
@@ -1069,7 +1080,7 @@ render_table() {
   fi
 
   _anyq=0
-  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of; do
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
     [ -n "$_l" ] || continue
     case "$_tr" in *'?'*) _anyq=1 ;; esac
     _c=$C_OFF
@@ -1148,6 +1159,15 @@ render_record() {
     [ -z "$_rl" ] && _rl=$_lm
     [ "$_lm" -gt "$_rl" ] 2>/dev/null && _rl=$_lm
   done
+  if [ -z "$_rl" ]; then
+    case "$_su" in
+      FAIL*) case "$_tr" in
+               *boot*) _bt=$BOOT_EPOCH
+                       [ -n "$_bt" ] && printf '  %-10s %s%s%s\n' 'dead since:' "$C_BAD" \
+                         "$(date -r "$_bt" '+%Y-%m-%d %H:%M:%S') - it failed at boot, and has no log to date it by" "$C_OFF" ;;
+             esac ;;
+    esac
+  fi
   if [ -n "$_rl" ]; then
     case "$_su" in
       run\ *) printf '  %-10s %s\n' 'last log:' \
@@ -1410,6 +1430,7 @@ act_on() {
     disable) v_disable ;;
     delete)  v_delete  ;;
     edit)    v_edit    ;;
+    truncate) v_truncate ;;
   esac
 }
 
@@ -1520,6 +1541,40 @@ v_disable() {
     [ "$NOW" = 0 ] && [ "$_state" = on ] && \
       msg "$_label is still running (add --now, or 'stop' it)"
   else step_fail "$(translate_lc_error)"; fi
+}
+
+# Empty a service's log files. Truncating in place (rather than deleting and
+# recreating) matters: launchd holds the file open, so a new file would be
+# written to by nobody while the daemon kept appending to the unlinked one.
+v_truncate() {
+  _did=0
+  for _stream in stderr stdout; do
+    case "$TRUNC_WHAT" in
+      both) ;;
+      "$_stream") ;;
+      *) continue ;;
+    esac
+    if [ "$_stream" = stderr ]; then _tf=$_ef; else _tf=$_of; fi
+    [ -n "$_tf" ] || continue
+    # one file serving both streams must not be emptied twice
+    if [ "$_stream" = stdout ] && [ -n "$_ef" ] && [ "$_ef" = "$_of" ]; then continue; fi
+    if [ ! -e "$_tf" ]; then msg "$_label: no $_stream log at $_tf"; continue; fi
+    if [ ! -f "$_tf" ]; then msg "$_label: $_stream is $_tf, not a regular file - left alone"; continue; fi
+    _tsz=$(wc -c < "$_tf" 2>/dev/null | tr -d ' ')
+    if [ "${_tsz:-0}" = 0 ]; then msg "$_label: $_stream log is already empty"; continue; fi
+    _lbl=$_stream
+    [ -n "$_ef" ] && [ "$_ef" = "$_of" ] && _lbl='stderr+stdout'
+    msgn "emptying the $_lbl log of $_label ($(human_size "$_tsz")) ..."
+    [ "$VRB" = 1 ] && printf '\n'
+    det "$_tf"
+    det "truncated in place: launchd holds it open, so unlinking would orphan it"
+    if run truncate -s 0 "$_tf"; then _did=1; step_ok
+    else step_fail 'could not truncate (needs root?)'; fi
+  done
+  # The watermark's offsets point past the end of an emptied file, so reset
+  # it; otherwise the next status would report a truncation that my-lc did.
+  [ "$_did" = 1 ] && write_mark "$_label" "$_ef" "$_of" exact
+  return 0
 }
 
 # Where a deleted plist goes, and what to call that place. The Trash is the
@@ -1664,7 +1719,8 @@ _my-lc() {
         'enable:Arm it for boot; add --now to also start it'
         'disable:Stop it coming back at boot; add --now to also stop it'
         'edit:Open the plist in $EDITOR and check it stays valid'
-        'delete:Stop it and move its plist to a dated backup'
+        'delete:Stop it and move its plist to the Trash'
+        'truncate:Empty its logs - truncate [err|out], both by default'
     )
 
     local -a opts
@@ -1700,7 +1756,7 @@ _my-lc() {
     local w
     for w in ${words[2,-1]}; do
         case $w in
-            status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete)
+            status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete|truncate)
                 verb=$w; break ;;
         esac
     done
@@ -1773,6 +1829,7 @@ complete_labels() {
     stop|restart|run|runnow) awk -F"$FS1" '$5=="on" || $5=="@off"' "$DB" ;;
     kill)            awk -F"$FS1" '$7 ~ /^run /'             "$DB" ;;
     edit|delete)     awk -F"$FS1" '$3 != "" && $3 !~ /^\/System\/Library\//' "$DB" ;;
+    truncate)        awk -F"$FS1" '$12 != "" || $13 != ""' "$DB" ;;
     *)               cat "$DB" ;;
   esac | cut -d"$FS1" -f1 | sort -u
 }
@@ -1783,7 +1840,7 @@ complete_labels() {
 
 is_verb() {
   case "$1" in
-    status|list|start|stop|restart|run|runnow|kill|enable|disable|delete|edit) return 0 ;;
+    status|list|start|stop|restart|run|runnow|kill|enable|disable|delete|edit|truncate) return 0 ;;
   esac
   return 1
 }
@@ -1860,6 +1917,14 @@ parse_args() {
           if [ "$VERB" = kill ]; then
             case "${2:-}" in
               HUP|INT|QUIT|KILL|TERM|USR1|USR2|STOP|CONT) KILLSIG=$2; shift ;;
+            esac
+          fi
+          # 'truncate' takes an optional stream, the way 'kill' takes a signal
+          if [ "$VERB" = truncate ]; then
+            case "${2:-}" in
+              stderr|err) TRUNC_WHAT=stderr; shift ;;
+              stdout|out) TRUNC_WHAT=stdout; shift ;;
+              both)       TRUNC_WHAT=both;   shift ;;
             esac
           fi
         else
@@ -1979,6 +2044,14 @@ build_db() {
   SEEN=' '      # labels already emitted
   SEENF=' '     # plist basenames already scanned
   NOW_EPOCH=$(date '+%s')
+  # launchd records no timestamp for a failure - only 'runs' and the exit
+  # code. But a boot-triggered service that ran and is not running now
+  # failed AT BOOT, and boot time is knowable, so the date is recoverable
+  # for exactly the services that have no log to date them by.
+  # Anchored on purpose: '.*sec' also matches 'usec', which captures the
+  # microseconds and dates everything to 1970.
+  BOOT_EPOCH=$(sysctl -n kern.boottime 2>/dev/null \
+               | sed -n 's/^{ *sec *= *\([0-9][0-9]*\).*/\1/p')
   AGENT_USER=$(id -un "${DOMAIN_UID:-$(id -u)}" 2>/dev/null)
   load_ps_map
   case "$SCOPE" in
@@ -2007,14 +2080,21 @@ do_action() {
     return 0
   fi
   # 'delete' removes a file, so it confirms even for a single target.
-  if { [ "$_n" -gt 1 ] || [ "$VERB" = delete ]; } && [ "$GO" != 1 ]; then
+  if { [ "$_n" -gt 1 ] || [ "$VERB" = delete ] || [ "$VERB" = truncate ]; } && [ "$GO" != 1 ]; then
     if [ "$_n" = 1 ]; then printf 'this would %s 1 service:\n\n' "$VERB"
     else                   printf 'this would %s %s services:\n\n' "$VERB" "$_n"; fi
-    while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of; do
+    while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
       printf '  %s%s%s\n' "$C_HDR" "$_l" "$C_OFF"
       plan_steps | sed 's/^/      /'
       case "$VERB" in
         edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '        %s\n' "$_p" ;;
+        truncate)
+          for _ts in "$_ef" "$_of"; do
+            [ -n "$_ts" ] && [ "$_ts" != "$EM" ] && [ -f "$_ts" ] || continue
+            printf '        %s (%s)\n' "$_ts" \
+              "$(human_size "$(wc -c < "$_ts" 2>/dev/null | tr -d ' ')")"
+            [ "$_ef" = "$_of" ] && break
+          done ;;
         delete)
           if [ -n "$_p" ] && [ "$_p" != "$EM" ]; then
             printf '        %s\n' "$_p"
@@ -2033,7 +2113,7 @@ do_action() {
   fi
   # Sequential, one launchctl call at a time, so the narration is
   # consecutive and a failure is unambiguously attributable.
-  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of; do
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
     [ -n "$_l" ] || continue
     if [ "$_a" = 1 ] && [ "${_p#/System/Library/}" != "$_p" ]; then
       msg "$_l is SIP-protected (/System/Library); launchd will not let anyone change it"
@@ -2065,6 +2145,13 @@ plan_steps() {
              printf -- '- disable it, so it stays off even if its plist comes back\n'
              printf -- '- move its plist to %s\n' "$(delete_where)" ;;
     edit)    printf -- '- open its plist in the editor\n' ;;
+    truncate)
+             case "$TRUNC_WHAT" in
+               stderr) printf -- '- empty its stderr log\n' ;;
+               stdout) printf -- '- empty its stdout log\n' ;;
+               *)      printf -- '- empty its stderr and stdout logs\n' ;;
+             esac
+             printf -- '  (the files stay, they are truncated to 0 bytes)\n' ;;
   esac
 }
 
@@ -2083,6 +2170,7 @@ plan_raw() {
              else printf 'launchctl disable %s/%s' "$2" "$1"; fi ;;
     delete)  printf 'launchctl bootout %s/%s ; disable %s/%s ; mv %s' "$2" "$1" "$2" "$1" "$3" ;;
     edit)    printf '%s %s' "${EDITOR_CMD:-${VISUAL:-${EDITOR:-vi}}}" "$3" ;;
+    truncate) printf 'truncate -s 0 <the %s log(s)>' "$TRUNC_WHAT" ;;
   esac
 }
 
@@ -2244,7 +2332,7 @@ run_tests() {
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
     printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
-    printf 'EDITOR_CMD=""\nDELETE_MODE=trash\nTIME_FORMAT=relative\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
+    printf 'EDITOR_CMD=""\nDELETE_MODE=trash\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 
   # and the suite's own view of the machine
@@ -2259,6 +2347,7 @@ run_tests() {
   t_version
   t_exitcodes
   t_timefmt
+  t_truncate
   t_errcolumn
   t_editdelete
   t_program
@@ -2671,6 +2760,75 @@ t_editdelete() {
   cleanup_fixtures
 }
 
+t_truncate() {
+  t_sec 'N. truncate'
+  _td="$TMPD/trunc"; mkdir -p "$_td/st"
+  _lab="$SELFTEST_PREFIX-trunc"
+  t_guard "$_lab"
+  _mk() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+      printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$1"
+      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$2"
+      printf '</dict></plist>\n'; } > "$_td/$_lab.plist"
+  }
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_td" "$_td" "$_td" > "$_td/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _run() { MY_LC_CONFIG="$_td/conf" "$0" $_sf "$_lab" truncate "$@" 2>&1; }
+  _sz() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+  _mk "$_td/e.log" "$_td/o.log"
+  printf 'aaaa\nbbbb\n' > "$_td/e.log"; printf 'cccc\n' > "$_td/o.log"
+
+  # it must CONFIRM: truncating discards data
+  _o=$(_run < /dev/null)
+  case "$_o" in *'this would truncate 1 service:'*) t_ok 'truncate confirms before discarding anything' ;;
+    *) t_no 'truncate confirms' 'this would truncate 1 service:' "$_o" ;; esac
+  t_eq 'truncate without go changes nothing' 10 "$(_sz "$_td/e.log")"
+  # ...and the plan says how much would go
+  case "$_o" in *'(10B)'*) t_ok 'the plan says how much would be discarded' ;;
+    *) t_no 'plan shows sizes' '(10B)' "$_o" ;; esac
+
+  # err only
+  _run err --go >/dev/null 2>&1
+  t_eq 'truncate err empties stderr'        0 "$(_sz "$_td/e.log")"
+  t_eq 'truncate err leaves stdout alone'   5 "$(_sz "$_td/o.log")"
+
+  # out only
+  printf 'aaaa\nbbbb\n' > "$_td/e.log"
+  _run out --go >/dev/null 2>&1
+  t_eq 'truncate out empties stdout'        0 "$(_sz "$_td/o.log")"
+  t_eq 'truncate out leaves stderr alone'   10 "$(_sz "$_td/e.log")"
+
+  # both by default
+  printf 'cccc\n' > "$_td/o.log"
+  _run --go >/dev/null 2>&1
+  t_eq 'truncate with no argument does both (stderr)' 0 "$(_sz "$_td/e.log")"
+  t_eq 'truncate with no argument does both (stdout)' 0 "$(_sz "$_td/o.log")"
+
+  # the file must SURVIVE: launchd holds it open, so unlinking would orphan it
+  if [ -f "$_td/e.log" ]; then t_ok 'the log file survives, it is only emptied'
+  else t_no 'truncate keeps the file' 'the file still exists' 'it was removed'; fi
+
+  # one file serving both streams is emptied once, and named as one
+  _mk "$_td/both.log" "$_td/both.log"
+  printf 'xxxx\n' > "$_td/both.log"
+  _o=$(_run --go)
+  case "$_o" in *'stderr+stdout'*) t_ok 'a shared log is emptied once, and named as one' ;;
+    *) t_no 'shared log' 'stderr+stdout' "$_o" ;; esac
+  t_eq 'the shared log is empty afterwards' 0 "$(_sz "$_td/both.log")"
+
+  # an already-empty log is said so, not silently "done"
+  _o=$(_run --go)
+  case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
+    *) t_no 'already empty' 'already empty' "$_o" ;; esac
+  cleanup_fixtures
+}
+
 t_errcolumn() {
   t_sec 'M. the ERR column tells the truth about itself'
   _cd="$TMPD/errcol"; mkdir -p "$_cd/st"
@@ -2729,8 +2887,29 @@ t_timefmt() {
   _save=$TIME_FMT; TIME_FMT='%Y%m%d'
   t_eq 'TIME_FMT is honoured' "$(date -r "$_then" '+%Y%m%d')" "$(when "$_then")"
   TIME_FMT=$_save
-  TIME_FORMAT=relative
   t_eq 'an empty moment is ? and not a crash' '?' "$(when '')"
+
+  # absolute is the DEFAULT: a timestamp can be lined up against other logs,
+  # an age cannot
+  _o=$("$0" --create-config 2>/dev/null | grep '^TIME_FORMAT=')
+  t_eq 'the shipped default is absolute' 'TIME_FORMAT=absolute' "$_o"
+
+  # boot time must be parsed from the RIGHT number: '.*sec' also matches
+  # 'usec', which captures the microseconds and dates everything to 1970
+  if [ -n "$BOOT_EPOCH" ]; then
+    if [ "$BOOT_EPOCH" -gt 1000000000 ] 2>/dev/null; then
+      t_ok "boot time parsed as a real epoch ($(date -r "$BOOT_EPOCH" '+%Y-%m-%d'))"
+    else
+      t_no 'boot epoch is sane' 'a 10-digit epoch' "$BOOT_EPOCH"
+    fi
+    _up=$(( $(now_epoch) - BOOT_EPOCH ))
+    if [ "$_up" -gt 0 ] && [ "$_up" -lt 315360000 ]; then
+      t_ok 'boot time gives a plausible uptime'
+    else t_no 'uptime from boot time' 'between 0 and 10 years' "$_up seconds"; fi
+  else
+    t_no 'boot time is readable' 'an epoch from kern.boottime' 'empty'
+  fi
+  TIME_FORMAT=relative
 }
 
 t_exitcodes() {
