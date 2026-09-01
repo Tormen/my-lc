@@ -185,8 +185,11 @@ a way to learn the raw commands.
   that makes it stay down.
 - **launchctl's numeric errors** (`Bootstrap failed: 5: Input/output
   error`) are translated to their actual causes.
-- **stderr line count** is in the default listing, because a non-empty
-  stderr on a daemon is almost always the reason you opened the tool.
+- **stderr line count** is in the default listing — marked `+out` when
+  stdout is the *same file*, so the count is not mistaken for pure errors.
+  It is highlighted only when something else already says the service is in
+  trouble: `NSLog` writes ordinary lines to stderr, so colouring every
+  non-empty stderr red would just train the eye to ignore red.
 - **`status <one service>`** shows the log lines added since that service
   last started, not a blind tail.
 - **File-system triggers are verified, not just listed.** A `WatchPaths`

@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="73cc8a7"
+SCRIPT_COMMIT="22202cc"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -155,6 +155,11 @@ TRIGGER — why it would run, read from the plist
   watch    WatchPaths           queue    QueueDirectories
   sock     Sockets              xpc      MachServices
   login    LimitLoadToSessionType        manual  none of the above
+  ERR shows the size and age of the service's stderr, and '+out' when
+  stdout is the SAME file, so the count is not stderr alone. It is only
+  highlighted when something else already says the service is in trouble:
+  a non-empty stderr on its own is not evidence of a problem.
+
   A trailing ! means a watched path is missing — usually why a watch
   service never fires. A ? means the plist could not be read (rerun as
   root). MISSING and ? are never conflated: a path under an unreadable
@@ -921,6 +926,13 @@ discover_scope() {
     esac
     [ "$_ei" = '?PENDING' ] && _ei=$(log_indicator "$_ef")
     [ "$_oi" = '?PENDING' ] && _oi=$(log_indicator "$_of")
+    # When both streams point at ONE file the count is not stderr alone, and
+    # saying so matters: it is the difference between "90 lines of errors"
+    # and "90 lines of ordinary logging that happen to include stderr".
+    if [ -n "$_ef" ] && [ "$_ef" = "$_of" ]; then
+      [ "$_ei" = '-' ] || _ei="$_ei +out"
+      _oi='same file'
+    fi
 
     # When did it last do anything? The newest of its log files is the only
     # evidence launchd leaves behind. For a FAILED service that is the
@@ -1087,8 +1099,18 @@ render_table() {
     else
       printf '%-*s ' "$_ws" "$_su"
     fi
+    # Red only when something else already says this service is in trouble.
+    # A non-empty stderr on its own means nothing: NSLog and friends write
+    # ordinary informational lines there, so colouring every one of them red
+    # trains the eye to ignore the colour.
     if [ "$_er" = '-' ]; then printf -- '-'
-    else printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF"; fi
+    else
+      case "$_su" in
+        FAIL*|*'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
+          printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF" ;;
+        *) printf '%s' "$_er" ;;
+      esac
+    fi
     [ "$VRB" = 1 ] && printf ' %s' "$_ou"
     printf '\n'
     if [ "$VRB" = 1 ]; then
@@ -1262,9 +1284,16 @@ show_log_delta() {
   fi
 
   _shown=0
+  _same=0
+  [ -n "$_ef" ] && [ "$_ef" = "$_of" ] && _same=1
   for _which in stderr stdout; do
     if [ "$_which" = stderr ]; then _lf=$_ef; _off=$_eo; else _lf=$_of; _off=$_oo; fi
     [ -n "$_lf" ] || continue
+    # One file serving both streams: show it once, named for what it is.
+    if [ "$_same" = 1 ]; then
+      [ "$_which" = stdout ] && continue
+      _which='stderr+stdout (one file)'
+    fi
     [ -e "$_lf" ] || continue
     if [ ! -r "$_lf" ]; then
       printf '\n  %s: not readable as %s; rerun as root\n' "$_which" "$(id -un)"
@@ -2230,6 +2259,7 @@ run_tests() {
   t_version
   t_exitcodes
   t_timefmt
+  t_errcolumn
   t_editdelete
   t_program
   t_watch
@@ -2641,6 +2671,46 @@ t_editdelete() {
   cleanup_fixtures
 }
 
+t_errcolumn() {
+  t_sec 'M. the ERR column tells the truth about itself'
+  _cd="$TMPD/errcol"; mkdir -p "$_cd/st"
+  printf 'a\nb\nc\n' > "$_cd/both.log"
+  printf 'x\n'         > "$_cd/only.err"
+  for _v in same split; do
+    if [ "$_v" = same ]; then _e="$_cd/both.log"; _u="$_cd/both.log"
+    else                      _e="$_cd/only.err"; _u="$_cd/both.log"; fi
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s-ec-%s</string>\n' "$SELFTEST_PREFIX" "$_v"
+      printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$_e"
+      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$_u"
+      printf '</dict></plist>\n'; } > "$_cd/$SELFTEST_PREFIX-ec-$_v.plist"
+  done
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_cd" "$_cd" "$_cd" > "$_cd/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+
+  _o=$(MY_LC_CONFIG="$_cd/conf" "$0" $_sf list 2>&1)
+  case "$_o" in *'+out'*) t_ok 'a merged stderr is marked +out in the ERR column' ;;
+    *) t_no 'ERR marks a merged log' '+out' "$_o" ;; esac
+  _sp=$(printf '%s\n' "$_o" | grep -- '-ec-split')
+  case "$_sp" in *'+out'*) t_no 'a separate stderr is NOT marked' 'no +out' "$_sp" ;;
+    *) t_ok 'a separate stderr is not marked' ;; esac
+
+  # a healthy service with a non-empty stderr must NOT be highlighted:
+  # NSLog writes ordinary lines there, so red on every one trains the eye
+  # to ignore red
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=always\n' \
+    "$_cd" "$_cd" "$_cd" > "$_cd/confc"
+  _o=$(MY_LC_CONFIG="$_cd/confc" "$0" $_sf list 2>&1 | grep -- '-ec-same')
+  case "$_o" in
+    *"$(printf '\033')[31m"*'L '*) t_no 'a healthy log is not red' 'no red on the ERR cell' "$_o" ;;
+    *) t_ok 'a healthy non-empty stderr is not highlighted' ;;
+  esac
+}
+
 t_timefmt() {
   t_sec 'L. time rendering follows the config'
   _now=$(now_epoch)
@@ -2782,7 +2852,18 @@ t_logs() {
       *e*) t_ok 'an empty delta still shows the tail of the log' ;;
       *) t_no 'empty delta shows the tail' 'the last lines' "$_o" ;;
     esac
-    rm -f "$_big" "$_sm"
+    # stderr and stdout very often point at ONE file. Showing the identical
+    # tail twice is noise, and the ERR count is then not stderr alone.
+    # a fresh label: the earlier tests left a watermark on $_lab
+    _one="$_ld/one.log"; printf 'alpha\nbeta\n' > "$_one"
+    _o=$(show_log_delta "$SELFTEST_PREFIX-merged" "$_one" "$_one")
+    case "$_o" in
+      *'stderr+stdout (one file)'*) t_ok 'one file serving both streams is shown once' ;;
+      *) t_no 'merged log shown once' 'stderr+stdout (one file)' "$_o" ;;
+    esac
+    _n2=$(printf '%s\n' "$_o" | grep -c alpha)
+    t_eq 'a merged log is not printed twice' 1 "$_n2"
+    rm -f "$_one" "$_big" "$_sm"
 
     # truncation must not produce a negative offset
     write_mark "$_lab" "$_el" "$_ol" exact
