@@ -187,11 +187,13 @@ a way to learn the raw commands.
   that makes it stay down.
 - **launchctl's numeric errors** (`Bootstrap failed: 5: Input/output
   error`) are translated to their actual causes.
-- **stderr line count** is in the default listing — marked `+out` when
-  stdout is the *same file*, so the count is not mistaken for pure errors.
-  It is highlighted only when something else already says the service is in
-  trouble: `NSLog` writes ordinary lines to stderr, so colouring every
-  non-empty stderr red would just train the eye to ignore red.
+- **stderr is in the default listing, highlighted** — the line count plus
+  when the *last* line was written (`3L last 2026-09-02_0118`; the bare
+  timestamp read as either the first or the last error, so it says which).
+  The one exception is a service whose stdout is the same file: an error
+  cannot be told from ordinary output there, so it reads
+  `merged with stdout: 90L` and is left plain rather than raising a false
+  alarm.
 - **`status <one service>`** shows the log lines added since that service
   last started, not a blind tail.
 - **File-system triggers are verified, not just listed.** A `WatchPaths`

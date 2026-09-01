@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="fbb41a1"
+SCRIPT_COMMIT="b822999"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -166,10 +166,11 @@ TRIGGER — why it would run, read from the plist
   watch    WatchPaths           queue    QueueDirectories
   sock     Sockets              xpc      MachServices
   login    LimitLoadToSessionType        manual  none of the above
-  ERR shows the size and age of the service's stderr, and '+out' when
-  stdout is the SAME file, so the count is not stderr alone. It is only
-  highlighted when something else already says the service is in trouble:
-  a non-empty stderr on its own is not evidence of a problem.
+  ERR is the service's own stderr: the line count and WHEN THE LAST line
+  was written. Any non-empty stderr is highlighted. The exception is a
+  service whose stdout is the same file - an error cannot be told apart
+  from ordinary output there, so it reads 'merged with stdout: NNL' and is
+  left plain.
 
   A trailing ! means a watched path is missing — usually why a watch
   service never fires. A ? means the plist could not be read (rerun as
@@ -943,7 +944,12 @@ discover_scope() {
     # saying so matters: it is the difference between "90 lines of errors"
     # and "90 lines of ordinary logging that happen to include stderr".
     if [ -n "$_ef" ] && [ "$_ef" = "$_of" ]; then
-      [ "$_ei" = '-' ] || _ei="$_ei +out"
+      # One file for both streams: the count is not errors, it is everything
+      # the service logged. Say so in words rather than marking it, and
+      # leave it uncoloured - there is nothing here to alarm anyone.
+      if [ "$_ei" != '-' ]; then
+        _ei="merged with stdout: ${_ei%% *}"
+      fi
       _oi='same file'
     fi
 
@@ -1003,7 +1009,10 @@ log_indicator() {
   [ "${_sz:-0}" -gt 0 ] 2>/dev/null || { printf -- '-'; return; }
   _ln=$(wc -l < "$1" 2>/dev/null | tr -d ' ')
   _mt=$(file_epoch "$1")
-  if [ -n "$_mt" ]; then printf '%sL %s' "$_ln" "$(when "$_mt")"
+  # 'last' is not decoration: the file's mtime is when the most recent line
+  # was written, not when the first error happened, and the bare timestamp
+  # read as either.
+  if [ -n "$_mt" ]; then printf '%sL last %s' "$_ln" "$(when "$_mt")"
   else                   printf '%sL' "$_ln"; fi
 }
 
@@ -1119,16 +1128,15 @@ render_table() {
     else
       printf '%-*s ' "$_ws" "$_su"
     fi
-    # Red only when something else already says this service is in trouble.
-    # A non-empty stderr on its own means nothing: NSLog and friends write
-    # ordinary informational lines there, so colouring every one of them red
-    # trains the eye to ignore the colour.
+    # A service writing to its OWN stderr is worth the eye going to it, so
+    # every non-empty one is coloured. The single exception is a log shared
+    # with stdout: there is no way to tell an error from ordinary output in
+    # it, so it is reported in words and left plain.
     if [ "$_er" = '-' ]; then printf -- '-'
     else
-      case "$_su" in
-        FAIL*|*'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
-          printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF" ;;
-        *) printf '%s' "$_er" ;;
+      case "$_er" in
+        merged*) printf '%s' "$_er" ;;
+        *)       printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF" ;;
       esac
     fi
     [ "$VRB" = 1 ] && printf ' %s' "$_ou"
@@ -3298,21 +3306,29 @@ t_errcolumn() {
   _sf=; [ "$SCOPE" = agents ] && _sf=--agents
 
   _o=$(MY_LC_CONFIG="$_cd/conf" "$0" $_sf list 2>&1)
-  case "$_o" in *'+out'*) t_ok 'a merged stderr is marked +out in the ERR column' ;;
-    *) t_no 'ERR marks a merged log' '+out' "$_o" ;; esac
+  # a shared log cannot be called an error count: say what it is, in words
+  case "$_o" in *'merged with stdout:'*) t_ok 'a shared log is described, not counted as errors' ;;
+    *) t_no 'merged wording' 'merged with stdout: NNL' "$_o" ;; esac
   _sp=$(printf '%s\n' "$_o" | grep -- '-ec-split')
-  case "$_sp" in *'+out'*) t_no 'a separate stderr is NOT marked' 'no +out' "$_sp" ;;
-    *) t_ok 'a separate stderr is not marked' ;; esac
+  case "$_sp" in *'merged'*) t_no 'a separate stderr is not called merged' 'no merged' "$_sp" ;;
+    *) t_ok 'a separate stderr is not described as merged' ;; esac
+  # the timestamp must say WHICH moment it is: mtime is the LAST write
+  case "$_sp" in *'last '*) t_ok 'the stderr timestamp is labelled as the last write' ;;
+    *) t_no 'timestamp labelled' 'NNL last <when>' "$_sp" ;; esac
 
-  # a healthy service with a non-empty stderr must NOT be highlighted:
-  # NSLog writes ordinary lines there, so red on every one trains the eye
-  # to ignore red
+  # every real stderr is coloured - that IS the case worth looking at
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=always\n' \
     "$_cd" "$_cd" "$_cd" > "$_cd/confc"
+  _o=$(MY_LC_CONFIG="$_cd/confc" "$0" $_sf list 2>&1 | grep -- '-ec-split')
+  case "$_o" in
+    *"$(printf '\033')[31m"*) t_ok 'a service with its own stderr is highlighted' ;;
+    *) t_no 'stderr is red' 'a red ERR cell' "$_o" ;;
+  esac
+  # ...except a merged one, where an error cannot be told from ordinary output
   _o=$(MY_LC_CONFIG="$_cd/confc" "$0" $_sf list 2>&1 | grep -- '-ec-same')
   case "$_o" in
-    *"$(printf '\033')[31m"*'L '*) t_no 'a healthy log is not red' 'no red on the ERR cell' "$_o" ;;
-    *) t_ok 'a healthy non-empty stderr is not highlighted' ;;
+    *"$(printf '\033')[31m"*'merged'*) t_no 'merged is not coloured' 'plain text' "$_o" ;;
+    *) t_ok 'a merged log is left plain, since it is not an error count' ;;
   esac
 }
 
