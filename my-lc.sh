@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="d40cb83"
+SCRIPT_COMMIT="78a1858"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -56,6 +56,7 @@ ERR_TAIL=10
 BIG_DELTA=1048576
 WIDTH_LABEL=auto
 COLOR=auto
+EDITOR_CMD=""
 
 # --- internal ----------------------------------------------------------
 # Internal record format. Tab-separated, with an explicit marker for an
@@ -86,7 +87,7 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
            program path. Several words are ANDed. A .plist path, a bare
            label and system/<label> are interchangeable.
   VERB     status (default) | list | start | stop | restart | run | kill
-           | enable | disable        (recognised in any position)
+           | enable | disable | edit | delete   (any position)
 
   status   one match -> the record view; otherwise the table
   list     always the table
@@ -97,6 +98,8 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   kill     signal the running process (default TERM; 'kill HUP' to pick)
   enable   arm it for boot; add --now to also start it
   disable  stop it coming back at boot; add --now to also stop it now
+  edit     open the plist in $EDITOR, then check it is still valid
+  delete   stop it and move its plist to a dated backup (always confirms)
 
   --enabled          only services that could run or are running (default)
   --disabled         only services that are switched off
@@ -357,6 +360,10 @@ BIG_DELTA=1048576
 
 # Label column width: 'auto' fits the widest label, or give a number.
 WIDTH_LABEL=auto
+
+# Editor used by the 'edit' verb. Empty means: $VISUAL, then $EDITOR, then
+# vi. Set it here to override the environment.
+EDITOR_CMD=""
 
 # Colour: auto (only on a terminal) | always | never
 COLOR=auto
@@ -881,6 +888,26 @@ discover_scope() {
     esac
     [ "$_ei" = '?PENDING' ] && _ei=$(log_indicator "$_ef")
     [ "$_oi" = '?PENDING' ] && _oi=$(log_indicator "$_of")
+
+    # When did it last do anything? The newest of its log files is the only
+    # evidence launchd leaves behind. For a FAILED service that is the
+    # difference between "it broke" and "it has been broken since July".
+    _last=
+    for _lp in "$_ef" "$_of"; do
+      [ -n "$_lp" ] || continue
+      _lm=$(file_epoch "$_lp") || continue
+      [ -n "$_lm" ] || continue
+      [ -z "$_last" ] && _last=$_lm
+      [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
+    done
+    if [ -n "$_last" ]; then
+      _lage=$(human_age $(( NOW_EPOCH - _last )) )
+      case "$_su" in
+        run\ *) ;;
+        FAIL*)  _su="$_su, dead $_lage" ;;
+        *)      [ "$VRB" = 1 ] && _su="$_su, last $_lage" ;;
+      esac
+    fi
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
            "$_pr" "$_us" "$_ef" "$_of" "$_wat" >> "$DB"
   done < "$TMPD/joined"
@@ -1058,6 +1085,22 @@ render_record() {
   printf '  %-10s %s\n' 'state:'   "$(state_render "$_st")  $(state_meaning "$_st")"
   printf '  %-10s %s\n' 'trigger:' "$_tr"
   printf '  %-10s %s\n' 'status:'  "$_su"
+  _rl=
+  for _lp in "$_ef" "$_of"; do
+    [ -n "$_lp" ] || continue
+    _lm=$(file_epoch "$_lp") || continue
+    [ -n "$_lm" ] || continue
+    [ -z "$_rl" ] && _rl=$_lm
+    [ "$_lm" -gt "$_rl" ] 2>/dev/null && _rl=$_lm
+  done
+  if [ -n "$_rl" ]; then
+    case "$_su" in
+      run\ *) printf '  %-10s %s\n' 'last log:' \
+                "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
+      *)      printf '  %-10s %s\n' 'dead since:' \
+                "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
+    esac
+  fi
   case "$_su" in
     FAIL\ *) _code=${_su#FAIL }; _code=${_code%% *}
              _long=$(exit_meaning "$_code" long)
@@ -1303,6 +1346,8 @@ act_on() {
     kill)    v_kill    ;;
     enable)  v_enable  ;;
     disable) v_disable ;;
+    delete)  v_delete  ;;
+    edit)    v_edit    ;;
   esac
 }
 
@@ -1415,6 +1460,81 @@ v_disable() {
   else step_fail "$(translate_lc_error)"; fi
 }
 
+# Remove a launch item for good: stop it, then take its plist out of the
+# way. The plist is MOVED to a dated backup rather than unlinked - undoing a
+# delete should not need a reinstall.
+v_delete() {
+  [ -n "$_plist" ] || { msg "$_label has no plist on disk; nothing to delete"; EXITCODE=1; return 0; }
+  case "$_plist" in
+    /System/Library/*) msg "$_label is SIP-protected; macOS will not let it be removed"
+                       EXITCODE=1; return 0 ;;
+  esac
+  if [ "$_state" = on ] || [ "$_state" = '@off' ]; then
+    msgn "stopping $_label ..."; [ "$VRB" = 1 ] && printf '\n'
+    if lc bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  fi
+  if ensure_state_dir && mkdir -p "$STATE_DIR/deleted" 2>/dev/null; then
+    _bk="$STATE_DIR/deleted/$_label.plist.$(date '+%Y%m%d-%H%M%S')"
+    msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
+    det "moved to $_bk, so this can be undone"
+    if run mv "$_plist" "$_bk"; then
+      step_ok
+      msg "backup: $_bk"
+    else step_fail 'could not move the plist (needs root?)'; fi
+  else
+    msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
+    if run rm -f "$_plist"; then step_ok; else step_fail 'could not remove the plist (needs root?)'; fi
+  fi
+  case "$_state" in
+    off|@off) msg "note: $_label stays listed as disabled in the override database" ;;
+  esac
+}
+
+# Open the plist in the user's editor, then check what came back.
+v_edit() {
+  [ -n "$_plist" ] || { err "$_label has no plist on disk to edit"; return 0; }
+  case "$_plist" in
+    /System/Library/*) err "$_label is SIP-protected; its plist cannot be edited"; return 0 ;;
+  esac
+  _ed=${EDITOR_CMD:-${VISUAL:-${EDITOR:-vi}}}
+  command -v "${_ed%% *}" >/dev/null 2>&1 \
+    || die "editor not found: $_ed  (set EDITOR, or EDITOR_CMD in the config)"
+  [ -w "$_plist" ] || [ "$(id -u)" = 0 ] \
+    || warn "$_plist is not writable by $(id -un); the editor may refuse to save"
+  _before=$(shasum -a 256 "$_plist" 2>/dev/null | cut -d' ' -f1)
+  msg "editing $_plist with $_ed"
+  run "$_ed" "$_plist"
+  _after=$(shasum -a 256 "$_plist" 2>/dev/null | cut -d' ' -f1)
+  if [ "$_before" = "$_after" ]; then
+    msg "unchanged"
+    return 0
+  fi
+  # A malformed plist is silently ignored by launchd, so check it here.
+  # 'plutil -lint' alone is too weak: it accepts a bare word, because that
+  # is a valid old-style plist string. launchd needs a DICT WITH A LABEL,
+  # so that is what gets checked.
+  if ! plutil -lint "$_plist" >/dev/null 2>&1; then
+    err "the plist is NOT valid any more:"
+    plutil -lint "$_plist" 2>&1 | sed 's/^/    /' >&2
+    printf '    > launchd ignores a malformed plist; fix it or restore the backup\n' >&2
+    return 0
+  fi
+  if ! plutil -extract Label raw -o - "$_plist" >/dev/null 2>&1; then
+    err "the plist parses, but it is NOT a launchd job any more"
+    printf '    > it needs to be a dictionary with a Label key\n' >&2
+    printf '    > launchd ignores it as it stands\n' >&2
+    return 0
+  fi
+  msg "saved; it is a valid launchd job"
+  _newlab=$(plutil -extract Label raw -o - "$_plist" 2>/dev/null)
+  [ -n "$_newlab" ] && [ "$_newlab" != "$_label" ] && \
+    msg "note: the Label is now '$_newlab' - the old service keeps the old name until reloaded"
+  case "$_state" in
+    on|@off) msg "$_label is loaded with the OLD definition - 'restart' to apply the change" ;;
+    *)       msg "$_label is not loaded; 'start' it to apply the change" ;;
+  esac
+}
+
 # ======================================================================
 # zsh completion — installed transparently on every run, idempotent
 # ======================================================================
@@ -1443,6 +1563,8 @@ _my-lc() {
         'kill:Signal the running process (default TERM)'
         'enable:Arm it for boot; add --now to also start it'
         'disable:Stop it coming back at boot; add --now to also stop it'
+        'edit:Open the plist in $EDITOR and check it stays valid'
+        'delete:Stop it and move its plist to a dated backup'
     )
 
     local -a opts
@@ -1478,7 +1600,7 @@ _my-lc() {
     local w
     for w in ${words[2,-1]}; do
         case $w in
-            status|list|start|stop|restart|run|runnow|kill|enable|disable)
+            status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete)
                 verb=$w; break ;;
         esac
     done
@@ -1550,6 +1672,7 @@ complete_labels() {
     start)           awk -F"$FS1" '$5=="@on"'                "$DB" ;;
     stop|restart|run|runnow) awk -F"$FS1" '$5=="on" || $5=="@off"' "$DB" ;;
     kill)            awk -F"$FS1" '$7 ~ /^run /'             "$DB" ;;
+    edit|delete)     awk -F"$FS1" '$3 != "" && $3 !~ /^\/System\/Library\//' "$DB" ;;
     *)               cat "$DB" ;;
   esac | cut -d"$FS1" -f1 | sort -u
 }
@@ -1560,7 +1683,7 @@ complete_labels() {
 
 is_verb() {
   case "$1" in
-    status|list|start|stop|restart|run|runnow|kill|enable|disable) return 0 ;;
+    status|list|start|stop|restart|run|runnow|kill|enable|disable|delete|edit) return 0 ;;
   esac
   return 1
 }
@@ -1778,8 +1901,15 @@ do_action() {
     err "nothing matched$( [ -n "$FILTERS" ] && printf ':%s' "$FILTERS" )"
     return 0
   fi
-  if [ "$_n" -gt 1 ] && [ "$GO" != 1 ]; then
-    printf 'this would %s %s services:\n\n' "$VERB" "$_n"
+  if [ "$VERB" = edit ] && [ "$_n" -gt 1 ]; then
+    err "'edit' opens one plist at a time; $_n services matched"
+    printf '    > narrow the filter, or name the service exactly\n' >&2
+    return 0
+  fi
+  # 'delete' removes a file, so it confirms even for a single target.
+  if { [ "$_n" -gt 1 ] || [ "$VERB" = delete ]; } && [ "$GO" != 1 ]; then
+    if [ "$_n" = 1 ]; then printf 'this would %s 1 service:\n\n' "$VERB"
+    else                   printf 'this would %s %s services:\n\n' "$VERB" "$_n"; fi
     while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of; do
       printf '  %-46s %s\n' "$_l" "$(plan_line "$_l" "$_d" "$_p" "$_st")"
     done < "$_sel"
@@ -1813,6 +1943,8 @@ plan_line() {
                             || printf 'launchctl enable %s/%s' "$2" "$1" ;;
     disable) [ "$NOW" = 1 ] && printf 'launchctl bootout + disable %s/%s' "$2" "$1" \
                             || printf 'launchctl disable %s/%s' "$2" "$1" ;;
+    delete)  printf 'bootout %s/%s, then move %s away' "$2" "$1" "$3" ;;
+    edit)    printf 'open %s in an editor' "$3" ;;
   esac
 }
 
@@ -1973,7 +2105,7 @@ run_tests() {
     printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\nEDITOR_CMD=""\n'
   } > "$T_CONF"
 
   # and the suite's own view of the machine
@@ -1987,6 +2119,7 @@ run_tests() {
   t_hints
   t_version
   t_exitcodes
+  t_editdelete
   t_program
   t_watch
   t_logs
@@ -2295,6 +2428,66 @@ t_program() {
     *)    t_no 'unknown user' '? no such user' "$(program_access "$_pd/good" no-such-user-xyz)" ;;
   esac
   t_eq 'root reaches everything' 'ok (root)' "$(program_access "$_pd/good" root)"
+}
+
+t_editdelete() {
+  t_sec 'K. edit and delete'
+  _ed="$TMPD/ed"; mkdir -p "$_ed"
+  _lab="$SELFTEST_PREFIX-editme"
+  t_guard "$_lab"
+  _pl=$(t_plist editme)
+  cp "$_pl" "$_ed/$_lab.plist"
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_ed" "$_ed" "$_ed" > "$_ed/conf"
+  _sf=
+  [ "$SCOPE" = agents ] && _sf=--agents
+
+  # edit: no change, a valid change, and a change that breaks the plist
+  printf '#!/bin/sh\nexit 0\n' > "$_ed/noop"; chmod 755 "$_ed/noop"
+  # shellcheck disable=SC2016  # $1 belongs to the generated script, not to us
+  printf '#!/bin/sh\nsed -i "" "s|3600|7200|" "$1"\n' > "$_ed/ok"; chmod 755 "$_ed/ok"
+  # a bare word IS a valid plist string, so break it in a way launchd cares
+  # about: valid syntax, but not a dict with a Label
+  # shellcheck disable=SC2016  # same
+  printf '#!/bin/sh\nprintf "just-a-string\\n" > "$1"\n' > "$_ed/bad"; chmod 755 "$_ed/bad"
+
+  _o=$(EDITOR="$_ed/noop" MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" edit 2>&1)
+  case "$_o" in *unchanged*) t_ok 'edit reports an unchanged plist' ;;
+    *) t_no 'edit: unchanged' 'unchanged' "$_o" ;; esac
+
+  _o=$(EDITOR="$_ed/ok" MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" edit 2>&1)
+  case "$_o" in *'valid launchd job'*) t_ok 'edit validates a good change' ;;
+    *) t_no 'edit: valid change' 'a valid launchd job' "$_o" ;; esac
+
+  _o=$(EDITOR="$_ed/bad" MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" edit 2>&1)
+  case "$_o" in
+    *'NOT a launchd job'*) t_ok 'edit catches a plist that stopped being a launchd job' ;;
+    *) t_no 'edit: broken plist' 'NOT a launchd job any more' "$_o" ;;
+  esac
+  # and truly malformed content is caught too
+  # shellcheck disable=SC2016  # $1 belongs to the generated script
+  printf '#!/bin/sh\nprintf "<<<\\n" > "$1"\n' > "$_ed/bad2"; chmod 755 "$_ed/bad2"
+  cp "$_pl" "$_ed/$_lab.plist"
+  _o=$(EDITOR="$_ed/bad2" MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" edit 2>&1)
+  case "$_o" in *'NOT valid'*) t_ok 'edit catches malformed XML' ;;
+    *) t_no 'edit: malformed' 'NOT valid any more' "$_o" ;; esac
+
+  # delete must CONFIRM even for a single service, and must not act without it
+  cp "$_pl" "$_ed/$_lab.plist"
+  _o=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" delete < /dev/null 2>&1)
+  case "$_o" in *'this would delete 1 service:'*) t_ok 'delete confirms even for one service' ;;
+    *) t_no 'delete confirmation' 'this would delete 1 service:' "$_o" ;; esac
+  if [ -f "$_ed/$_lab.plist" ]; then t_ok 'delete without go removes nothing'
+  else t_no 'delete without go is a no-op' 'the plist still there' 'it was deleted'; fi
+
+  # ...and with --go it backs the plist up rather than unlinking it
+  _o=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf "$_lab" delete --go 2>&1)
+  if [ -f "$_ed/$_lab.plist" ]; then t_no 'delete --go removes the plist' 'gone' 'still there'
+  else t_ok 'delete --go removes the plist'; fi
+  if ls "$_ed"/st/deleted/"$_lab".plist.* >/dev/null 2>&1; then
+    t_ok 'delete keeps a dated backup, so it can be undone'
+  else t_no 'delete backs up the plist' 'a file under st/deleted/' 'no backup found'; fi
+  cleanup_fixtures
 }
 
 t_exitcodes() {

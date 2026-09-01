@@ -117,6 +117,8 @@ you will find in most existing documentation.
 | `bootout` + `disable <d>/<L>` | `unload -w <plist>` | `disable --now` | stop it coming back **and** stop it now |
 | `kickstart -k <d>/<L>` | `start <L>` | `run` (alias `runnow`) | execute the program **now**, without waiting for its trigger |
 | `kill <sig> <d>/<L>` | `stop <L>` | `kill [SIG]` | signal the running process — a KeepAlive service comes straight back |
+| — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
+| — | — | `delete` | stop it and move its plist to a dated backup (always confirms) |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
 Three levels of permanence: `kill` touches the **process** only ·
@@ -205,6 +207,18 @@ a way to learn the raw commands.
               newest entry: scan_0042.pdf (3h12m ago)
             /some/gone/path                                      MISSING
 ```
+- **The program is checked, not assumed.** A launch item whose program is
+  missing, empty, non-executable or unreachable fails with 126/127 and
+  launchd says nothing about why. my-lc reports it in the table and explains
+  it in the record view — and judges executability for the user the service
+  **runs as** (`UserName`, else root for a daemon, else the session user),
+  not for whoever happens to be running my-lc.
+- **Exit codes are translated** — `FAIL 78 config error`, and in the record
+  view `exit 78 = EX_CONFIG: the program rejected its own configuration`.
+  `128+N` is reported as death by signal N.
+- **"dead since"** — for a failed service, when it last did anything, taken
+  from the newest of its log files. "It is broken" and "it has been broken
+  since July" are different problems.
 - **Who it runs as** is merged into the status text, and shown only when it
   is *not* the default — a daemon that runs as root and an agent that runs
   as its session user say nothing, but `run 2d1h as _www` tells you the
