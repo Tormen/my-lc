@@ -120,6 +120,7 @@ you will find in most existing documentation.
 | — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
 | — | — | `delete` | stop it, disable it, and move its plist to a dated backup (always confirms) |
 | — | — | `truncate [err\|out]` | empty its logs to 0 bytes, both streams by default (always confirms) |
+| — | — | `undelete` | put a deleted plist back and re-enable it; with no filter, list what can be restored |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
 Three levels of permanence: `kill` touches the **process** only ·
@@ -233,6 +234,14 @@ a way to learn the raw commands.
   is *not* the default — a daemon that runs as root and an agent that runs
   as its session user say nothing, but `run 2d1h as _www` tells you the
   plist set `UserName`. `-V` shows it always.
+- **`delete` is reversible.** The plist is moved to a dated backup with a
+  note of where it came from, so `undelete` puts it back exactly there and
+  clears the disable that `delete` set. A plist in the Trash that my-lc did
+  *not* delete is never offered — installing a launch daemon from a guessed
+  location would be reckless.
+- **`status` dates the plist itself** — when it was written and whether it
+  has changed since. An old plist edited yesterday is a different story
+  from one untouched since it was installed.
 - **The plan before a destructive action is in plain words**, one bullet per
   step, not launchctl's vocabulary — `- stop it`, `- disable it, so it stays
   off even if its plist comes back`. `-V` adds the exact `launchctl` line

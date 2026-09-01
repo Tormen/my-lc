@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="9d688ab"
+SCRIPT_COMMIT="a063a53"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -92,7 +92,7 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
            label and system/<label> are interchangeable.
   VERB     status (default) | list | start | stop | restart | run | kill
            | enable | disable | edit | delete | truncate [err|out]
-           (recognised in any position)
+           | undelete            (recognised in any position)
 
   status   one match -> the record view; otherwise the table
   list     always the table
@@ -107,6 +107,8 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   delete   stop it, disable it, and move its plist aside (always confirms)
   truncate empty its logs to 0 bytes. 'truncate err' or 'truncate out' to
            pick one; both by default
+  undelete put a deleted plist back and re-enable it. With no filter, list
+           what can be restored
 
   --enabled          only services that could run or are running (default)
   --disabled         only services that are switched off
@@ -1183,7 +1185,21 @@ render_record() {
              _long=$(exit_meaning "$_code" long)
              [ -n "$_long" ] && printf '  %-10s %s\n' '' "exit $_code = $_long" ;;
   esac
-  [ -n "$_p" ]  && printf '  %-10s %s\n' 'plist:'   "$_p"
+  if [ -n "$_p" ]; then
+    printf '  %-10s %s\n' 'plist:' "$_p"
+    # When a launch item was installed, and when its definition last
+    # changed, are two different questions: an old plist that changed
+    # yesterday is a very different story from one untouched since install.
+    _pb=$(stat -f '%B' "$_p" 2>/dev/null)
+    _pm=$(stat -f '%m' "$_p" 2>/dev/null)
+    if [ -n "$_pb" ] && [ -n "$_pm" ]; then
+      if [ "$_pb" = "$_pm" ]; then
+        printf '  %-10s %s\n' '' "written $(when "$_pb"), unchanged since"
+      else
+        printf '  %-10s %s\n' '' "written $(when "$_pb"), last changed $(when "$_pm")"
+      fi
+    fi
+  fi
   if [ -n "$_pr" ]; then
     case "$_d" in
       system) _asuser=${_us:-root} ;;
@@ -1579,6 +1595,72 @@ v_truncate() {
   return 0
 }
 
+# Everything my-lc has deleted, newest first: label, when, and where it
+# came from. Scans both destinations, since DELETE_MODE may have changed
+# between the delete and the undelete.
+#   out: backup-path <TAB> label <TAB> epoch <TAB> origin-plist
+deleted_list() {
+  for _dd in "$STATE_DIR/deleted" "${HOME:-/nonexistent}/.Trash"; do
+    [ -d "$_dd" ] || continue
+    for _bf in "$_dd"/*.plist "$_dd"/*.plist.*; do
+      [ -f "$_bf" ] || continue
+      case "$_bf" in *.origin) continue ;; esac
+      _bl=${_bf##*/}
+      # <label>.plist or <label>.plist.<timestamp>
+      _bl=${_bl%.plist}; _bl=${_bl%.plist.*}
+      case "$_bl" in *.plist) _bl=${_bl%.plist} ;; esac
+      _bo=
+      [ -r "$_bf.origin" ] && _bo=$(head -n 1 "$_bf.origin" 2>/dev/null)
+      if [ -z "$_bo" ]; then
+        # A plist in the Trash with no origin note was NOT put there by
+        # my-lc - the user's own Trash is full of things it knows nothing
+        # about. Offering to install one, to a guessed location, would be
+        # reckless: skip it, and say so under -V.
+        case "$_dd" in
+          "$STATE_DIR/deleted") ;;
+          *) [ "$VRB" = 1 ] && printf 'skipping %s: not deleted by %s\n' \
+               "$_bf" "$SCRIPT_NAME" >&2
+             continue ;;
+        esac
+        # Inside my-lc's own folder, an origin note may simply predate the
+        # version that started writing one: fall back to where a service of
+        # this scope belongs.
+        case "$SCOPE" in
+          agents) _bo="$HOME/Library/LaunchAgents/$_bl.plist" ;;
+          *)      _bo="/Library/LaunchDaemons/$_bl.plist" ;;
+        esac
+      fi
+      printf '%s%s%s%s%s%s%s\n' "$_bf" "$FS1" "$_bl" "$FS1" \
+        "$(file_epoch "$_bf")" "$FS1" "$_bo"
+    done
+  done | sort -t"$FS1" -k3,3nr
+}
+
+v_undelete() {
+  _bf=$1; _label=$2; _when=$3; _origin=$4
+  if [ -e "$_origin" ]; then
+    err "$_label: something is already at $_origin"
+    printf '    > move it aside first, or restore the backup by hand\n' >&2
+    return 0
+  fi
+  msgn "putting $_label back ..."; [ "$VRB" = 1 ] && printf '\n'
+  det "$_bf"
+  det "-> $_origin"
+  if run mv "$_bf" "$_origin"; then step_ok
+  else step_fail 'could not move it back (needs root?)'; return 0; fi
+  rm -f "$_bf.origin" 2>/dev/null
+  # delete disabled it, so undelete must clear that or it stays off
+  msgn "re-enabling $_label ..."; [ "$VRB" = 1 ] && printf '\n'
+  det 'delete disabled it as well as removing it; this undoes that half'
+  if lc enable "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  if [ "$NOW" = 1 ]; then
+    msgn "starting $_label ..."; [ "$VRB" = 1 ] && printf '\n'
+    if lc bootstrap "$DOMAIN" "$_origin"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  else
+    msg "$_label is restored and enabled, but not started (add --now, or 'start' it)"
+  fi
+}
+
 # Where a deleted plist goes, and what to call that place. The Trash is the
 # default: it is where a deleted file belongs, Finder can restore it, and it
 # needs no explaining. Prints nothing if neither destination can be made,
@@ -1638,6 +1720,10 @@ v_delete() {
     det "-> $_dest"
     if run mv "$_plist" "$_dest"; then
       step_ok
+      # Remember where it came from: the backup name carries the label and
+      # a date, not the directory, and 'undelete' must put it back exactly
+      # where it was rather than guess.
+      printf '%s\n%s\n' "$_plist" "$DOMAIN" > "$_dest.origin" 2>/dev/null || true
       msg "$_dest"
     else step_fail 'could not move the plist (needs root?)'; fi
   else
@@ -1729,6 +1815,7 @@ _my-lc() {
         'edit:Open the plist in $EDITOR and check it stays valid'
         'delete:Stop it, disable it, and move its plist aside'
         'truncate:Empty its logs - truncate [err|out], both by default'
+        'undelete:Put a deleted plist back and re-enable it'
     )
 
     local -a opts
@@ -1764,7 +1851,7 @@ _my-lc() {
     local w
     for w in ${words[2,-1]}; do
         case $w in
-            status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete|truncate)
+            status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete|truncate|undelete)
                 verb=$w; break ;;
         esac
     done
@@ -1848,7 +1935,7 @@ complete_labels() {
 
 is_verb() {
   case "$1" in
-    status|list|start|stop|restart|run|runnow|kill|enable|disable|delete|edit|truncate) return 0 ;;
+    status|list|start|stop|restart|run|runnow|kill|enable|disable|delete|edit|truncate|undelete) return 0 ;;
   esac
   return 1
 }
@@ -2144,6 +2231,67 @@ do_action() {
 # What the action will DO, one bullet per step, in plain words. The plan is
 # the last thing shown before something irreversible, so it is no place for
 # launchctl's vocabulary - that is what -V is for.
+# The undelete flow: list what can be restored, or restore what matches.
+do_undelete() {
+  deleted_list > "$TMPD/del.all"
+  if [ ! -s "$TMPD/del.all" ]; then
+    printf 'nothing to undelete: no plist has been deleted by my-lc\n'
+    printf '  (it would be in %s)\n' "$STATE_DIR/deleted"
+    return 0
+  fi
+  : > "$TMPD/del.sel"
+  while IFS="$FS1" read -r _bf _bl _bt _bo; do
+    [ -n "$_bl" ] || continue
+    _keep=1
+    for _f in $FILTERS; do
+      _lf=$(lower "$_f")
+      case "$(lower "$_bl $_bf $_bo")" in *"$_lf"*) ;; *) _keep=0 ;; esac
+    done
+    [ "$_keep" = 1 ] && printf '%s%s%s%s%s%s%s\n' "$_bf" "$FS1" "$_bl" "$FS1" "$_bt" "$FS1" "$_bo" >> "$TMPD/del.sel"
+  done < "$TMPD/del.all"
+
+  _n=$(wc -l < "$TMPD/del.sel" | tr -d ' ')
+  if [ "$_n" = 0 ]; then
+    err "nothing deleted matches$( [ -n "$FILTERS" ] && printf ':%s' "$FILTERS" )"
+    printf '    > run '\''my-lc undelete'\'' with no filter to see what there is\n' >&2
+    return 0
+  fi
+
+  # With no filter this is a listing, not an action: show what is there.
+  if [ -z "$FILTERS" ]; then
+    printf '%sdeleted, and restorable:%s\n\n' "$C_HDR" "$C_OFF"
+    while IFS="$FS1" read -r _bf _bl _bt _bo; do
+      printf '  %s%s%s\n' "$C_HDR" "$_bl" "$C_OFF"
+      printf '      deleted %s\n' "$(when "$_bt")"
+      printf '      would go back to %s\n' "$_bo"
+      [ "$VRB" = 1 ] && printf '      from %s\n' "$_bf"
+      printf '\n'
+    done < "$TMPD/del.sel"
+    printf 'name one to restore it, e.g. my-lc undelete %s\n' \
+      "$(head -n 1 "$TMPD/del.sel" | cut -d"$FS1" -f2)"
+    return 0
+  fi
+
+  if [ "$_n" -gt 1 ] && [ "$GO" != 1 ]; then
+    printf 'this would undelete %s services:\n\n' "$_n"
+    while IFS="$FS1" read -r _bf _bl _bt _bo; do
+      printf '  %s%s%s\n' "$C_HDR" "$_bl" "$C_OFF"
+      printf '      - put its plist back at %s\n' "$_bo"
+      printf '      - re-enable it\n'
+      [ "$NOW" = 1 ] && printf '      - start it\n'
+      printf '\n'
+    done < "$TMPD/del.sel"
+    printf 'add --go to carry it out, or type go: '
+    if [ -t 0 ]; then read -r _ans; else _ans=; fi
+    [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
+    printf '\n'
+  fi
+  while IFS="$FS1" read -r _bf _bl _bt _bo <&3; do
+    [ -n "$_bl" ] || continue
+    v_undelete "$_bf" "$_bl" "$_bt" "$_bo"
+  done 3< "$TMPD/del.sel"
+}
+
 plan_steps() {
   case "$VERB" in
     start)   printf -- '- start it in this boot session\n' ;;
@@ -2225,6 +2373,10 @@ main() {
   build_db
 
   if [ "$COMPLETE" = 1 ]; then complete_labels; exit 0; fi
+
+  # 'undelete' works on what is NOT in the table: a deleted service has no
+  # plist, so the ordinary selection can never find it.
+  if [ "$VERB" = undelete ]; then do_undelete; exit "$EXITCODE"; fi
 
   select_records "$DB" "$TMPD/sel.final"
   _n=$(wc -l < "$TMPD/sel.final" | tr -d ' ')
@@ -2364,6 +2516,7 @@ run_tests() {
   t_exitcodes
   t_timefmt
   t_truncate
+  t_undelete
   t_errcolumn
   t_editdelete
   t_program
@@ -2867,6 +3020,67 @@ t_truncate() {
   _o=$(_run --go)
   case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
     *) t_no 'already empty' 'already empty' "$_o" ;; esac
+  cleanup_fixtures
+}
+
+t_undelete() {
+  t_sec 'O. undelete'
+  _ud="$TMPD/ud"; mkdir -p "$_ud/dir" "$_ud/st"
+  _lab="$SELFTEST_PREFIX-ud"
+  t_guard "$_lab"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+    printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+    printf '</dict></plist>\n'; } > "$_ud/dir/$_lab.plist"
+  printf 'AGENT_DIRS="%s/dir"\nDAEMON_DIRS="%s/dir"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\nDELETE_MODE=backup\n' \
+    "$_ud" "$_ud" "$_ud" > "$_ud/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _u() { MY_LC_CONFIG="$_ud/conf" "$0" $_sf "$@" 2>&1; }
+
+  _u "$_lab" delete --go >/dev/null 2>&1
+  if [ -f "$_ud/dir/$_lab.plist" ]; then
+    t_no 'delete moved the plist' 'gone from the dir' 'still there'
+  else t_ok 'the fixture is deleted, ready to undelete'; fi
+
+  # delete must record WHERE it came from, or undelete can only guess
+  if ls "$_ud"/st/deleted/"$_lab".plist.*.origin >/dev/null 2>&1; then
+    t_ok 'delete records the original location'
+  else t_no 'origin recorded' 'a .origin file' 'none written'; fi
+
+  # bare undelete is a LISTING, and must not change anything
+  _o=$(_u undelete)
+  case "$_o" in *"$_lab"*'would go back to'*) t_ok 'bare undelete lists what can be restored' ;;
+    *) t_no 'undelete listing' "$_lab ... would go back to" "$_o" ;; esac
+  if [ -f "$_ud/dir/$_lab.plist" ]; then
+    t_no 'listing changes nothing' 'still deleted' 'it was restored'
+  else t_ok 'listing on its own restores nothing'; fi
+
+  # naming it restores it to the RECORDED location, and re-enables it
+  _u undelete "$_lab" >/dev/null 2>&1
+  if [ -f "$_ud/dir/$_lab.plist" ]; then t_ok 'undelete puts the plist back where it came from'
+  else t_no 'undelete restores' "$_ud/dir/$_lab.plist" 'not restored'; fi
+  if launchctl print-disabled "$DOMAIN" 2>/dev/null \
+     | awk -F'"' '/=> *disabled/ { print $2 }' | grep -qxF "$_lab"; then
+    t_no 'undelete re-enables' 'not disabled' 'still disabled'
+  else t_ok 'undelete clears the disable that delete set'; fi
+
+  # it must refuse to overwrite something already at the destination
+  _u "$_lab" delete --go >/dev/null 2>&1
+  printf 'in the way\n' > "$_ud/dir/$_lab.plist"
+  _o=$(_u undelete "$_lab")
+  case "$_o" in *'already at'*) t_ok 'undelete refuses to overwrite what is already there' ;;
+    *) t_no 'undelete overwrite guard' 'something is already at ...' "$_o" ;; esac
+  rm -f "$_ud/dir/$_lab.plist"
+
+  # a plist in the Trash that my-lc did NOT delete must never be offered:
+  # installing a launch daemon from a guessed location would be reckless
+  _th="$_ud/home"; mkdir -p "$_th/.Trash"
+  printf 'x\n' > "$_th/.Trash/com.someone.else.plist"
+  _o=$(HOME="$_th" _u undelete)
+  case "$_o" in *com.someone.else*) t_no 'foreign trash excluded' 'not offered' "$_o" ;;
+    *) t_ok 'a plist my-lc did not delete is never offered' ;; esac
   cleanup_fixtures
 }
 
