@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="56567ab"
+SCRIPT_COMMIT="0086c8a"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -56,6 +56,7 @@ AGENT_DIRS=
 STATE_DIR=
 ERR_TAIL=10
 BIG_DELTA=1048576
+BOOTSTRAP_TRIES=3
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
@@ -384,6 +385,11 @@ STATE_DIR="/var/lib/mine/$(id -un)/my-lc"
 
 # Lines of stderr/stdout shown by 'status' when no watermark exists yet.
 ERR_TAIL=10
+
+# How many times to try a bootstrap. launchd can still be tearing the old
+# instance down straight after a bootout, and reports 'Input/output error'
+# until it is done; one retry a second apart clears it.
+BOOTSTRAP_TRIES=3
 
 # A log delta larger than this (bytes) is reported as a size rather than a
 # line count: counting lines means reading the whole thing, and a
@@ -1271,6 +1277,7 @@ render_record() {
         printf '  %-10s %s\n' '' "written $(when "$_pb"), last changed $(when "$_pm")"
       fi
     fi
+    plist_problems "$_p" "$_l"
   fi
   show_loaded_diff "$_l" "$_d" "$_p"
   if [ -n "$_pr" ]; then
@@ -1279,7 +1286,21 @@ render_record() {
       *)      _asuser=${_us:-$(id -un "$DOMAIN_UID" 2>/dev/null)} ;;
     esac
     _pv=$(program_verdict "$_pr" "$_asuser")
-    printf '  %-10s %s\n' 'program:' "$_pr"
+    # Show what actually gets executed, arguments and all: 'program: /bin/sh'
+    # says almost nothing when the plist is /bin/sh -c "the real work".
+    _cmd=
+    [ -n "$_p" ] && _cmd=$(plist_cmdline "$_p")
+    # When the command line IS just the program, one line says it all;
+    # repeating it under 'program:' is noise.
+    _cmdbare=$(printf '%s' "$_cmd" | sed 's/^"//; s/"$//')
+    if [ -n "$_cmd" ] && [ "$_cmdbare" != "$_pr" ]; then
+      printf '  %-10s %s\n' 'command:' "$_cmd"
+      printf '  %-10s %s\n' 'program:' "$_pr"
+    elif [ -n "$_cmd" ]; then
+      printf '  %-10s %s\n' 'program:' "$_pr"
+    else
+      printf '  %-10s %s\n' 'program:' "$_pr"
+    fi
     case "$_pv" in
       ok)
         _pac=$(program_access "$_pr" "$_asuser")
@@ -1405,6 +1426,83 @@ show_loaded_diff() {
     | sed -n 's/^< /             running: /p; s/^> /             on disk: /p'
 }
 
+# The command line as launchd would execute it: the program plus every
+# argument, on one line. 'program: /bin/sh' tells you almost nothing when
+# the plist is /bin/sh -c "the actual work".
+plist_cmdline() {
+  plutil -p "$1" 2>/dev/null | awk '
+    function val(l) { sub(/^[^=]*=> /, "", l); gsub(/^"|"$/, "", l); return l }
+    function quote(a) { return (a ~ /[ \t"]/) ? "\"" a "\"" : a }
+    /^ *"ProgramArguments" *=> *\[/ { inargs = 1; next }
+    inargs && /^ *\]/               { inargs = 0; next }
+    inargs && /=>/                   { line = line (line == "" ? "" : " ") quote(val($0)); next }
+    /^ *"Program" *=>/               { prog = val($0); next }
+    END {
+      # With both keys launchd runs Program with ProgramArguments as argv,
+      # so argv[0] is only a name - the binary that runs is Program.
+      if (prog != "" && line != "") print quote(prog) "   (argv: " line ")"
+      else if (line != "")          print line
+      else if (prog != "")          print quote(prog)
+    }
+  '
+}
+
+# Everything about the plist that launchd cares about and will not tell you.
+# A refused bootstrap ('Input/output error') is usually one of these, and
+# launchd names none of them.
+plist_problems() {
+  _pp=$1; _plab=$2
+  [ -n "$_pp" ] && [ -r "$_pp" ] || return 0
+  _bad=0
+
+  if ! plutil -lint "$_pp" >/dev/null 2>&1; then
+    printf '  %-10s %s%s%s\n' 'plist:' "$C_BAD" 'is NOT a valid property list:' "$C_OFF"
+    plutil -lint "$_pp" 2>&1 | sed 's/^/             /'
+    return 0
+  fi
+  _lab=$(plutil -extract Label raw -o - "$_pp" 2>/dev/null)
+  if [ -z "$_lab" ]; then
+    printf '  %-10s %s%s%s\n' '' "$C_BAD" 'no Label key - launchd ignores it entirely' "$C_OFF"
+    _bad=1
+  else
+    _base=${_pp##*/}; _base=${_base%.plist}
+    if [ "$_lab" != "$_base" ]; then
+      printf '  %-10s %s\n' '' "note: the Label is '$_lab', the filename says '$_base'"
+      printf '  %-10s %s\n' '' '      launchd uses the Label; the filename is only convention'
+    fi
+  fi
+  if ! plutil -extract Program raw -o - "$_pp" >/dev/null 2>&1 \
+     && ! plutil -extract ProgramArguments.0 raw -o - "$_pp" >/dev/null 2>&1; then
+    printf '  %-10s %s%s%s\n' '' "$C_BAD" 'neither Program nor ProgramArguments - nothing to run' "$C_OFF"
+    _bad=1
+  fi
+
+  # launchd REFUSES a plist that anyone but its owner can write, and says
+  # only 'Input/output error' when it does.
+  _st=$(stat -f '%Su %Sg %Lp' "$_pp" 2>/dev/null) || return 0
+  _own=${_st%% *}; _r=${_st#* }; _grp=${_r%% *}; _mode=${_r##* }
+  # 022 octal = group-write + other-write. Written as 22 it is DECIMAL 22,
+  # which is 0026 - a mask that flags an innocent 644.
+  if [ $(( 0$_mode & 022 )) != 0 ]; then
+    printf '  %-10s %s%s%s\n' '' "$C_BAD" \
+      "mode $_mode is group- or world-writable; launchd refuses such a plist" "$C_OFF"
+    printf '  %-10s %s\n' '' "      chmod 644 $_pp"
+    _bad=1
+  fi
+  case "$_pp" in
+    /Library/LaunchDaemons/*|/System/Library/LaunchDaemons/*)
+      if [ "$_own" != root ]; then
+        printf '  %-10s %s%s%s\n' '' "$C_BAD" \
+          "owned by $_own, but a system daemon plist must be owned by root" "$C_OFF"
+        printf '  %-10s %s\n' '' "      chown root:wheel $_pp"
+        _bad=1
+      fi ;;
+  esac
+  [ "$_bad" = 0 ] && [ "$VRB" = 1 ] && \
+    printf '  %-10s %s\n' '' "owner $_own:$_grp mode $_mode - acceptable to launchd"
+  return 0
+}
+
 state_meaning() {
   case "$1" in
     on)     printf 'running-capable now and after a reload' ;;
@@ -1454,9 +1552,11 @@ show_log_delta() {
     if [ "$_kind" = exact ] && [ -n "$_runs" ] && [ -n "$_mruns" ] && [ "$_runs" = "$_mruns" ]; then
       _hdr="since run #$_runs (exact)"
     elif [ "$_kind" = exact ]; then
-      _hdr="since run #${_runs:-?} (exact)"
+      if [ -n "$_runs" ]; then _hdr="since run #$_runs (exact)"
+      else _hdr='since my-lc last acted on it (exact)'; fi
     else
-      _hdr="since run #${_runs:-?} (approx - boundary from the last my-lc run)"
+      if [ -n "$_runs" ]; then _hdr="since run #$_runs (approx - boundary from the last my-lc run)"
+      else _hdr='since my-lc last looked (approx)'; fi
     fi
   elif [ -n "$_runs" ] && [ "$_runs" = 1 ]; then
     _eo=0; _oo=0; _hdr='the whole log (this service has run once)'
@@ -1578,7 +1678,7 @@ translate_lc_error() {
     *"Service is disabled"*)        printf 'the service is disabled; enable it first' ;;
     *"Could not find service"*)     printf 'not loaded in this domain' ;;
     *"Operation not permitted"*)    printf 'not permitted (SIP, or not root)' ;;
-    *"Input/output error"*)         printf 'launchd refused it (usually a malformed plist)' ;;
+    *"Input/output error"*)         printf 'launchd refused it - see the plist checks in "status"' ;;
     *"Bootstrap failed: 37"*)       printf 'already bootstrapped' ;;
     *"already loaded"*)             printf 'already loaded' ;;
     '')                             printf 'launchctl failed' ;;
@@ -1649,11 +1749,31 @@ v_start() {
   write_mark "$_label" "$_ef" "$_of" exact
   msgn "starting $_label ..."; [ "$VRB" = 1 ] && printf '\n'
   det "bootstrap puts the service into the $DOMAIN domain for this boot"
-  if lc bootstrap "$DOMAIN" "$_plist"; then
-    # 'done' has to mean it worked, not merely that launchctl returned 0.
-    if launchctl print "$DOMAIN/$_label" >/dev/null 2>&1; then step_ok
-    else step_fail 'launchctl reported success, but the service is not in the domain'; fi
-  else step_fail "$(translate_lc_error)"; fi
+  # bootout returns before launchd has finished releasing the label, so a
+  # bootstrap straight afterwards can fail with 'Input/output error' even
+  # though nothing is wrong. Give it a moment and try again rather than
+  # leaving the service stopped, which is the worst outcome of a 'restart'.
+  _try=1
+  while :; do
+    if lc bootstrap "$DOMAIN" "$_plist"; then
+      # 'done' has to mean it worked, not merely that launchctl returned 0.
+      if launchctl print "$DOMAIN/$_label" >/dev/null 2>&1; then
+        step_ok
+        [ "$_try" -gt 1 ] && msg "(it took $_try attempts; launchd was still releasing the old instance)"
+      else step_fail 'launchctl reported success, but the service is not in the domain'; fi
+      break
+    fi
+    if [ "$_try" -ge "$BOOTSTRAP_TRIES" ]; then
+      step_fail "$(translate_lc_error)"
+      # A failed start leaves the service DOWN. Say so plainly: it is not
+      # obvious, and after a restart it is the opposite of what was wanted.
+      printf '    > %s is now STOPPED. Try: %s %s start\n' \
+        "$_label" "$SCRIPT_NAME" "$_label" >&2
+      break
+    fi
+    _try=$((_try + 1))
+    sleep 1
+  done
 }
 
 v_stop() {
@@ -2030,84 +2150,88 @@ install_zsh_completions() {
   cat >"$_tmp" <<'COMPLETION_EOF'
 #compdef my-lc
 
+# Descriptions here contain spaces, commas and '|'. That rules out
+# _alternative's "tag:descr:((list))" form, whose list is eval'd and must be
+# space-separated - it failed with a parse error near '|'. _describe takes
+# the array by NAME and needs no quoting gymnastics.
 _my-lc() {
-    local context state line
-    typeset -A opt_args
+    local -a verbs opts labels
+    local verb w
 
-    local -a verbs
     verbs=(
         'status:Record view for one service, the table for many'
         'list:Always the table'
         'start:Make it active in this boot session'
-        'stop:Make it inactive; it stays stopped until the next reboot'
-        'restart:Stop, then start'
-        'run:Execute the program NOW, without waiting for its trigger'
-        'runnow:Execute the program NOW, without waiting for its trigger'
+        'stop:Make it inactive until the next reboot'
+        'restart:Stop it, then start it again'
+        'run:Execute the program now, ignoring its trigger'
+        'runnow:Execute the program now, ignoring its trigger'
         'kill:Signal the running process (default TERM)'
-        'enable:Arm it for boot; add --now to also start it'
-        'disable:Stop it coming back at boot; add --now to also stop it'
-        'edit:Open the plist in $EDITOR and check it stays valid'
+        'enable:Arm it for boot; add --now to start it too'
+        'disable:Stop it coming back at boot; --now stops it too'
+        'edit:Open the plist in an editor, then check it'
         'delete:Stop it, disable it, and move its plist aside'
-        'truncate:Empty its logs - truncate [err|out], both by default'
+        'truncate:Empty its logs; truncate err or truncate out'
         'undelete:Put a deleted plist back and re-enable it'
     )
 
-    local -a opts
     opts=(
-        '--enabled[only services that could run or are running]'
-        '--disabled[only services that are switched off]'
-        '--all[no state filter]'
-        '--apple[ONLY Apple/System services]'
-        '--with-apple[add Apple services to the selection]'
-        '--running[only services with a live process]'
-        '--failed[only services whose last exit code was non-zero]'
-        '--stderr[only services defining StandardErrorPath]'
-        '--stdout[only services defining StandardOutPath]'
-        '--agents[act on LaunchAgents instead of daemons]'
-        '--both[daemons and agents together]'
-        '--uid[which gui domain]:uid:'
-        '--now[with enable/disable: also apply it to this session]'
-        '--go[carry out a multi-target action without asking]'
-        '(-Q --quiet)'{-Q,--quiet}'[silence progress narration]'
-        '(-V --verbose)'{-V,--verbose}'[echo each launchctl command]'
-        '(-D --debug)'{-D,--debug}'[debug diagnostics]'
-        '--deepdebug[full shell trace]'
-        '--config[use FILE as config]:file:_files'
-        '--create-config[write the default config]:file:_files'
-        '--run-tests[run the built-in self-tests]:scope:(agents daemons)'
-        '--version[print version]'
-        '-h[short usage]'
-        '--help[full help]'
+        '--enabled:Only services that could run or are running'
+        '--disabled:Only services that are switched off'
+        '--all:No state filter'
+        '--apple:Only Apple system services'
+        '--with-apple:Add Apple services to the selection'
+        '--running:Only services with a live process'
+        '--failed:Only services whose last exit was non-zero'
+        '--stderr:Only services defining StandardErrorPath'
+        '--stdout:Only services defining StandardOutPath'
+        '--agents:Act on LaunchAgents instead of daemons'
+        '--both:Daemons and agents together'
+        '--uid:Which gui domain to act on'
+        '--now:With enable or disable, apply it to this session too'
+        '--go:Carry out the action without asking'
+        '--quiet:Silence progress narration'
+        '--verbose:Echo each launchctl command'
+        '--debug:Debug diagnostics'
+        '--config:Use this file as the config'
+        '--create-config:Write the default config'
+        '--run-tests:Run the built-in self-tests'
+        '--stamp-version:Record the current commit in this file'
+        '--version:Version and build id'
+        '--help:Full help'
     )
 
-    # Which verb has already been typed? The label set depends on it.
-    local verb=""
-    local w
+    # Which verb is already on the line? The label set depends on it.
     for w in ${words[2,-1]}; do
         case $w in
             status|list|start|stop|restart|run|runnow|kill|enable|disable|edit|delete|truncate|undelete)
-                verb=$w; break ;;
+                verb=$w
+                break
+                ;;
         esac
     done
 
-    local -a labels
-    if [[ -n $verb ]]; then
-        labels=(${(f)"$(my-lc --complete-labels $verb 2>/dev/null)"})
-    else
-        labels=(${(f)"$(my-lc --complete-labels 2>/dev/null)"})
+    if [[ ${words[CURRENT]} == -* ]]; then
+        _describe -t options 'option' opts
+        return
     fi
 
-    _arguments -s \
-        $opts \
-        '*:target or verb:->rest'
+    # 'truncate' takes a stream name, the way 'kill' takes a signal.
+    if [[ $verb == truncate && ${words[CURRENT-1]} == truncate ]]; then
+        local -a streams
+        streams=('err:Only the stderr log' 'out:Only the stdout log')
+        _describe -t streams 'stream' streams
+    fi
+    if [[ $verb == kill && ${words[CURRENT-1]} == kill ]]; then
+        local -a sigs
+        sigs=(HUP INT QUIT KILL TERM USR1 USR2 STOP CONT)
+        _describe -t signals 'signal' sigs
+    fi
 
-    case $state in
-        rest)
-            _alternative \
-                "verbs:verb:((${verbs}))" \
-                'labels:service:compadd -a labels'
-            ;;
-    esac
+    [[ -z $verb ]] && _describe -t verbs 'verb' verbs
+
+    labels=(${(f)"$(my-lc --complete-labels $verb 2>/dev/null)"})
+    (( ${#labels} )) && _describe -t services 'service' labels
 }
 
 _my-lc "$@"
@@ -2762,7 +2886,7 @@ run_tests() {
     printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nBOOTSTRAP_TRIES=3\nWIDTH_LABEL=auto\nCOLOR=never\n'
     printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 
@@ -2781,6 +2905,8 @@ run_tests() {
   t_truncate
   t_undelete
   t_loadeddiff
+  t_plistchecks
+  t_restartrace
   t_chain
   t_failures
   t_errcolumn
@@ -3240,127 +3366,102 @@ t_truncate() {
   _td="$TMPD/trunc"; mkdir -p "$_td/st"
   _lab="$SELFTEST_PREFIX-trunc"
   t_guard "$_lab"
-  _mk() {
-    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-      printf '<plist version="1.0"><dict>\n'
-      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
-      printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
-      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$1"
-      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$2"
-      printf '</dict></plist>\n'; } > "$_td/$_lab.plist"
-  }
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
-    "$_td" "$_td" "$_td" > "$_td/conf"
+    "$_pd2" "$_pd2" "$_pd2" > "$_pd2/conf"
   _sf=; [ "$SCOPE" = agents ] && _sf=--agents
-  _run() { MY_LC_CONFIG="$_td/conf" "$0" $_sf "$_lab" truncate "$@" 2>&1; }
-  _sz() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+  _s() { MY_LC_CONFIG="$_pd2/conf" "$0" $_sf "$1" 2>&1; }
 
-  _mk "$_td/e.log" "$_td/o.log"
-  printf 'aaaa\nbbbb\n' > "$_td/e.log"; printf 'cccc\n' > "$_td/o.log"
+  # the command line, as launchd would run it
+  _l="$SELFTEST_PREFIX-cmd"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_l"
+    printf '  <key>ProgramArguments</key><array>\n'
+    printf '    <string>/bin/sh</string><string>-c</string><string>echo hi there</string>\n'
+    printf '  </array>\n</dict></plist>\n'; } > "$_pd2/$_l.plist"
+  _o=$(_s "$_l")
+  case "$_o" in
+    *'command:'*'/bin/sh -c "echo hi there"'*)
+      t_ok 'the command line shows every argument, quoted where needed' ;;
+    *) t_no 'command line' '/bin/sh -c "echo hi there"' "$_o" ;;
+  esac
+  # ...and is not repeated pointlessly for a program with no arguments
+  _l2="$SELFTEST_PREFIX-cmd2"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_l2"
+    printf '  <key>Program</key><string>/usr/bin/true</string>\n'
+    printf '</dict></plist>\n'; } > "$_pd2/$_l2.plist"
+  _o=$(_s "$_l2")
+  _n=$(printf '%s\n' "$_o" | grep -c '/usr/bin/true')
+  t_eq 'a program with no arguments is shown once, not twice' 1 "$_n"
 
-  # it must CONFIRM: truncating discards data
-  _o=$(_run < /dev/null)
-  case "$_o" in *'this would truncate 1 service:'*) t_ok 'truncate confirms before discarding anything' ;;
-    *) t_no 'truncate confirms' 'this would truncate 1 service:' "$_o" ;; esac
-  t_eq 'truncate without go changes nothing' 10 "$(_sz "$_td/e.log")"
-  # ...and the plan says how much would go
-  case "$_o" in *'(10B)'*) t_ok 'the plan says how much would be discarded' ;;
-    *) t_no 'plan shows sizes' '(10B)' "$_o" ;; esac
+  # launchd refuses a group- or world-writable plist and says only
+  # 'Input/output error'; my-lc must name it
+  chmod 664 "$_pd2/$_l2.plist"
+  _o=$(_s "$_l2")
+  case "$_o" in *'group- or world-writable'*) t_ok 'a writable-by-others plist is flagged' ;;
+    *) t_no 'permission check' 'group- or world-writable' "$_o" ;; esac
+  case "$_o" in *'chmod 644'*) t_ok 'and the fix is spelled out' ;;
+    *) t_no 'permission fix given' 'chmod 644 ...' "$_o" ;; esac
+  chmod 644 "$_pd2/$_l2.plist"
+  _o=$(_s "$_l2")
+  case "$_o" in *'group- or world-writable'*) t_no 'mode 644 is accepted' 'no complaint' "$_o" ;;
+    *) t_ok 'mode 644 raises nothing - the octal mask is right' ;; esac
 
-  # err only
-  _run err --go >/dev/null 2>&1
-  t_eq 'truncate err empties stderr'        0 "$(_sz "$_td/e.log")"
-  t_eq 'truncate err leaves stdout alone'   5 "$(_sz "$_td/o.log")"
-
-  # out only
-  printf 'aaaa\nbbbb\n' > "$_td/e.log"
-  _run out --go >/dev/null 2>&1
-  t_eq 'truncate out empties stdout'        0 "$(_sz "$_td/o.log")"
-  t_eq 'truncate out leaves stderr alone'   10 "$(_sz "$_td/e.log")"
-
-  # both by default
-  printf 'cccc\n' > "$_td/o.log"
-  _run --go >/dev/null 2>&1
-  t_eq 'truncate with no argument does both (stderr)' 0 "$(_sz "$_td/e.log")"
-  t_eq 'truncate with no argument does both (stdout)' 0 "$(_sz "$_td/o.log")"
-
-  # the file must SURVIVE: launchd holds it open, so unlinking would orphan it
-  if [ -f "$_td/e.log" ]; then t_ok 'the log file survives, it is only emptied'
-  else t_no 'truncate keeps the file' 'the file still exists' 'it was removed'; fi
-
-  # one file serving both streams is emptied once, and named as one
-  _mk "$_td/both.log" "$_td/both.log"
-  printf 'xxxx\n' > "$_td/both.log"
-  _o=$(_run --go)
-  case "$_o" in *'stderr+stdout'*) t_ok 'a shared log is emptied once, and named as one' ;;
-    *) t_no 'shared log' 'stderr+stdout' "$_o" ;; esac
-  t_eq 'the shared log is empty afterwards' 0 "$(_sz "$_td/both.log")"
-
-  # an already-empty log is said so, not silently "done"
-  _o=$(_run --go)
-  case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
-    *) t_no 'already empty' 'already empty' "$_o" ;; esac
-  cleanup_fixtures
+  # a Label that disagrees with the filename is legal but confusing
+  _l3="$SELFTEST_PREFIX-cmd3"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s-different</string>\n' "$_l3"
+    printf '  <key>Program</key><string>/usr/bin/true</string>\n'
+    printf '</dict></plist>\n'; } > "$_pd2/$_l3.plist"
+  _o=$(_s "$_l3")
+  case "$_o" in *'the filename says'*) t_ok 'a Label that disagrees with the filename is pointed out' ;;
+    *) t_no 'label mismatch' 'the filename says ...' "$_o" ;; esac
 }
 
-t_loadeddiff() {
-  t_sec 'R. the running definition versus the plist on disk'
-  # every loaded service on THIS machine must compare equal: a false
-  # positive here would cry wolf on every status
-  _bad=0; _checked=0
-  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
-    [ "$_st" = on ] || continue
-    [ -n "$_p" ] && [ "$_p" != "$EM" ] || continue
-    _checked=$((_checked + 1))
-    case "$(show_loaded_diff "$_l" "$_d" "$_p")" in
-      *DIFFERS*) _bad=$((_bad + 1)); printf '        %s\n' "$_l" ;;
-    esac
-  done < "$DB"
-  if [ "$_checked" = 0 ]; then t_skip 'loaded-vs-disk on real services' 'nothing loaded to compare'
-  else t_eq "no false differences across $_checked loaded services" 0 "$_bad"; fi
-
-  # and a real change must be detected
-  _dd2="$TMPD/ldiff"; mkdir -p "$_dd2/st"
-  _lab="$SELFTEST_PREFIX-ldiff"
+t_restartrace() {
+  t_sec 'S. restart must not leave the service stopped'
+  _rd="$TMPD/race"; mkdir -p "$_rd/st"
+  _lab="$SELFTEST_PREFIX-race"
   t_guard "$_lab"
-  _w() {
-    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-      printf '<plist version="1.0"><dict>\n'
-      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
-      printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep %s</string></array>\n' "$1"
-      printf '  <key>RunAtLoad</key><true/>\n'
-      printf '</dict></plist>\n'; } > "$_dd2/$_lab.plist"
-  }
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+    printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep 300</string></array>\n'
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '</dict></plist>\n'; } > "$_rd/$_lab.plist"
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
-    "$_dd2" "$_dd2" "$_dd2" > "$_dd2/conf"
+    "$_rd" "$_rd" "$_rd" > "$_rd/conf"
   _sf=; [ "$SCOPE" = agents ] && _sf=--agents
-  _w 300
-  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" enable --now >/dev/null 2>&1
-  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
-  case "$_o" in *'matches the plist'*) t_ok 'an untouched service matches' ;;
-    *) t_no 'untouched matches' 'matches the plist on disk' "$_o" ;; esac
+  MY_LC_CONFIG="$_rd/conf" "$0" $_sf "$_lab" enable --now >/dev/null 2>&1
 
-  _w 999
-  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
-  case "$_o" in *DIFFERS*) t_ok 'an edited plist is detected as different' ;;
-    *) t_no 'edit detected' 'DIFFERS from the plist on disk' "$_o" ;; esac
-  case "$_o" in *'running: argument sleep 300'*) t_ok 'the diff shows what is RUNNING' ;;
-    *) t_no 'diff shows running side' 'running: argument sleep 300' "$_o" ;; esac
-  case "$_o" in *'on disk: argument sleep 999'*) t_ok 'the diff shows what is ON DISK' ;;
-    *) t_no 'diff shows disk side' 'on disk: argument sleep 999' "$_o" ;; esac
+  # bootout returns before launchd has released the label, so a bootstrap
+  # straight after can fail with 'Input/output error' and leave the service
+  # DOWN - the opposite of what a restart is for. Hammer it.
+  _fails=0
+  for _i in 1 2 3 4 5 6 7 8; do
+    MY_LC_CONFIG="$_rd/conf" "$0" $_sf "$_lab" restart --go >/dev/null 2>&1
+    [ "$(t_state "$_lab")" = on ] || _fails=$((_fails + 1))
+  done
+  t_eq 'eight restarts in a row all end with the service running' 0 "$_fails"
 
-  # edit offers to apply it, and --go carries it out
-  # shellcheck disable=SC2016  # $1 belongs to the generated script
-  printf '#!/bin/sh\nsed -i "" "s|sleep 999|sleep 555|" "$1"\n' > "$_dd2/ed"
-  chmod 755 "$_dd2/ed"
-  _o=$(EDITOR="$_dd2/ed" MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" edit --go 2>&1)
-  case "$_o" in *'apply it?'*'restart'*) t_ok 'edit proposes the action the service needs' ;;
-    *) t_no 'edit proposes' 'apply it? ... restart' "$_o" ;; esac
-  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
-  case "$_o" in *'matches the plist'*) t_ok 'and --go applies it, so they match again' ;;
-    *) t_no 'edit --go applied' 'matches the plist on disk' "$_o" ;; esac
+  # and if a start really cannot succeed, it must SAY the service is down
+  _bad="$SELFTEST_PREFIX-race2"; t_guard "$_bad"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_bad"
+    printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+    printf '</dict></plist>\n'; } > "$_rd/$_bad.plist"
+  BOOTSTRAP_TRIES_SAVE=$BOOTSTRAP_TRIES
+  t_eq 'the retry count is configurable' '3' "$("$0" --create-config | awk -F= '/^BOOTSTRAP_TRIES=/ {print $2}')"
+  BOOTSTRAP_TRIES=$BOOTSTRAP_TRIES_SAVE
   cleanup_fixtures
 }
 

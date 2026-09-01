@@ -260,6 +260,21 @@ a way to learn the raw commands.
   `edit` shows the same diff on leaving the editor and then offers exactly
   the steps that service needs — restart to apply it now, enable so every
   boot picks it up, or both — doing nothing without the word `go`.
+- **The plist itself is checked.** launchd refuses a plist that is group- or
+  world-writable, or that a system daemon does not own as root, and reports
+  only `Input/output error` when it does. `status` names the actual problem
+  and gives the `chmod`/`chown` to fix it, and also flags invalid XML, a
+  missing `Label`, no `Program` at all, and a `Label` that disagrees with
+  the filename.
+- **`status` shows the command line, not just the program** — every
+  argument as launchd would run it, quoted where needed:
+  `/bin/sh -c "echo hi there"`. `program: /bin/sh` on its own says almost
+  nothing.
+- **`restart` retries the bootstrap.** `bootout` returns before launchd has
+  released the label, so an immediate `bootstrap` can fail with
+  `Input/output error` — leaving the service stopped, the opposite of what
+  a restart is for. If a start really cannot succeed, my-lc says the service
+  is now stopped rather than leaving you to notice.
 - **`status` dates the plist itself** — when it was written and whether it
   has changed since. An old plist edited yesterday is a different story
   from one untouched since it was installed.
