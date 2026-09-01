@@ -234,6 +234,11 @@ a way to learn the raw commands.
   is *not* the default — a daemon that runs as root and an agent that runs
   as its session user say nothing, but `run 2d1h as _www` tells you the
   plist set `UserName`. `-V` shows it always.
+- **Verbs chain**, in the order typed, with a single combined plan and one
+  confirmation for the lot: `my-lc <service> truncate restart` empties the
+  logs and then restarts, so what you read afterwards is only the new run.
+  Declining the prompt cancels the whole chain, not just the verb that
+  asked.
 - **`delete` is reversible.** The plist is moved to a dated backup with a
   note of where it came from, so `undelete` puts it back exactly there and
   clears the disable that `delete` set. A plist in the Trash that my-lc did

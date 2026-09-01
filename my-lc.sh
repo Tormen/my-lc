@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a063a53"
+SCRIPT_COMMIT="fbb41a1"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -35,6 +35,7 @@ WANT_FAILED=0
 WANT_STDERR=0
 WANT_STDOUT=0
 VERB=
+VERBS=
 TRUNC_WHAT=both
 WANT_VERSION=0
 WANT_STAMP=0
@@ -81,6 +82,8 @@ TMPD=
 DOMAIN=                   # resolved acting domain, e.g. system or gui/501
 DOMAIN_UID=
 EXITCODE=0
+CONFIRMED=0
+ABORT_CHAIN=0
 
 usage_short() {
   cat <<EOF
@@ -93,6 +96,8 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   VERB     status (default) | list | start | stop | restart | run | kill
            | enable | disable | edit | delete | truncate [err|out]
            | undelete            (recognised in any position)
+           Verbs CHAIN and run in the order typed, with one confirmation
+           for the lot:  my-lc <service> truncate restart
 
   status   one match -> the record view; otherwise the table
   list     always the table
@@ -1403,16 +1408,26 @@ show_log_delta() {
 # ======================================================================
 
 # The one place a launchctl mutation happens. Returns non-zero on failure.
+# Every launchctl call that CHANGES something goes through here. Read-only
+# calls do not: they work unprivileged, and refusing them would break the
+# listing for a normal user.
 lc() {
   if [ "$DOMAIN" = system ] && [ "$(id -u)" != 0 ]; then
-    printf '\n'
-    err "needs root: launchctl $*"
-    printf '    > rerun under sudo, or from a root shell\n' >&2
+    # Report it the same way as any other failure - one line, with the
+    # evidence under it - rather than a separate error plus a second,
+    # vaguer 'launchctl failed' from the caller.
+    { printf 'needs root, and my-lc will not invoke sudo for you\n'
+      printf 'the command it would have run:\n'
+      printf '  launchctl %s\n' "$*"; } > "$TMPD/lcerr"
+    printf '90' > "$TMPD/lcrc"
     return 90
   fi
   _o=$(run launchctl "$@" 2>&1); _rc=$?
-  [ "$_rc" = 0 ] && return 0
+  # Keep whatever it said either way: on success so a stale message from an
+  # earlier call cannot be reprinted later, on failure so it can be shown.
   printf '%s' "$_o" > "$TMPD/lcerr"
+  [ "$_rc" = 0 ] && { : > "$TMPD/lcerr"; return 0; }
+  printf '%s' "$_rc" > "$TMPD/lcrc"
   return "$_rc"
 }
 
@@ -1420,6 +1435,7 @@ lc() {
 translate_lc_error() {
   _e=$(cat "$TMPD/lcerr" 2>/dev/null)
   case "$_e" in
+    "needs root"*)                  printf 'needs root - rerun under sudo' ;;
     *"No such file or directory"*)  printf 'no such file (has the plist moved?)' ;;
     *"Service is disabled"*)        printf 'the service is disabled; enable it first' ;;
     *"Could not find service"*)     printf 'not loaded in this domain' ;;
@@ -1433,8 +1449,19 @@ translate_lc_error() {
 }
 
 step_ok()   { [ "$QUIET" = 1 ] || { [ "$VRB" = 1 ] && printf '  done\n' || printf ' done\n'; }; }
-step_fail() { [ "$QUIET" = 1 ] || { [ "$VRB" = 1 ] && printf '  FAILED' || printf ' FAILED'; printf ': %s\n' "$1"; }
-              EXITCODE=1; }
+# A failure prints the translated cause AND the command's own output. The
+# translation is a summary; the raw text is the evidence, and hiding it
+# means the user has to reproduce the failure by hand to see it.
+step_fail() {
+  [ "$QUIET" = 1 ] || { [ "$VRB" = 1 ] && printf '  FAILED' || printf ' FAILED'; printf ': %s\n' "$1"; }
+  if [ -s "$TMPD/lcerr" ]; then
+    _rc=$(cat "$TMPD/lcrc" 2>/dev/null)
+    printf '    > launchctl exited %s and said:\n' "${_rc:-non-zero}" >&2
+    sed 's/^/      /' "$TMPD/lcerr" >&2
+    : > "$TMPD/lcerr"
+  fi
+  EXITCODE=1
+}
 
 act_on() {
   _label=$1; _plist=$2; _state=$3; _trig=$4; _ef=$5; _of=$6
@@ -1463,10 +1490,32 @@ v_start() {
               return 0 ;;
   esac
   [ -n "$_plist" ] || { msg "$_label has no plist on disk; nothing to start"; EXITCODE=1; return 0; }
+  # launchctl bootstrap only REGISTERS the job - it returns 0 without ever
+  # touching the program, so a missing binary is not discovered until
+  # launchd execs it. Reporting 'done' for that is a false success, and
+  # my-lc already knows better.
+  case "$_dm" in system) _asu=${_us:-root} ;; *) _asu=${_us:-$AGENT_USER} ;; esac
+  _pv=$(program_verdict "$_pr" "$_asu")
+  if [ -z "$_pr" ]; then
+    msg "$_label defines no program at all; launchd will reject it"
+    printf '    > the plist needs a Program or ProgramArguments key\n' >&2
+    EXITCODE=1; return 0
+  fi
+  case "$_pv" in
+    ok|'?'*) ;;
+    *) msg "$_label cannot start: its program is $_pv"
+       [ -n "$_pr" ] && printf '    > %s\n' "$_pr" >&2
+       printf '    > fix the program or the plist first; launchd would just fail to exec it\n' >&2
+       EXITCODE=1; return 0 ;;
+  esac
   write_mark "$_label" "$_ef" "$_of" exact
   msgn "starting $_label ..."; [ "$VRB" = 1 ] && printf '\n'
   det "bootstrap puts the service into the $DOMAIN domain for this boot"
-  if lc bootstrap "$DOMAIN" "$_plist"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  if lc bootstrap "$DOMAIN" "$_plist"; then
+    # 'done' has to mean it worked, not merely that launchctl returned 0.
+    if launchctl print "$DOMAIN/$_label" >/dev/null 2>&1; then step_ok
+    else step_fail 'launchctl reported success, but the service is not in the domain'; fi
+  else step_fail "$(translate_lc_error)"; fi
 }
 
 v_stop() {
@@ -2013,9 +2062,16 @@ parse_args() {
         exit 1 ;;
       *)
         if is_verb "$_a"; then
-          [ -n "$VERB" ] && die "two verbs given: $VERB and $_a"
+          # Verbs chain, and run in the order typed: 'truncate restart' is a
+          # natural pair - clear the logs, then restart and watch fresh
+          # output. Refusing the second one made the user run two commands
+          # and lose that ordering guarantee.
           VERB=$_a
           [ "$VERB" = runnow ] && VERB=run
+          case " $VERBS " in
+            *" $VERB "*) die "the verb '$VERB' was given twice" ;;
+          esac
+          VERBS="$VERBS$VERB "
           # 'kill' may take a signal name as the next word
           if [ "$VERB" = kill ]; then
             case "${2:-}" in
@@ -2182,42 +2238,64 @@ do_action() {
     printf '    > narrow the filter, or name the service exactly\n' >&2
     return 0
   fi
-  # 'delete' removes a file, so it confirms even for a single target.
-  if { [ "$_n" -gt 1 ] || [ "$VERB" = delete ] || [ "$VERB" = truncate ]; } && [ "$GO" != 1 ]; then
-    if [ "$_n" = 1 ]; then printf 'this would %s 1 service:\n\n' "$VERB"
-    else                   printf 'this would %s %s services:\n\n' "$VERB" "$_n"; fi
+  # delete and truncate destroy something, so they confirm even for a single
+  # target. The chain is confirmed ONCE, as a whole: being asked twice for
+  # 'truncate restart' would be worse than being asked once for both.
+  [ "$CONFIRMED" = 1 ] && GO=1
+  _needc=0
+  [ "$_n" -gt 1 ] && _needc=1
+  case " $VERBS " in *" delete "*|*" truncate "*) _needc=1 ;; esac
+  if [ "$_needc" = 1 ] && [ "$GO" != 1 ]; then
+    _vl=$(printf '%s' "$VERBS" | sed 's/ *$//; s/ /, then /g')
+    if [ "$_n" = 1 ]; then printf 'this would %s 1 service:\n\n' "$_vl"
+    else                   printf 'this would %s %s services:\n\n' "$_vl" "$_n"; fi
     while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
       printf '  %s%s%s\n' "$C_HDR" "$_l" "$C_OFF"
-      plan_steps | sed 's/^/      /'
-      case "$VERB" in
-        edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '        %s\n' "$_p" ;;
-        truncate)
-          for _ts in "$_ef" "$_of"; do
-            [ -n "$_ts" ] && [ "$_ts" != "$EM" ] && [ -f "$_ts" ] || continue
-            printf '        %s (%s)\n' "$_ts" \
-              "$(human_size "$(wc -c < "$_ts" 2>/dev/null | tr -d ' ')")"
-            [ "$_ef" = "$_of" ] && break
-          done ;;
-        delete)
-          if [ -n "$_p" ] && [ "$_p" != "$EM" ]; then
-            printf '        %s\n' "$_p"
-            _pd=$(delete_destination "$_l")
-            [ -n "$_pd" ] && printf '        -> %s\n' "$_pd"
-          fi ;;
-      esac
+      # No pipeline here on purpose: it would run the loop in a subshell,
+      # and $VERB is the caller's loop variable.
+      _vsave=$VERB
+      { for VERB in $VERBS; do
+          plan_steps
+          case "$VERB" in
+            edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '  %s\n' "$_p" ;;
+            truncate)
+              for _ts in "$_ef" "$_of"; do
+                [ -n "$_ts" ] && [ "$_ts" != "$EM" ] && [ -f "$_ts" ] || continue
+                printf '  %s (%s)\n' "$_ts" \
+                  "$(human_size "$(wc -c < "$_ts" 2>/dev/null | tr -d ' ')")"
+                [ "$_ef" = "$_of" ] && break
+              done ;;
+            delete)
+              if [ -n "$_p" ] && [ "$_p" != "$EM" ]; then
+                printf '  %s\n' "$_p"
+                _pd=$(delete_destination "$_l")
+                [ -n "$_pd" ] && printf '  -> %s\n' "$_pd"
+              fi ;;
+          esac
+        done; } > "$TMPD/plansteps"
+      VERB=$_vsave
+      sed 's/^/      /' "$TMPD/plansteps"
       [ "$VRB" = 1 ] && printf '      %s%s%s\n' "$C_DIM" "$(plan_raw "$_l" "$_d" "$_p")" "$C_OFF"
       printf '\n'
     done < "$_sel"
     :
     printf '\nadd --go to carry it out, or type go: '
     if [ -t 0 ]; then read -r _ans; else _ans=; fi
-    [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
+    [ "$_ans" = go ] || { printf 'nothing done\n'; ABORT_CHAIN=1; return 0; }
     printf '\n'
+    CONFIRMED=1
   fi
   # Sequential, one launchctl call at a time, so the narration is
   # consecutive and a failure is unambiguously attributable.
   while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat <&3; do
     [ -n "$_l" ] || continue
+    # Decode the empty-field marker. Without this an "empty" program came
+    # through as the sentinel character, and every check on it was wrong:
+    # a plist with no program at all was reported as 'program MISSING'.
+    [ "$_p"  = "$EM" ] && _p=;   [ "$_tr" = "$EM" ] && _tr=
+    [ "$_su" = "$EM" ] && _su=;  [ "$_pr" = "$EM" ] && _pr=
+    [ "$_us" = "$EM" ] && _us=;  [ "$_ef" = "$EM" ] && _ef=
+    [ "$_of" = "$EM" ] && _of=;  [ "$_wat" = "$EM" ] && _wat=
     if [ "$_a" = 1 ] && [ "${_p#/System/Library/}" != "$_p" ]; then
       msg "$_l is SIP-protected (/System/Library); launchd will not let anyone change it"
       EXITCODE=1
@@ -2354,7 +2432,7 @@ main() {
 
   [ -z "$SCOPE" ]        && SCOPE=$DEFAULT_SCOPE
   [ -z "$FILTER_STATE" ] && FILTER_STATE=$DEFAULT_FILTER_STATE
-  [ -z "$VERB" ]         && VERB=$DEFAULT_COMMAND
+  if [ -z "$VERBS" ]; then VERB=$DEFAULT_COMMAND; VERBS="$VERB "; fi
   [ -z "$APPLE_MODE" ]   && APPLE_MODE=exclude
   FILTERS=$(printf '%s' "$FILTERS" | sed 's/^ *//')
 
@@ -2381,18 +2459,18 @@ main() {
   select_records "$DB" "$TMPD/sel.final"
   _n=$(wc -l < "$TMPD/sel.final" | tr -d ' ')
 
-  case "$VERB" in
-    list)
-      domain_header
-      render_table "$TMPD/sel.final" ;;
-    status)
-      domain_header
-      if [ "$_n" = 1 ]; then render_record "$TMPD/sel.final"
-      else                   render_table  "$TMPD/sel.final"; fi ;;
-    *)
-      domain_header
-      do_action "$TMPD/sel.final" ;;
-  esac
+  domain_header
+  for VERB in $VERBS; do
+    # A declined confirmation stops the whole chain: the plan the user said
+    # no to covered every verb in it.
+    [ "$ABORT_CHAIN" = 1 ] && break
+    case "$VERB" in
+      list)   render_table "$TMPD/sel.final" ;;
+      status) if [ "$_n" = 1 ]; then render_record "$TMPD/sel.final"
+              else                   render_table  "$TMPD/sel.final"; fi ;;
+      *)      do_action "$TMPD/sel.final" ;;
+    esac
+  done
   exit "$EXITCODE"
 }
 
@@ -2517,6 +2595,8 @@ run_tests() {
   t_timefmt
   t_truncate
   t_undelete
+  t_chain
+  t_failures
   t_errcolumn
   t_editdelete
   t_program
@@ -3020,6 +3100,118 @@ t_truncate() {
   _o=$(_run --go)
   case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
     *) t_no 'already empty' 'already empty' "$_o" ;; esac
+  cleanup_fixtures
+}
+
+t_chain() {
+  t_sec 'Q. verbs chain, in the order typed'
+  _cd2="$TMPD/chain"; mkdir -p "$_cd2/st"
+  _lab="$SELFTEST_PREFIX-chain"
+  t_guard "$_lab"
+  printf 'one\ntwo\n' > "$_cd2/e.log"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+    printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep 300</string></array>\n'
+    printf '  <key>StandardErrorPath</key><string>%s/e.log</string>\n' "$_cd2"
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '</dict></plist>\n'; } > "$_cd2/$_lab.plist"
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_cd2" "$_cd2" "$_cd2" > "$_cd2/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _c() { MY_LC_CONFIG="$_cd2/conf" "$0" $_sf "$@" 2>&1; }
+
+  _c "$_lab" enable --now >/dev/null 2>&1
+
+  # ONE plan, ONE confirmation, both verbs named
+  _o=$(_c truncate restart "$_lab" < /dev/null)
+  case "$_o" in *'truncate, then restart'*) t_ok 'the plan names the whole chain' ;;
+    *) t_no 'chain plan' 'truncate, then restart' "$_o" ;; esac
+  _asks=$(printf '%s\n' "$_o" | grep -c 'add --go')
+  t_eq 'it asks once, not once per verb' 1 "$_asks"
+
+  # declining stops the WHOLE chain, not just the verb that asked
+  t_eq 'declining leaves the log untouched' 8 "$(wc -c < "$_cd2/e.log" | tr -d ' ')"
+  # look for the narration of a real step; ' done' also matches
+  # "nothing done", which is what a decline prints
+  case "$_o" in
+    *'* emptying'*|*'* stopping'*|*'* starting'*)
+      t_no 'nothing runs after a decline' 'no step narration' "$_o" ;;
+    *) t_ok 'declining runs none of the chain' ;;
+  esac
+
+  # and it runs in the order typed
+  _p1=$(launchctl list 2>/dev/null | awk -v l="$_lab" '$3==l {print $1}')
+  _o=$(_c truncate restart "$_lab" --go)
+  _p2=$(launchctl list 2>/dev/null | awk -v l="$_lab" '$3==l {print $1}')
+  t_eq 'truncate ran' 0 "$(wc -c < "$_cd2/e.log" | tr -d ' ')"
+  if [ -n "$_p1" ] && [ -n "$_p2" ] && [ "$_p1" != "$_p2" ]; then
+    t_ok 'restart ran too, after the truncate'
+  else t_no 'chain ran both verbs' "a new pid, was $_p1" "$_p2"; fi
+  case "$_o" in
+    *emptying*stopping*) t_ok 'the order typed is the order run' ;;
+    *) t_no 'chain order' 'emptying before stopping' "$_o" ;;
+  esac
+
+  # the same verb twice is a mistake, not a chain
+  _o=$(_c truncate truncate "$_lab" --go)
+  case "$_o" in *"given twice"*) t_ok 'a repeated verb is refused' ;;
+    *) t_no 'repeated verb' "the verb 'truncate' was given twice" "$_o" ;; esac
+  cleanup_fixtures
+}
+
+t_failures() {
+  t_sec 'P. done means it worked, and a failure shows its evidence'
+  _fd="$TMPD/fail"; mkdir -p "$_fd/st"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _mkp() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$1"
+      [ -n "$2" ] && printf '  <key>Program</key><string>%s</string>\n' "$2"
+      printf '</dict></plist>\n'; } > "$_fd/$1.plist"
+  }
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_fd" "$_fd" "$_fd" > "$_fd/conf"
+
+  # 'launchctl bootstrap' returns 0 for a plist whose program does not
+  # exist - it only registers the job. Reporting 'done' for that is a false
+  # success, and my-lc already knows the program is missing.
+  _l1="$SELFTEST_PREFIX-nostart"; t_guard "$_l1"
+  _mkp "$_l1" "$_fd/definitely-not-here"
+  _o=$(MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l1" start 2>&1); _rc=$?
+  case "$_o" in
+    *'cannot start'*MISSING*) t_ok 'start refuses when the program is missing' ;;
+    *) t_no 'start refuses a missing program' 'cannot start ... MISSING' "$_o" ;;
+  esac
+  case "$_o" in *' done'*) t_no 'no false done' 'no "done"' "$_o" ;;
+    *) t_ok 'it does not report done for something that cannot work' ;; esac
+  t_eq 'and it exits non-zero' 1 "$_rc"
+
+  # a plist with no program at all is a different complaint
+  _l2="$SELFTEST_PREFIX-noprog"; t_guard "$_l2"
+  _mkp "$_l2" ""
+  _o=$(MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l2" start 2>&1)
+  case "$_o" in *'no program at all'*) t_ok 'a plist with no program is named as such' ;;
+    *) t_no 'no-program plist' 'defines no program at all' "$_o" ;; esac
+
+  # a genuine launchctl failure must show launchctl's OWN words, not just a
+  # summary: the translation is a hint, the raw text is the evidence
+  TMPD_SAVE=$TMPD
+  DOMAIN_SAVE=$DOMAIN
+  DOMAIN="gui/$(id -u)"
+  _o=$( { lc bootout "$DOMAIN/no.such.service.anywhere" || step_fail "$(translate_lc_error)"; } 2>&1 )
+  case "$_o" in *'launchctl exited'*'said:'*) t_ok 'a failure prints launchctl exit code and output' ;;
+    *) t_no 'raw failure output' 'launchctl exited N and said:' "$_o" ;; esac
+  case "$_o" in *'No such process'*) t_ok 'the exact message is preserved, not just the summary' ;;
+    *) t_no 'raw text preserved' 'No such process' "$_o" ;; esac
+  # ...and a success must not print a stale message from an earlier failure
+  _o=$( { lc print-disabled "$DOMAIN" >/dev/null && step_ok; } 2>&1 )
+  case "$_o" in *'launchctl exited'*) t_no 'stale output suppressed' 'no evidence block' "$_o" ;;
+    *) t_ok 'a success prints no stale failure text' ;; esac
+  DOMAIN=$DOMAIN_SAVE; TMPD=$TMPD_SAVE
   cleanup_fixtures
 }
 
