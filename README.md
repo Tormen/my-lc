@@ -118,7 +118,7 @@ you will find in most existing documentation.
 | `kickstart -k <d>/<L>` | `start <L>` | `run` (alias `runnow`) | execute the program **now**, without waiting for its trigger |
 | `kill <sig> <d>/<L>` | `stop <L>` | `kill [SIG]` | signal the running process — a KeepAlive service comes straight back |
 | — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
-| — | — | `delete` | stop it, disable it, and move its plist to a dated backup (always confirms) |
+| — | — | `delete` | stop it, disable it, and move its plist to the Trash (always confirms) |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
 Three levels of permanence: `kill` touches the **process** only ·

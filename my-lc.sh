@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="ce979c4"
+SCRIPT_COMMIT="73cc8a7"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -57,6 +57,9 @@ BIG_DELTA=1048576
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
+DELETE_MODE=trash
+TIME_FORMAT=relative
+TIME_FMT="%Y-%m-%d_%H%M"
 
 # --- internal ----------------------------------------------------------
 # Internal record format. Tab-separated, with an explicit marker for an
@@ -294,6 +297,18 @@ human_size() {
   else printf '%sB' "$_hs"; fi
 }
 
+# A point in time, rendered the way the config asks: an age relative to now,
+# or an absolute timestamp. Everything that shows "when" goes through here,
+# so the two styles cannot drift apart.
+when() {
+  [ -n "$1" ] || { printf '?'; return; }
+  if [ "$TIME_FORMAT" = absolute ]; then
+    date -r "$1" "+$TIME_FMT" 2>/dev/null || printf '?'
+  else
+    human_age $(( $(now_epoch) - $1 ))
+  fi
+}
+
 human_age() {
   # seconds -> compact 4d2h / 3h12m / 45m / 12s
   _ha=$1
@@ -360,6 +375,17 @@ BIG_DELTA=1048576
 
 # Label column width: 'auto' fits the widest label, or give a number.
 WIDTH_LABEL=auto
+
+# What 'delete' does with the plist:
+#   trash  = move it to the Trash of the user running my-lc (recoverable
+#            from Finder, and it is where a deleted file belongs)
+#   backup = move it to $STATE_DIR/deleted/<label>.plist.<timestamp>
+DELETE_MODE=trash
+
+# How ages are shown: 'relative' gives 44d0h, 'absolute' gives a timestamp
+# in TIME_FMT. Absolute is easier to correlate with other logs.
+TIME_FORMAT=relative
+TIME_FMT="%Y-%m-%d_%H%M"
 
 # Editor used by the 'edit' verb. Empty means: $VISUAL, then $EDITOR, then
 # vi. Set it here to override the environment.
@@ -809,7 +835,7 @@ discover_scope() {
 
       e = (lab in lec) ? lec[lab] : ""
       if (p != "") {
-        status = (p in start) ? ("run " age(now - start[p]) " pid " p extra) \
+        status = (p in start) ? ("run \003" start[p] " pid " p extra) \
                               : ("run pid " p extra)
       } else if (e != "" && e != "-" && e != "0") {
         status = "FAIL " e "\002" extra
@@ -849,6 +875,13 @@ discover_scope() {
         esac ;;
     esac
     SEEN="$SEEN$_lab "
+    # \003 marks a moment in time that awk could not render: BSD awk has no
+    # strftime, and only the shell knows the configured style.
+    case "$_su" in
+      *"$(printf '\003')"*)
+        _ep=${_su#*"$(printf '\003')"}; _ep=${_ep%% *}
+        _su=$(printf '%s' "$_su" | sed "s/$(printf '\003')$_ep/$(when "$_ep")/") ;;
+    esac
     # \002 marks where the exit code's meaning goes; awk cannot know it
     case "$_su" in
       *"$(printf '\002')"*)
@@ -901,7 +934,7 @@ discover_scope() {
       [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
     done
     if [ -n "$_last" ]; then
-      _lage=$(human_age $(( NOW_EPOCH - _last )) )
+      _lage=$(when "$_last")
       case "$_su" in
         run\ *) ;;
         FAIL*)  _su="$_su, dead $_lage" ;;
@@ -938,7 +971,7 @@ log_indicator() {
   [ "${_sz:-0}" -gt 0 ] 2>/dev/null || { printf -- '-'; return; }
   _ln=$(wc -l < "$1" 2>/dev/null | tr -d ' ')
   _mt=$(file_epoch "$1")
-  if [ -n "$_mt" ]; then printf '%sL %s' "$_ln" "$(human_age $(( $(now_epoch) - _mt )) )"
+  if [ -n "$_mt" ]; then printf '%sL %s' "$_ln" "$(when "$_mt")"
   else                   printf '%sL' "$_ln"; fi
 }
 
@@ -1460,6 +1493,36 @@ v_disable() {
   else step_fail "$(translate_lc_error)"; fi
 }
 
+# Where a deleted plist goes, and what to call that place. The Trash is the
+# default: it is where a deleted file belongs, Finder can restore it, and it
+# needs no explaining. Prints nothing if neither destination can be made,
+# in which case the caller unlinks instead.
+delete_where() {
+  case "$DELETE_MODE" in
+    backup) printf 'a dated backup' ;;
+    *)      printf 'the Trash' ;;
+  esac
+}
+
+delete_destination() {
+  case "$DELETE_MODE" in
+    backup)
+      ensure_state_dir || return 0
+      mkdir -p "$STATE_DIR/deleted" 2>/dev/null || return 0
+      printf '%s/deleted/%s.plist.%s' "$STATE_DIR" "$1" "$(date '+%Y%m%d-%H%M%S')" ;;
+    *)
+      [ -n "${HOME:-}" ] || return 0
+      mkdir -p "$HOME/.Trash" 2>/dev/null || return 0
+      # Finder refuses to overwrite in the Trash, and neither should we:
+      # a second delete of the same label must not clobber the first.
+      if [ -e "$HOME/.Trash/$1.plist" ]; then
+        printf '%s/.Trash/%s.plist.%s' "$HOME" "$1" "$(date '+%Y%m%d-%H%M%S')"
+      else
+        printf '%s/.Trash/%s.plist' "$HOME" "$1"
+      fi ;;
+  esac
+}
+
 # Remove a launch item for good: stop it, then take its plist out of the
 # way. The plist is MOVED to a dated backup rather than unlinked - undoing a
 # delete should not need a reinstall.
@@ -1482,13 +1545,14 @@ v_delete() {
        det "so it stays off even if its plist is reinstalled later"
        if lc disable "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi ;;
   esac
-  if ensure_state_dir && mkdir -p "$STATE_DIR/deleted" 2>/dev/null; then
-    _bk="$STATE_DIR/deleted/$_label.plist.$(date '+%Y%m%d-%H%M%S')"
-    msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
-    det "moved to $_bk, so this can be undone"
-    if run mv "$_plist" "$_bk"; then
+  _dest=$(delete_destination "$_label")
+  if [ -n "$_dest" ]; then
+    msgn "moving the plist to $(delete_where) ..."; [ "$VRB" = 1 ] && printf '\n'
+    det "$_plist"
+    det "-> $_dest"
+    if run mv "$_plist" "$_dest"; then
       step_ok
-      msg "backup: $_bk"
+      msg "$_dest"
     else step_fail 'could not move the plist (needs root?)'; fi
   else
     msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
@@ -1921,7 +1985,13 @@ do_action() {
       printf '  %s%s%s\n' "$C_HDR" "$_l" "$C_OFF"
       plan_steps | sed 's/^/      /'
       case "$VERB" in
-        delete|edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '        %s\n' "$_p" ;;
+        edit) [ -n "$_p" ] && [ "$_p" != "$EM" ] && printf '        %s\n' "$_p" ;;
+        delete)
+          if [ -n "$_p" ] && [ "$_p" != "$EM" ]; then
+            printf '        %s\n' "$_p"
+            _pd=$(delete_destination "$_l")
+            [ -n "$_pd" ] && printf '        -> %s\n' "$_pd"
+          fi ;;
       esac
       [ "$VRB" = 1 ] && printf '      %s%s%s\n' "$C_DIM" "$(plan_raw "$_l" "$_d" "$_p")" "$C_OFF"
       printf '\n'
@@ -1964,7 +2034,7 @@ plan_steps() {
              [ "$NOW" = 1 ] || printf -- '  (it keeps running for now; add --now to stop it too)\n' ;;
     delete)  printf -- '- stop it\n'
              printf -- '- disable it, so it stays off even if its plist comes back\n'
-             printf -- '- move its plist to a dated backup:\n' ;;
+             printf -- '- move its plist to %s\n' "$(delete_where)" ;;
     edit)    printf -- '- open its plist in the editor\n' ;;
   esac
 }
@@ -2144,7 +2214,8 @@ run_tests() {
     printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\nEDITOR_CMD=""\n'
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'EDITOR_CMD=""\nDELETE_MODE=trash\nTIME_FORMAT=relative\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 
   # and the suite's own view of the machine
@@ -2158,6 +2229,7 @@ run_tests() {
   t_hints
   t_version
   t_exitcodes
+  t_timefmt
   t_editdelete
   t_program
   t_watch
@@ -2476,7 +2548,9 @@ t_editdelete() {
   t_guard "$_lab"
   _pl=$(t_plist editme)
   cp "$_pl" "$_ed/$_lab.plist"
-  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+  # DELETE_MODE=backup keeps the suite inside its own temp dir. A test must
+  # never put anything in the real Trash.
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\nDELETE_MODE=backup\n' \
     "$_ed" "$_ed" "$_ed" > "$_ed/conf"
   _sf=
   [ "$SCOPE" = agents ] && _sf=--agents
@@ -2524,6 +2598,12 @@ t_editdelete() {
   esac
   case "$_o" in *'- stop it'*'- disable it'*) t_ok 'the plan lists each step as a bullet' ;;
     *) t_no 'plan bullets' 'one bullet per step' "$_o" ;; esac
+  # the plan must name the DESTINATION, not repeat the source: "move it to a
+  # dated backup:" followed by the source path was actively misleading
+  case "$_o" in
+    *'-> '*) t_ok 'the plan names where the plist will go' ;;
+    *) t_no 'plan names the destination' 'a -> destination line' "$_o" ;;
+  esac
   # ...and -V still exposes the exact commands
   _ov=$(MY_LC_CONFIG="$_ed/conf" "$0" $_sf -V "$_lab" delete < /dev/null 2>&1)
   case "$_ov" in *'launchctl bootout'*) t_ok '-V still shows the exact launchctl commands' ;;
@@ -2538,12 +2618,49 @@ t_editdelete() {
   if ls "$_ed"/st/deleted/"$_lab".plist.* >/dev/null 2>&1; then
     t_ok 'delete keeps a dated backup, so it can be undone'
   else t_no 'delete backs up the plist' 'a file under st/deleted/' 'no backup found'; fi
+  # trash mode, exercised with HOME redirected so the real Trash is untouched
+  _th="$_ed/home"; mkdir -p "$_th"
+  cp "$_pl" "$_ed/$_lab.plist"
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\nDELETE_MODE=trash\n' \
+    "$_ed" "$_ed" "$_ed" > "$_ed/conft"
+  _o=$(HOME="$_th" MY_LC_CONFIG="$_ed/conft" "$0" $_sf "$_lab" delete --go 2>&1)
+  if [ -f "$_th/.Trash/$_lab.plist" ]; then t_ok 'DELETE_MODE=trash puts the plist in the Trash'
+  else t_no 'trash mode' "a plist in $_th/.Trash" "$_o"; fi
+  # a second delete of the same label must not clobber the first
+  cp "$_pl" "$_ed/$_lab.plist"
+  HOME="$_th" MY_LC_CONFIG="$_ed/conft" "$0" $_sf "$_lab" delete --go >/dev/null 2>&1
+  _cnt=$(find "$_th/.Trash" -type f 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$_cnt" -ge 2 ]; then t_ok 'a second delete does not overwrite the first in the Trash'
+  else t_no 'trash collision' '2 files' "$_cnt file(s)"; fi
+
   # delete must DISABLE as well as remove, so a reinstalled plist stays off
   if launchctl print-disabled "$DOMAIN" 2>/dev/null \
      | awk -F'"' '/=> *disabled/ { print $2 }' | grep -qxF "$_lab"; then
     t_ok 'delete leaves the service disabled, not merely removed'
   else t_no 'delete disables too' "$_lab listed as disabled" 'it is not disabled'; fi
   cleanup_fixtures
+}
+
+t_timefmt() {
+  t_sec 'L. time rendering follows the config'
+  _now=$(now_epoch)
+  _then=$(( _now - 90000 ))
+  TIME_FORMAT=relative
+  case "$(when "$_then")" in
+    *d*h) t_ok 'relative mode gives an age' ;;
+    *) t_no 'relative mode' 'NNdNNh' "$(when "$_then")" ;;
+  esac
+  TIME_FORMAT=absolute
+  case "$(when "$_then")" in
+    20[0-9][0-9]-[01][0-9]-[0-3][0-9]_[0-2][0-9][0-5][0-9])
+      t_ok "absolute mode gives a timestamp ($(when "$_then"))" ;;
+    *) t_no 'absolute mode' 'YYYY-MM-DD_HHMM' "$(when "$_then")" ;;
+  esac
+  _save=$TIME_FMT; TIME_FMT='%Y%m%d'
+  t_eq 'TIME_FMT is honoured' "$(date -r "$_then" '+%Y%m%d')" "$(when "$_then")"
+  TIME_FMT=$_save
+  TIME_FORMAT=relative
+  t_eq 'an empty moment is ? and not a crash' '?' "$(when '')"
 }
 
 t_exitcodes() {
