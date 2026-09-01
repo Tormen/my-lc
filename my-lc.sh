@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="b822999"
+SCRIPT_COMMIT="56567ab"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -595,6 +595,46 @@ path_verdict() {
   printf 'MISSING'
 }
 
+# Which of the three permission digits applies to USER for PATH: the owner
+# digit, the group digit, or the other digit. Every "can this user do X"
+# question reduces to this, so it lives in one place: the same reasoning was
+# written out three times and drifted between them.
+#   echoes 0-7, or nothing when the path cannot be stat'd
+perm_bit() {
+  _pbs=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || return 1
+  _pbo=${_pbs%% *}; _pbr=${_pbs#* }; _pbg=${_pbr%% *}; _pbm=${_pbr##* }
+  _pbu=$(id -u "$2" 2>/dev/null) || return 1
+  # root is bound by none of them for reading, and for execute needs only
+  # that SOME execute bit is set; callers handle that case themselves.
+  if   [ "$_pbo" = "$_pbu" ];                       then printf '%s' $(( (0$_pbm / 64) % 8 ))
+  elif case " $(id -G "$2" 2>/dev/null) " in *" $_pbg "*) true ;; *) false ;; esac
+                                                    then printf '%s' $(( (0$_pbm / 8) % 8 ))
+  else                                                   printf '%s' $((  0$_pbm       % 8 ))
+  fi
+}
+
+# Can USER read PATH, and reach it at all? Used for the watched paths: a
+# path the job cannot read is a trigger that fires into a failure.
+#   ok | <reason>
+path_readable() {
+  _prp=$1; _pru=$2
+  [ -n "$_prp" ] && [ -n "$_pru" ] || { printf 'ok'; return; }
+  _pruid=$(id -u "$_pru" 2>/dev/null) || { printf '? no such user: %s' "$_pru"; return; }
+  # every parent must be traversable, whoever is asking
+  _prd=$(dirname "$_prp")
+  while [ "$_prd" != / ] && [ -n "$_prd" ] && [ "$_prd" != . ]; do
+    if [ "$_pruid" != 0 ]; then
+      _b=$(perm_bit "$_prd" "$_pru") || break
+      [ $(( _b % 2 )) = 1 ] || { printf 'cannot traverse %s' "$_prd"; return; }
+    fi
+    _prd=$(dirname "$_prd")
+  done
+  [ "$_pruid" = 0 ] && { printf 'ok'; return; }
+  _b=$(perm_bit "$_prp" "$_pru") || { printf 'ok'; return; }
+  if [ $(( _b / 4 )) = 1 ]; then printf 'ok'
+  else printf 'not readable by %s' "$_pru"; fi
+}
+
 # Is the program actually runnable BY THE USER THE SERVICE RUNS AS?
 # '[ -x ]' answers "can *I* execute it", which is a different question: a
 # root-owned mode-544 helper is executable by root and not by me, and
@@ -622,19 +662,12 @@ program_verdict() {
     [ -x "$1" ] && { printf 'ok'; return; }
   fi
 
-  _pst=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || { printf '?'; return; }
-  _po=${_pst%% *}; _pr2=${_pst#* }; _pg=${_pr2%% *}; _pm=${_pr2##* }
-
+  _pst=$(stat -f '%Lp' "$1" 2>/dev/null) || { printf '?'; return; }
   # No execute bit at all is definitive, for every user including root.
-  [ $(( 0$_pm & 73 )) = 0 ] && { printf 'NOT EXECUTABLE'; return; }
+  [ $(( 0$_pst & 73 )) = 0 ] && { printf 'NOT EXECUTABLE'; return; }
   # root may execute anything that carries any execute bit.
   [ "$_pu2" = 0 ] && { printf 'ok'; return; }
-  # Otherwise it depends which class this user falls into.
-  if   [ "$_po" = "$_pu2" ];                          then _pb=$(( (0$_pm / 64) % 8 ))
-  elif case " $(id -G "$_pusr" 2>/dev/null) " in *" $_pg "*) true ;; *) false ;; esac
-                                                      then _pb=$(( (0$_pm / 8) % 8 ))
-  else                                                     _pb=$((  0$_pm       % 8 ))
-  fi
+  _pb=$(perm_bit "$1" "$_pusr") || { printf 'ok'; return; }
   if [ $(( _pb % 2 )) = 1 ]; then printf 'ok'
   else printf 'NOT EXECUTABLE by %s' "$_pusr"; fi
 }
@@ -678,6 +711,32 @@ $_dirs"
   fi
   if [ $(( _bit % 2 )) = 1 ]; then printf 'ok'
   else printf 'not executable by %s' "$_pu"; fi
+}
+
+# For a watched path that exists, say WHEN it last changed - that change is
+# the event that would have fired the service - and for a directory WHAT
+# changed, since the directory's own mtime moves when an entry appears or
+# disappears.
+watch_detail() {
+  _wp=$1
+  case "$2" in ok*) ;; *) return 0 ;; esac
+  _mt=$(file_epoch "$_wp")
+  [ -n "$_mt" ] || return 0
+  printf '  %-10s   last change %s\n' '' "$(when "$_mt")"
+  if [ -d "$_wp" ] && [ -r "$_wp" ] && [ -x "$_wp" ]; then
+    # shellcheck disable=SC2012  # newest-by-mtime; BSD find has no -printf
+    _new=$(ls -t "$_wp" 2>/dev/null | head -n 1)
+    if [ -n "$_new" ]; then
+      _nmt=$(file_epoch "$_wp/$_new")
+      if [ -n "$_nmt" ]; then
+        printf '  %-10s   newest entry: %s (%s)\n' '' "$_new" "$(when "$_nmt")"
+      else
+        printf '  %-10s   newest entry: %s\n' '' "$_new"
+      fi
+    else
+      printf '  %-10s   the directory is empty\n' ''
+    fi
+  fi
 }
 
 # Worst verdict across a service's watched paths: ok | ! (missing) | ?
@@ -1213,6 +1272,7 @@ render_record() {
       fi
     fi
   fi
+  show_loaded_diff "$_l" "$_d" "$_p"
   if [ -n "$_pr" ]; then
     case "$_d" in
       system) _asuser=${_us:-root} ;;
@@ -1244,6 +1304,12 @@ render_record() {
     esac
   fi
 
+  # who the job runs as decides whether it can read its watched paths
+  case "$_d" in
+    system) _asuser=${_us:-root} ;;
+    *)      _asuser=${_us:-$(id -un "$DOMAIN_UID" 2>/dev/null)} ;;
+  esac
+
   # watched paths, each with its own verdict
   _wat=$(unmark "$(cut -d"$FS1" -f14 "$1")")
   if [ -n "$_wat" ]; then
@@ -1257,6 +1323,12 @@ render_record() {
       [ -n "$_w" ] || continue
       if [ "$_first" = 1 ]; then _lbl='watches:'; _first=0; else _lbl=''; fi
       _pv=$(path_verdict "$_w")
+      # A path that exists but cannot be read by the user the job runs as is
+      # a trigger that fires into a failure, so check that too.
+      case "$_pv" in
+        ok*) _pr2=$(path_readable "$_w" "$_asuser")
+             [ "$_pr2" = ok ] || _pv="$_pv, $_pr2" ;;
+      esac
       printf '  %-10s %-56s %s\n' "$_lbl" "$_w" "$_pv"
       watch_detail "$_w" "$_pv"
     done
@@ -1273,6 +1345,64 @@ render_record() {
   [ -n "$_ef" ] && printf '  %-10s %s\n' 'stderr:' "$_ef"
   [ -n "$_of" ] && printf '  %-10s %s\n' 'stdout:' "$_of"
   show_log_delta "$_l" "$_ef" "$_of"
+}
+
+# launchd keeps the definition it was given at bootstrap time. Editing the
+# plist changes the file, NOT the running service - and nothing tells you
+# they have diverged. These two render the same facts from each side so
+# they can be diffed.
+defn_from_launchctl() {
+  launchctl print "$1/$2" 2>/dev/null | awk '
+    /^\tprogram = /      { sub(/^\tprogram = /, ""); print "program " $0; next }
+    /^\targuments = \{/  { inargs = 1; next }
+    inargs && /^\t\}/    { inargs = 0; next }
+    inargs                { sub(/^\t\t/, ""); print "argument " $0; next }
+    /^\tstdout path = /  { sub(/^\tstdout path = /, ""); print "stdout " $0; next }
+    /^\tstderr path = /  { sub(/^\tstderr path = /, ""); print "stderr " $0; next }
+  '
+}
+
+defn_from_plist() {
+  plutil -p "$1" 2>/dev/null | awk '
+    function val(l) { sub(/^[^=]*=> /, "", l); gsub(/^"|"$/, "", l); return l }
+    /^ *"ProgramArguments" *=> *\[/ { inargs = 1; next }
+    inargs && /^ *\]/              { inargs = 0; next }
+    inargs && /=>/                  { a[++n] = val($0); print "argument " a[n]; next }
+    /^ *"Program" *=>/              { prog = val($0); next }
+    /^ *"StandardOutPath" *=>/      { print "stdout " val($0); next }
+    /^ *"StandardErrorPath" *=>/    { print "stderr " val($0); next }
+    END {
+      # launchd fills program in from the first argument when the plist does
+      # not set one, and reports BOTH. Mirror that, or a plist that only has
+      # ProgramArguments reads as changed when nothing has changed.
+      if (prog == "") prog = a[1]
+      if (prog != "") print "program " prog
+      # NOT the reverse: for a Program-only service launchctl reports a
+      # program and NO arguments block, so inventing argument[0] here made
+      # every such service read as changed.
+    }
+  '
+}
+
+
+# Report how the running service differs from its plist, if at all.
+show_loaded_diff() {
+  _dl=$1; _dd=$2; _dp=$3
+  [ -n "$_dp" ] || return 0
+  launchctl print "$_dd/$_dl" >/dev/null 2>&1 || return 0
+  defn_from_launchctl "$_dd" "$_dl" | sort > "$TMPD/defn.loaded"
+  defn_from_plist "$_dp"            | sort > "$TMPD/defn.disk"
+  # A plist my-lc cannot read yields nothing, which would look like a total
+  # rewrite. Say nothing rather than something false.
+  [ -s "$TMPD/defn.disk" ] || return 0
+  if cmp -s "$TMPD/defn.loaded" "$TMPD/defn.disk"; then
+    printf '  %-10s %s\n' 'loaded:' 'matches the plist on disk'
+    return 0
+  fi
+  printf '  %-10s %s%s%s\n' 'loaded:' "$C_WARN" \
+    'DIFFERS from the plist on disk - restart to apply' "$C_OFF"
+  diff "$TMPD/defn.loaded" "$TMPD/defn.disk" 2>/dev/null \
+    | sed -n 's/^< /             running: /p; s/^> /             on disk: /p'
 }
 
 state_meaning() {
@@ -1835,10 +1965,57 @@ v_edit() {
   _newlab=$(plutil -extract Label raw -o - "$_plist" 2>/dev/null)
   [ -n "$_newlab" ] && [ "$_newlab" != "$_label" ] && \
     msg "note: the Label is now '$_newlab' - the old service keeps the old name until reloaded"
+  # Editing a plist changes the FILE. The running service keeps the
+  # definition it was bootstrapped with, and the next boot reads the file -
+  # so "now" and "at every boot" are two separate questions, and the answer
+  # to each depends on the state the service is in.
+  _needrestart=0; _needenable=0
   case "$_state" in
-    on|@off) msg "$_label is loaded with the OLD definition - 'restart' to apply the change" ;;
-    *)       msg "$_label is not loaded; 'start' it to apply the change" ;;
+    on|@off) _needrestart=1 ;;
   esac
+  case "$_state" in
+    off|@off) _needenable=1 ;;
+  esac
+  if [ "$_needrestart" = 1 ]; then
+    msg "$_label is still running the OLD definition:"
+    show_loaded_diff "$_label" "$DOMAIN" "$_plist" | sed 's/^/  /'
+  fi
+  [ "$_needenable" = 1 ] && \
+    msg "$_label is disabled, so the next boot will NOT pick this up either"
+  if [ "$_needrestart" = 0 ] && [ "$_needenable" = 0 ]; then
+    msg "$_label is not loaded; the next boot will use the new definition"
+    msg "'start' it to use it now as well"
+    return 0
+  fi
+
+  # Offer exactly the steps this service needs, and do nothing without the
+  # agreed word.
+  printf '\napply it?\n'
+  [ "$_needrestart" = 1 ] && printf '  - restart %s, so the change takes effect now\n' "$_label"
+  [ "$_needenable" = 1 ]  && printf '  - enable %s, so every boot picks it up\n' "$_label"
+  [ "$_needrestart" = 0 ] && [ "$_needenable" = 1 ] && \
+    printf '  - and start it, so it runs now too\n'
+  if [ "$GO" = 1 ]; then
+    printf '(--go given)\n'
+  else
+    printf 'type go: '
+    if [ -t 0 ]; then read -r _ans; else _ans=; fi
+    if [ "$_ans" != go ]; then
+      printf 'nothing done - the file is saved, the running service is unchanged\n'
+      return 0
+    fi
+  fi
+  if [ "$_needenable" = 1 ]; then
+    msgn "enabling $_label ..."; [ "$VRB" = 1 ] && printf '\n'
+    if lc enable "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  fi
+  if [ "$_needrestart" = 1 ]; then
+    _state=on
+    v_restart
+  else
+    _state=@on
+    v_start
+  fi
 }
 
 # ======================================================================
@@ -2603,6 +2780,7 @@ run_tests() {
   t_timefmt
   t_truncate
   t_undelete
+  t_loadeddiff
   t_chain
   t_failures
   t_errcolumn
@@ -2623,14 +2801,29 @@ run_tests() {
 # litter in a system file and the user should hear it from the tool rather
 # than discover it.
 t_residue() {
+  # Clean up properly rather than just reporting: 'launchctl enable' clears
+  # the flag but leaves the entry, and one per fixture label accumulates in
+  # the domain's override database run after run. The file is root-owned, so
+  # this only works when the suite runs as root; otherwise say what is left.
+  if [ "$DOMAIN" = system ]; then _dbf=/var/db/com.apple.xpc.launchd/disabled.plist
+  else _dbf=/var/db/com.apple.xpc.launchd/disabled.$DOMAIN_UID.plist; fi
+  if [ -w "$_dbf" ]; then
+    _removed=0
+    for _rl in $(launchctl print-disabled "$DOMAIN" 2>/dev/null \
+                 | awk -F'"' -v p="$SELFTEST_PREFIX" '$2 ~ p { print $2 }'); do
+      t_guard "$_rl"
+      plutil -remove "$_rl" "$_dbf" >/dev/null 2>&1 && _removed=$((_removed + 1))
+    done
+    [ "$_removed" -gt 0 ] && printf '\ncleaned up %s selftest entr%s from %s\n' \
+      "$_removed" "$( [ "$_removed" = 1 ] && printf 'y' || printf 'ies' )" "$_dbf"
+  fi
   _res=$(launchctl print-disabled "$DOMAIN" 2>/dev/null \
          | grep -c "$SELFTEST_PREFIX" 2>/dev/null)
   [ "${_res:-0}" -gt 0 ] 2>/dev/null || return 0
   printf '\n%sleft behind%s: %s selftest label(s) remain listed in the %s\n' \
     "$C_WARN" "$C_OFF" "$_res" "override database"
-  printf '  as "=> enabled", which disables nothing. launchctl can clear the\n'
-  printf '  flag but cannot delete the entry, so this cannot be undone from\n'
-  printf '  here. To remove them entirely, as root:\n'
+  printf '  as "=> enabled", which disables nothing. The suite removes these\n'
+  printf '  itself when it can write the file, but it is root-owned. As root:\n'
   # the system domain's file has no uid component; a gui domain's does
   if [ "$DOMAIN" = system ]; then _dbf=/var/db/com.apple.xpc.launchd/disabled.plist
   else _dbf=/var/db/com.apple.xpc.launchd/disabled.$DOMAIN_UID.plist; fi
@@ -3108,6 +3301,66 @@ t_truncate() {
   _o=$(_run --go)
   case "$_o" in *'already empty'*) t_ok 'an already-empty log says so' ;;
     *) t_no 'already empty' 'already empty' "$_o" ;; esac
+  cleanup_fixtures
+}
+
+t_loadeddiff() {
+  t_sec 'R. the running definition versus the plist on disk'
+  # every loaded service on THIS machine must compare equal: a false
+  # positive here would cry wolf on every status
+  _bad=0; _checked=0
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
+    [ "$_st" = on ] || continue
+    [ -n "$_p" ] && [ "$_p" != "$EM" ] || continue
+    _checked=$((_checked + 1))
+    case "$(show_loaded_diff "$_l" "$_d" "$_p")" in
+      *DIFFERS*) _bad=$((_bad + 1)); printf '        %s\n' "$_l" ;;
+    esac
+  done < "$DB"
+  if [ "$_checked" = 0 ]; then t_skip 'loaded-vs-disk on real services' 'nothing loaded to compare'
+  else t_eq "no false differences across $_checked loaded services" 0 "$_bad"; fi
+
+  # and a real change must be detected
+  _dd2="$TMPD/ldiff"; mkdir -p "$_dd2/st"
+  _lab="$SELFTEST_PREFIX-ldiff"
+  t_guard "$_lab"
+  _w() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+      printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep %s</string></array>\n' "$1"
+      printf '  <key>RunAtLoad</key><true/>\n'
+      printf '</dict></plist>\n'; } > "$_dd2/$_lab.plist"
+  }
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_dd2" "$_dd2" "$_dd2" > "$_dd2/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _w 300
+  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" enable --now >/dev/null 2>&1
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *'matches the plist'*) t_ok 'an untouched service matches' ;;
+    *) t_no 'untouched matches' 'matches the plist on disk' "$_o" ;; esac
+
+  _w 999
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *DIFFERS*) t_ok 'an edited plist is detected as different' ;;
+    *) t_no 'edit detected' 'DIFFERS from the plist on disk' "$_o" ;; esac
+  case "$_o" in *'running: argument sleep 300'*) t_ok 'the diff shows what is RUNNING' ;;
+    *) t_no 'diff shows running side' 'running: argument sleep 300' "$_o" ;; esac
+  case "$_o" in *'on disk: argument sleep 999'*) t_ok 'the diff shows what is ON DISK' ;;
+    *) t_no 'diff shows disk side' 'on disk: argument sleep 999' "$_o" ;; esac
+
+  # edit offers to apply it, and --go carries it out
+  # shellcheck disable=SC2016  # $1 belongs to the generated script
+  printf '#!/bin/sh\nsed -i "" "s|sleep 999|sleep 555|" "$1"\n' > "$_dd2/ed"
+  chmod 755 "$_dd2/ed"
+  _o=$(EDITOR="$_dd2/ed" MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" edit --go 2>&1)
+  case "$_o" in *'apply it?'*'restart'*) t_ok 'edit proposes the action the service needs' ;;
+    *) t_no 'edit proposes' 'apply it? ... restart' "$_o" ;; esac
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *'matches the plist'*) t_ok 'and --go applies it, so they match again' ;;
+    *) t_no 'edit --go applied' 'matches the plist on disk' "$_o" ;; esac
   cleanup_fixtures
 }
 

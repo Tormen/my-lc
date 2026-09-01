@@ -246,6 +246,20 @@ a way to learn the raw commands.
   clears the disable that `delete` set. A plist in the Trash that my-lc did
   *not* delete is never offered — installing a launch daemon from a guessed
   location would be reckless.
+- **`status` says whether the RUNNING service still matches its plist.**
+  launchd keeps the definition it was given at bootstrap; editing the file
+  changes nothing until a restart, and nothing tells you they have
+  diverged. my-lc diffs the two and shows which side says what:
+
+```
+  loaded:    DIFFERS from the plist on disk - restart to apply
+             running: argument sleep 300
+             on disk: argument sleep 999
+```
+
+  `edit` shows the same diff on leaving the editor and then offers exactly
+  the steps that service needs — restart to apply it now, enable so every
+  boot picks it up, or both — doing nothing without the word `go`.
 - **`status` dates the plist itself** — when it was written and whether it
   has changed since. An old plist edited yesterday is a different story
   from one untouched since it was installed.
