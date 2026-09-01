@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="55a4499"
+SCRIPT_COMMIT="7777c27"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -543,20 +543,39 @@ path_verdict() {
   printf 'MISSING'
 }
 
-# Is the program actually runnable? A missing or non-executable program is
-# precisely what produces exit 127 / 126, and launchd says nothing about it.
-# Cheap form: no forks, so the table can afford it for every service.
-#   ok | MISSING | EMPTY | NOT EXECUTABLE | ? <component>
+# Is the program actually runnable BY THE USER THE SERVICE RUNS AS?
+# '[ -x ]' answers "can *I* execute it", which is a different question: a
+# root-owned mode-544 helper is executable by root and not by me, and
+# reporting that as NOT EXECUTABLE is a false alarm. So the execute bits are
+# read from the mode and matched against the right user.
+#   ok | MISSING | EMPTY | NOT EXECUTABLE | NOT A FILE | ? <reason>
+#   $2 = the user the service runs as (optional; defaults to a bits-only test)
 program_verdict() {
   [ -n "$1" ] || { printf 'ok'; return; }
-  case "$(path_verdict "$1")" in
-    MISSING) printf 'MISSING'; return ;;
-    '?'*)    printf '%s' "$(path_verdict "$1")"; return ;;
+  _pvv=$(path_verdict "$1")
+  case "$_pvv" in
+    MISSING)  printf 'MISSING';    return ;;
+    '?'*)     printf '%s' "$_pvv"; return ;;
     'ok dir') printf 'NOT A FILE'; return ;;
   esac
   [ -s "$1" ] || { printf 'EMPTY'; return; }
-  [ -x "$1" ] || { printf 'NOT EXECUTABLE'; return; }
-  printf 'ok'
+  # Fast path: if I can execute it, so can anyone the bits allow.
+  [ -x "$1" ] && { printf 'ok'; return; }
+  _pst=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || { printf '?'; return; }
+  _po=${_pst%% *}; _pr2=${_pst#* }; _pg=${_pr2%% *}; _pm=${_pr2##* }
+  # No execute bit at all is definitive, for every user.
+  [ $(( 0$_pm & 73 )) = 0 ] && { printf 'NOT EXECUTABLE'; return; }
+  # Some bit is set, so it depends who asks.
+  [ -n "$2" ] || { printf 'ok'; return; }
+  _pu2=$(id -u "$2" 2>/dev/null) || { printf 'ok'; return; }
+  [ "$_pu2" = 0 ] && { printf 'ok'; return; }
+  if   [ "$_po" = "$_pu2" ];                      then _pb=$(( (0$_pm / 64) % 8 ))
+  elif case " $(id -G "$2" 2>/dev/null) " in *" $_pg "*) true ;; *) false ;; esac
+                                                  then _pb=$(( (0$_pm / 8) % 8 ))
+  else                                                 _pb=$((  0$_pm       % 8 ))
+  fi
+  if [ $(( _pb % 2 )) = 1 ]; then printf 'ok'
+  else printf 'NOT EXECUTABLE by %s' "$2"; fi
 }
 
 # Can USER actually reach and run it? Checked component by component, since
@@ -829,11 +848,16 @@ discover_scope() {
       run\ *) ;;
       *) if [ -n "$_pr" ]; then
            _pw=
-           case "$(program_verdict "$_pr")" in
+           case "$_dm" in
+             system) _asu=${_us:-root} ;;
+             *)      _asu=${_us:-$AGENT_USER} ;;
+           esac
+           case "$(program_verdict "$_pr" "$_asu")" in
              ok|'?'*)          ;;
              MISSING)          _pw='program MISSING' ;;
              EMPTY)            _pw='program EMPTY' ;;
-             'NOT EXECUTABLE') _pw='program NOT EXECUTABLE' ;;
+             'NOT EXECUTABLE')   _pw='program NOT EXECUTABLE' ;;
+             'NOT EXECUTABLE by'*) _pw="program NOT EXECUTABLE by $_asu" ;;
              'NOT A FILE')     _pw='program is a DIRECTORY' ;;
            esac
            if [ -n "$_pw" ]; then
@@ -979,7 +1003,21 @@ render_table() {
     printf '%-*s ' "$_wl" "$_l"
     printf '%s%-6s%s ' "$_c" "$_st" "$C_OFF"
     printf '%-*s ' "$_wt" "$_tr"
-    printf '%-*s ' "$_ws" "$_su"
+    # A failure or a broken program is the most actionable cell on the
+    # screen; it should not render like an ordinary status. Padding is
+    # computed from the uncoloured text, since escape bytes count in %-*s.
+    _sc=
+    case "$_su" in
+      *'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
+        _sc=$C_BAD ;;
+      FAIL*) _sc=$C_BAD ;;
+    esac
+    if [ -n "$_sc" ]; then
+      _spad=$(( _ws - ${#_su} )); [ "$_spad" -lt 0 ] && _spad=0
+      printf '%s%s%s%*s ' "$_sc" "$_su" "$C_OFF" "$_spad" ''
+    else
+      printf '%-*s ' "$_ws" "$_su"
+    fi
     if [ "$_er" = '-' ]; then printf -- '-'
     else printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF"; fi
     [ "$VRB" = 1 ] && printf ' %s' "$_ou"
@@ -1018,12 +1056,12 @@ render_record() {
   esac
   [ -n "$_p" ]  && printf '  %-10s %s\n' 'plist:'   "$_p"
   if [ -n "$_pr" ]; then
-    _pv=$(program_verdict "$_pr")
-    printf '  %-10s %s\n' 'program:' "$_pr"
     case "$_d" in
       system) _asuser=${_us:-root} ;;
       *)      _asuser=${_us:-$(id -un "$DOMAIN_UID" 2>/dev/null)} ;;
     esac
+    _pv=$(program_verdict "$_pr" "$_asuser")
+    printf '  %-10s %s\n' 'program:' "$_pr"
     case "$_pv" in
       ok)
         _pac=$(program_access "$_pr" "$_asuser")
@@ -1034,7 +1072,8 @@ render_record() {
         fi ;;
       MISSING)          printf '  %-10s %s%s%s\n' '' "$C_BAD" 'MISSING - this is why it cannot start (exit 127)' "$C_OFF" ;;
       EMPTY)            printf '  %-10s %s%s%s\n' '' "$C_BAD" 'the file is EMPTY (0 bytes)' "$C_OFF" ;;
-      'NOT EXECUTABLE') printf '  %-10s %s%s%s\n' '' "$C_BAD" 'NOT EXECUTABLE - no execute bit (exit 126)' "$C_OFF" ;;
+      'NOT EXECUTABLE')   printf '  %-10s %s%s%s\n' '' "$C_BAD" 'NOT EXECUTABLE - no execute bit at all (exit 126)' "$C_OFF" ;;
+      'NOT EXECUTABLE by'*) printf '  %-10s %s%s%s\n' '' "$C_BAD" "$_pv - the bits allow others, not this user" "$C_OFF" ;;
       'NOT A FILE')     printf '  %-10s %s%s%s\n' '' "$C_BAD" 'this path is a DIRECTORY, not a program' "$C_OFF" ;;
       '?'*)             printf '  %-10s %s\n' '' "$_pv - rerun as root to tell" ;;
     esac
@@ -2202,7 +2241,20 @@ t_program() {
 
   t_eq 'a real executable is ok'        ok               "$(program_verdict "$_pd/good")"
   t_eq 'a 0-byte program is EMPTY'      EMPTY            "$(program_verdict "$_pd/empty")"
-  t_eq 'a non-executable is caught'     'NOT EXECUTABLE' "$(program_verdict "$_pd/noexec")"
+  t_eq 'a file with no execute bit at all is caught' \
+       'NOT EXECUTABLE' "$(program_verdict "$_pd/noexec")"
+  # '[ -x ]' answers "can I run it", which is the wrong question: a
+  # root-owned mode-544 helper is executable by root and not by me, and
+  # calling that NOT EXECUTABLE was a real false alarm.
+  printf 'x' > "$_pd/rootonly"; chmod 544 "$_pd/rootonly"
+  t_eq 'mode 544 is executable for root'  ok "$(program_verdict "$_pd/rootonly" root)"
+  chmod 500 "$_pd/rootonly"
+  if [ "$(id -u)" = 0 ]; then
+    t_skip 'mode 500 owned by me' 'running as root, owner test differs'
+  else
+    t_eq 'a mode-500 file owned by me is fine for me' \
+         ok "$(program_verdict "$_pd/rootonly" "$(id -un)")"
+  fi
   t_eq 'an absent program is MISSING'   MISSING          "$(program_verdict "$_pd/nope")"
   t_eq 'a directory is not a program'   'NOT A FILE'     "$(program_verdict "$_pd")"
   t_eq 'no program at all is not an error' ok            "$(program_verdict '')"
