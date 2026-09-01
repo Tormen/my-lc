@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a943b8b"
+SCRIPT_COMMIT="9d688ab"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -58,7 +58,7 @@ BIG_DELTA=1048576
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
-DELETE_MODE=trash
+DELETE_MODE=backup
 TIME_FORMAT=absolute
 TIME_FMT="%Y-%m-%d_%H%M"
 
@@ -104,7 +104,7 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   enable   arm it for boot; add --now to also start it
   disable  stop it coming back at boot; add --now to also stop it now
   edit     open the plist in $EDITOR, then check it is still valid
-  delete   stop it and move its plist to the Trash (always confirms)
+  delete   stop it, disable it, and move its plist aside (always confirms)
   truncate empty its logs to 0 bytes. 'truncate err' or 'truncate out' to
            pick one; both by default
 
@@ -386,10 +386,12 @@ BIG_DELTA=1048576
 WIDTH_LABEL=auto
 
 # What 'delete' does with the plist:
-#   trash  = move it to the Trash of the user running my-lc (recoverable
-#            from Finder, and it is where a deleted file belongs)
-#   backup = move it to $STATE_DIR/deleted/<label>.plist.<timestamp>
-DELETE_MODE=trash
+#   backup = move it to $STATE_DIR/deleted/<label>.plist.<timestamp>, so
+#            every removed launch item stays together, dated, next to the
+#            tool's other state and out of the way of a Trash the user
+#            empties without thinking about it
+#   trash  = move it to the Trash of the user running my-lc
+DELETE_MODE=backup
 
 # How ages are shown: 'relative' gives 44d0h, 'absolute' gives a timestamp
 # in TIME_FMT. Absolute is easier to correlate with other logs.
@@ -1583,18 +1585,14 @@ v_truncate() {
 # in which case the caller unlinks instead.
 delete_where() {
   case "$DELETE_MODE" in
-    backup) printf 'a dated backup' ;;
-    *)      printf 'the Trash' ;;
+    trash) printf 'the Trash' ;;
+    *)     printf 'the deleted folder' ;;
   esac
 }
 
 delete_destination() {
   case "$DELETE_MODE" in
-    backup)
-      ensure_state_dir || return 0
-      mkdir -p "$STATE_DIR/deleted" 2>/dev/null || return 0
-      printf '%s/deleted/%s.plist.%s' "$STATE_DIR" "$1" "$(date '+%Y%m%d-%H%M%S')" ;;
-    *)
+    trash)
       [ -n "${HOME:-}" ] || return 0
       mkdir -p "$HOME/.Trash" 2>/dev/null || return 0
       # Finder refuses to overwrite in the Trash, and neither should we:
@@ -1604,6 +1602,10 @@ delete_destination() {
       else
         printf '%s/.Trash/%s.plist' "$HOME" "$1"
       fi ;;
+    *)
+      ensure_state_dir || return 0
+      mkdir -p "$STATE_DIR/deleted" 2>/dev/null || return 0
+      printf '%s/deleted/%s.plist.%s' "$STATE_DIR" "$1" "$(date '+%Y%m%d-%H%M%S')" ;;
   esac
 }
 
@@ -1725,7 +1727,7 @@ _my-lc() {
         'enable:Arm it for boot; add --now to also start it'
         'disable:Stop it coming back at boot; add --now to also stop it'
         'edit:Open the plist in $EDITOR and check it stays valid'
-        'delete:Stop it and move its plist to the Trash'
+        'delete:Stop it, disable it, and move its plist aside'
         'truncate:Empty its logs - truncate [err|out], both by default'
     )
 
@@ -2346,7 +2348,7 @@ run_tests() {
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
     printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nWIDTH_LABEL=auto\nCOLOR=never\n'
-    printf 'EDITOR_CMD=""\nDELETE_MODE=trash\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
+    printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 
   # and the suite's own view of the machine
@@ -2681,8 +2683,9 @@ t_editdelete() {
   t_guard "$_lab"
   _pl=$(t_plist editme)
   cp "$_pl" "$_ed/$_lab.plist"
-  # DELETE_MODE=backup keeps the suite inside its own temp dir. A test must
-  # never put anything in the real Trash.
+  # DELETE_MODE=backup is the default and keeps the suite inside its own
+  # temp dir; it is set explicitly so the trash test below is the only thing
+  # that can go near a Trash, and even that one redirects HOME.
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\nDELETE_MODE=backup\n' \
     "$_ed" "$_ed" "$_ed" > "$_ed/conf"
   _sf=
@@ -2931,6 +2934,8 @@ t_timefmt() {
   # an age cannot
   _o=$("$0" --create-config 2>/dev/null | grep '^TIME_FORMAT=')
   t_eq 'the shipped default is absolute' 'TIME_FORMAT=absolute' "$_o"
+  _o=$("$0" --create-config 2>/dev/null | grep '^DELETE_MODE=')
+  t_eq 'the shipped delete mode is the dated backup' 'DELETE_MODE=backup' "$_o"
 
   # boot time must be parsed from the RIGHT number: '.*sec' also matches
   # 'usec', which captures the microseconds and dates everything to 1970
