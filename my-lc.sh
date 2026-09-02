@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="d435630"
+SCRIPT_COMMIT="0480721"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -65,6 +65,8 @@ RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
 RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
 RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
 RUNLOG_MAX_LINES=20000
+RUNLOG_POLL=60
+RUNLOG_BACKFILL=900
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
@@ -516,6 +518,21 @@ RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
 # Records kept per file before the oldest are dropped. One line is ~50
 # bytes, so the default is about a megabyte per user.
 RUNLOG_MAX_LINES=20000
+
+# How often the recorder asks the log store what happened, in seconds. It
+# READS a window; it does not stream one. Measured on ada: 10 seconds of
+# unfiltered 'log stream' is 7129 lines, the same window filtered to launchd
+# is 2 - while 'log show' returns thousands for the same period. Cost is
+# proportional to the WINDOW, not to the events in it: ~2.3s for 5 minutes,
+# so a 70s window costs about a second of CPU a minute.
+RUNLOG_POLL=60
+
+# How far back the FIRST read reaches, in seconds. launchd has no start
+# ordering for daemons - RunAtLoad is all there is - so the recorder can
+# never be first at boot and will always miss what happened before it came
+# up. Reading a window rather than streaming one is what makes that
+# recoverable: the first read simply looks further back.
+RUNLOG_BACKFILL=900
 
 # A log delta larger than this (bytes) is reported as a size rather than a
 # line count: counting lines means reading the whole thing, and a
@@ -1436,18 +1453,9 @@ runlog_plist() { printf '%s/%s.plist' "$RUNLOG_PLIST_DIR" "$RUNLOG_LABEL"; }
 # layout - and its permissions - survive.
 runlog_file() { printf '%s' "$RUNLOG_STATE" | sed "s|@USER@|$1|"; printf '/runs.tsv'; }
 
-# Deliberately COARSE. Filtering the three transitions at the source was the
-# obvious optimisation and it broke the daemon outright: 'log stream'
-# block-buffers into a pipe, and a predicate that selective emits a few dozen
-# bytes an hour, so the buffer never fills and awk sees nothing for hours.
-# The daemon looks perfectly healthy while recording nothing - running, stderr
-# empty, no records - which is exactly how it behaved.
-#
-# pid 1 alone emits ~11 events a second, so the buffer flushes every few
-# seconds, and the events my-lc does not want are dropped by the reducer -
-# which had to identify them precisely anyway. 'script' would give a pty and
-# line buffering, but it echoes a stray ^D into the stream and needs a tty
-# on stdin that a daemon does not have.
+# Deliberately COARSE: everything launchd itself says. The cost of a read is
+# the WINDOW, not the events in it, so filtering harder at the source buys
+# nothing - and the reducer has to identify the events precisely anyway.
 runlog_predicate() { printf '%s' 'processID == 1'; }
 
 # One record per event: epoch, domain, label, event, detail. Kept apart from
@@ -1544,52 +1552,38 @@ runlog_reduce() {
       if (!(f in ready)) {
         d = f; sub(/\/[^\/]*$/, "", d)
         system("mkdir -p " d " 2>/dev/null; touch " f " 2>/dev/null; chown " who " " f " 2>/dev/null")
+        # Each window overlaps the previous one on purpose, so the same event
+        # arrives twice. The newest record already in the file says where the
+        # last read got to.
+        cmd = "tail -n 1 " f " 2>/dev/null"
+        last = ""; cmd | getline last; close(cmd)
+        split(last, lp, "\t"); seen[f] = lp[1] + 0
         ready[f] = 1
       }
+      ep = epoch_of($1, $2)
+      if (ep <= seen[f]) next
       detail = (ev == "ERR") ? msg : "-"
       gsub(/\t/, " ", detail)
-      emit(f, epoch_of($1, $2) "\t" dom "\t" lab "\t" ev "\t" detail)
+      emit(f, ep "\t" dom "\t" lab "\t" ev "\t" detail)
     }
   '
 }
 
-# The daemon body. It never exits on its own: KeepAlive restarts it if the
-# stream dies, which is the only way this ends.
+# The daemon body. It never returns on its own: KeepAlive restarts it if it
+# dies, which is the only way it ends.
 cmd_runlog_collect() {
-  [ "$(id -u)" = 0 ] || die "the run recorder needs root: streaming the system log is admin-only"
-  # The pipeline must die WITH this shell. A bootout sends SIGTERM to the job;
-  # dash does not pass that to the children of a pipeline, so 'log stream' and
-  # awk outlive it, keep the label busy, and the bootstrap that follows fails
-  # with launchd's generic 'Input/output error' - which is how a restart left
-  # this service stopped. Signalling the process group takes them all.
-  # Through a PTY, because a pipe is block-buffered: 'log stream' fills 4KB
-  # before the reducer sees a byte, and launchd events are far too sparse for
-  # that to happen in any useful time - the daemon then runs, says nothing,
-  # and records nothing. 'script' is the only way to get a pty on macOS
-  # (there is no stdbuf); it needs stdin, hence </dev/null, and it costs a
-  # stray ^D on the first line and a CR on every line, both of which the
-  # reducer drops.
-  if [ -x /usr/bin/script ]; then
-    /usr/bin/script -q /dev/null /usr/bin/log stream --level default --style compact \
-      --predicate "$(runlog_predicate)" < /dev/null | runlog_reduce &
-  else
-    /usr/bin/log stream --level default --style compact --predicate "$(runlog_predicate)" \
-      | runlog_reduce &
-  fi
-  _cpid=$!
-  # Signal the process GROUP, since the pipeline's children are grandchildren
-  # of this shell and 'kill $_cpid' would leave them running. Only when this
-  # shell actually leads the group, though: under launchd it does, but run by
-  # hand from a terminal it does not, and there the group is the caller's.
-  _pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-  if [ "$_pgid" = "$$" ]; then
-    trap 'kill -TERM 0 2>/dev/null; exit 0' TERM INT HUP
-  else
-    # killing the subshell alone leaves the pipeline it forked, so take its
-    # children with it
-    trap 'pkill -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null; exit 0' TERM INT HUP
-  fi
-  wait "$_cpid"
+  [ "$(id -u)" = 0 ] || die "the run recorder needs root: reading the system log is admin-only"
+  # The first read reaches back, because the recorder cannot be the first
+  # thing launchd starts and everything before it would otherwise be lost.
+  _win=$RUNLOG_BACKFILL
+  while :; do
+    /usr/bin/log show --last "${_win}s" --style compact \
+      --predicate "$(runlog_predicate)" 2>/dev/null | runlog_reduce
+    # each window overlaps the last, so nothing falls between two reads; the
+    # overlap is dropped by epoch in the reducer
+    _win=$((RUNLOG_POLL + 10))
+    sleep "$RUNLOG_POLL"
+  done
 }
 
 runlog_plist_content() {
@@ -4671,6 +4665,23 @@ t_logsizes() {
     'empty, last '*) t_ok 'an empty log says so, and still dates the run that emptied it' ;;
     *) t_no 'empty log note' 'empty, last <when>' "$(log_size_note "$_lg/empty")" ;;
   esac
+  # Windows overlap on purpose, so the same event is read more than once and
+  # must be written once. Without this the file grows by a whole window every
+  # poll, and every 'last run' would be the newest COPY rather than the run.
+  _rl2="$TMPD/dedupe"; mkdir -p "$_rl2"
+  RUNLOG_STATE_SAVE3=$RUNLOG_STATE; RUNLOG_STATE="$_rl2/@USER@/my-lc"
+  _win2='2026-09-02 07:37:22.517109 Df launchd[1:1] [system/eu.no-panic.d1:] service state: spawning
+2026-09-02 07:37:25.100000 Df launchd[1:1] [system:] service inactive: eu.no-panic.d1'
+  printf '%s\n' "$_win2" | runlog_reduce '+0200'
+  _rf2="$_rl2/root/my-lc/runs.tsv"
+  t_eq 'a window is recorded'            2 "$(awk 'END { print NR+0 }' "$_rf2")"
+  printf '%s\n' "$_win2" | runlog_reduce '+0200'
+  t_eq 'and reading it again adds nothing' 2 "$(awk 'END { print NR+0 }' "$_rf2")"
+  printf '%s\n2026-09-02 07:38:00.000000 Df launchd[1:1] [system:] service inactive: eu.no-panic.d2\n' \
+    "$_win2" | runlog_reduce '+0200'
+  t_eq 'while a NEW event in the overlap is kept' 3 "$(awk 'END { print NR+0 }' "$_rf2")"
+  RUNLOG_STATE=$RUNLOG_STATE_SAVE3
+
   # BSD stat uses lstat, so a symlinked log was dated and sized by the LINK -
   # a file my-lc never means. Every stat in the tool passes -L now.
   printf 'aaaa\n' > "$_lg/real"
