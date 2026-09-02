@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="1a84301"
+SCRIPT_COMMIT="b288207"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -185,9 +185,10 @@ STATUS — whatever is relevant for that kind of service
   ok 12x              exited cleanly
   every 3600 / cal    a timer that has not run yet
   waiting             armed on a socket, path or XPC name
-  A leading !! means the service cannot work where it is: it needs a GUI
-  login session, and the system domain has none. 'status <label>' says
-  why. The fix is to move the plist to /Library/LaunchAgents.
+  !! CANNOT WORK      it needs a GUI login session, and the system domain
+                      has none - so no status of its own is worth showing.
+                      'status <label>' gives the evidence; the fix is to
+                      move the plist to /Library/LaunchAgents
   'as <user>' is appended only when it differs from the default for its
   scope (daemons run as root, agents as the session user). -V always shows
   it, and adds the OUT column, the plist path and the program.
@@ -1203,20 +1204,29 @@ render_table() {
     _wl=$WIDTH_LABEL
   fi
   _wt=$(awk -F"$FS1" '{ if (length($6)>m) m=length($6) } END { print (m<7?7:m) }' "$_f")
-  _ws=$(awk -F"$FS1" '{ if (length($7)>m) m=length($7) } END { print (m<6?6:m) }' "$_f")
   _dom=0; [ "$SCOPE" = both ] && _dom=1
 
   # A service that cannot work where it is put deserves a mark, but a mark on
   # some rows and not others leaves the STATUS text ragged - so the gutter
   # exists only when THIS listing has something to put in it.
   : > "$TMPD/traps"
-  _gut=0
+  _gut=0; _wtrap=0
   while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
     [ -n "$_l" ] || continue
-    if [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ]; then
-      printf '%s\n' "$_l" >> "$TMPD/traps"; _gut=1
-    fi
+    [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ] || continue
+    # 'waiting' on a service that can never run is a lie, so it is replaced
+    # outright; a FAIL is true as far as it goes, so the cause is added to it.
+    _tsu=$TRAP_STATUS
+    printf '%s%s%s\n' "$_l" "$FS1" "$_tsu" >> "$TMPD/traps"
+    [ "${#_tsu}" -gt "$_wtrap" ] && _wtrap=${#_tsu}
+    _gut=1
   done < "$_f"
+  # STATUS is sized from what is DISPLAYED: a trapped row shows the short
+  # cause instead of its own text, so its text must not widen the column.
+  _ws=$(awk -F"$FS1" 'NR==FNR { t[$1]=1; next }
+                      { s = ($1 in t) ? "" : $7; if (length(s)>m) m=length(s) }
+                      END { print (m<6?6:m) }' "$TMPD/traps" "$_f")
+  [ "$_wtrap" -gt "$_ws" ] && _ws=$_wtrap
 
   # header
   if [ "$QUIET" != 1 ]; then
@@ -1245,9 +1255,11 @@ render_table() {
     printf '%-*s ' "$_wl" "$_l"
     printf '%s%-6s%s ' "$_c" "$_st" "$C_OFF"
     printf '%-*s ' "$_wt" "$_tr"
+    _tsu=
     if [ "$_gut" = 1 ]; then
-      if grep -qxF "$_l" "$TMPD/traps" 2>/dev/null
-      then printf '%s!!%s ' "$C_BAD" "$C_OFF"
+      _tsu=$(awk -F"$FS1" -v l="$_l" '$1 == l { print $2; exit }' "$TMPD/traps")
+      if [ -n "$_tsu" ]
+      then printf '%s!!%s ' "$C_BAD" "$C_OFF"; _su=$_tsu
       else printf '   '; fi
     fi
     # A failure or a broken program is the most actionable cell on the
@@ -1259,6 +1271,7 @@ render_table() {
         _sc=$C_BAD ;;
       FAIL*) _sc=$C_BAD ;;
     esac
+    [ -n "$_tsu" ] && _sc=$C_BAD
     if [ -n "$_sc" ]; then
       _spad=$(( _ws - ${#_su} )); [ "$_spad" -lt 0 ] && _spad=0
       printf '%s%s%s%*s ' "$_sc" "$_su" "$C_OFF" "$_spad" ''
@@ -1336,7 +1349,10 @@ render_record() {
   printf '  %-10s %s\n' 'domain:'  "$_d"
   printf '  %-10s %s\n' 'state:'   "$(state_render "$_st")  $(state_meaning "$_st")"
   printf '  %-10s %s\n' 'trigger:' "$_tr"
-  printf '  %-10s %s\n' 'status:'  "$_su"
+  if [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ]
+  then printf '  %-10s %s%s%s\n' 'status:' "$C_BAD" "$(trap_status "$_su")" "$C_OFF"
+  else printf '  %-10s %s\n' 'status:'  "$_su"
+  fi
   _rl=
   for _lp in "$_ef" "$_of"; do
     [ -n "$_lp" ] || continue
@@ -1565,6 +1581,18 @@ log_paren() {
 # non-zero when there is no trap.
 #   $1 domain  $2 program  $3 status  $4 stderr path
 SESSION_ERRORS='communicate with a helper application|Connection to window server failed|establish the default connection to the WindowServer|not permitted to communicate with WindowServer'
+
+# What STATUS says once a trap is known. One place, so the table and the
+# record cannot word it differently. The TABLE says only the cause: the exit
+# code is a symptom of it, and a 76-column status cell stretches every other
+# row to no purpose. The RECORD keeps the evidence, where width is free.
+TRAP_STATUS='CANNOT WORK - no GUI session'
+trap_status() {
+  case "$1" in
+    FAIL*) printf '%s - no GUI session' "$1" ;;
+    *)     printf '%s' "$TRAP_STATUS" ;;
+  esac
+}
 
 session_trap() {
   [ "$1" = system ] || return 1
@@ -4256,13 +4284,38 @@ t_sessiontrap() {
   case "$_o" in *'TRIGGER STATUS'*) t_ok 'and STATUS keeps its place in the header' ;;
     *) t_no 'header unchanged' 'TRIGGER STATUS' "$_o" ;; esac
   _o=$(render_table "$_trap")
-  case "$_o" in *'!! FAIL 255'*) t_ok 'a trapped row is marked !! in front of its status' ;;
-    *) t_no 'row marked' '!! FAIL 255' "$_o" ;; esac
+  case "$_o" in *"!! $TRAP_STATUS"*) t_ok 'a trapped row is marked !! and says why' ;;
+    *) t_no 'row marked' "!! $TRAP_STATUS" "$_o" ;; esac
+  case "$_o" in *'FAIL 255'*) t_no 'symptom replaced by cause' 'no FAIL 255 in the table' "$_o" ;;
+    *) t_ok 'and the exit code no longer stretches the column for every row' ;; esac
   case "$_o" in *'TRIGGER    STATUS'*) t_ok 'and the header opens a gutter to keep STATUS aligned' ;;
     *) t_no 'header gutter' 'TRIGGER    STATUS' "$_o" ;; esac
   case "$_o" in *'manual     ok'*) t_ok 'so an unflagged row lines up with the flagged one' ;;
     *) t_no 'unflagged row padded' 'manual     ok' "$_o" ;; esac
+
+  # STATUS has to say it too: the mark alone does not tell you WHY, and
+  # 'waiting' on a service that can never run is simply false.
+  t_eq 'the record keeps the exit code and adds the cause' \
+    'FAIL 255 - no GUI session' "$(trap_status 'FAIL 255')"
+  t_eq 'a trap that has not run yet has no exit code to keep' \
+    'CANNOT WORK - no GUI session' "$(trap_status waiting)"
+  case "$_o" in *'!! CANNOT WORK - no GUI session'*) t_ok 'the table row says the cause, not the symptom' ;;
+    *) t_no 'status text' '!! CANNOT WORK - no GUI session' "$_o" ;; esac
+
+  _row notyet.service system /tmp/w.plist - on watch 'waiting' - - /usr/bin/automator '' '' '' '' >> "$_trap"
+  _o=$(render_table "$_trap")
+  case "$_o" in *waiting*) t_no 'waiting replaced' "no 'waiting' on a trapped row" "$_o" ;;
+    *) t_ok "and a trap that never ran does not claim to be 'waiting'" ;; esac
   SCOPE=$SCOPE_SAVE
+
+  # and the record says it in both places it matters
+  _one="$_sd/one.db"
+  _row eu.no-panic.trapped system '' - on watch 'FAIL 255 as me' - - /usr/bin/automator me '' '' '' > "$_one"
+  _o=$(render_record "$_one" 2>&1)
+  case "$_o" in *'status:'*'FAIL 255 as me - no GUI session'*) t_ok 'the record status line carries the cause' ;;
+    *) t_no 'record status' 'FAIL 255 as me - no GUI session' "$_o" ;; esac
+  case "$_o" in *'needs a GUI login session'*) t_ok 'and the program block says it can never work here' ;;
+    *) t_no 'record program note' 'needs a GUI login session' "$_o" ;; esac
 }
 
 t_undelete() {
