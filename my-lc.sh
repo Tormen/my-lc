@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="fb3720a"
+SCRIPT_COMMIT="d435630"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1505,7 +1505,8 @@ runlog_reduce() {
     }
     BEGIN { offs = offset_seconds(off) }
     {
-      sub(/\r$/, "")   # a pty ends its lines CR LF
+      sub(/\r$/, "")            # a pty ends its lines CR LF
+      sub(/^[\004\010]+/, "")   # ...and echoes ^D backspaces onto the first
       if (NF < 6) next
       # NOT by field number: an error line reads "[system/<label> [74500]:]"
       # and pads its type column with two spaces, so both the subsystem and
@@ -1561,8 +1562,20 @@ cmd_runlog_collect() {
   # awk outlive it, keep the label busy, and the bootstrap that follows fails
   # with launchd's generic 'Input/output error' - which is how a restart left
   # this service stopped. Signalling the process group takes them all.
-  /usr/bin/log stream --level default --style compact --predicate "$(runlog_predicate)" \
-    | runlog_reduce &
+  # Through a PTY, because a pipe is block-buffered: 'log stream' fills 4KB
+  # before the reducer sees a byte, and launchd events are far too sparse for
+  # that to happen in any useful time - the daemon then runs, says nothing,
+  # and records nothing. 'script' is the only way to get a pty on macOS
+  # (there is no stdbuf); it needs stdin, hence </dev/null, and it costs a
+  # stray ^D on the first line and a CR on every line, both of which the
+  # reducer drops.
+  if [ -x /usr/bin/script ]; then
+    /usr/bin/script -q /dev/null /usr/bin/log stream --level default --style compact \
+      --predicate "$(runlog_predicate)" < /dev/null | runlog_reduce &
+  else
+    /usr/bin/log stream --level default --style compact --predicate "$(runlog_predicate)" \
+      | runlog_reduce &
+  fi
   _cpid=$!
   # Signal the process GROUP, since the pipeline's children are grandchildren
   # of this shell and 'kill $_cpid' would leave them running. Only when this
