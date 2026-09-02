@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="c0f9a59"
+SCRIPT_COMMIT="aa1d4b9"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1606,15 +1606,22 @@ runlog_status() {
     printf '\n'
   done
   [ "$_any" = 1 ] || printf '    > no records yet - nothing has started or stopped since it came up\n'
-  # A promoted my-lc does not reach a daemon that is already running: the
-  # process keeps the code it started with. Its own stderr file is dated
-  # when launchd created it, which is when the process started.
-  _pmt=$(file_epoch "$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)")
-  _smt=$(file_epoch "/var/log/mine/root/$SCRIPT_NAME-runlog.err")
-  if [ -n "$_pmt" ] && [ -n "$_smt" ] && [ "$_pmt" -gt "$_smt" ] 2>/dev/null; then
-    printf '    > %sthe running instance started %s, before this my-lc was installed (%s)%s\n' \
-      "$C_WARN" "$(when "$_smt")" "$(when "$_pmt")" "$C_OFF"
-    printf '    > %s restart %s   picks up the new one\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+  # The recorder IS my-lc, so the two build ids must match. They do not when
+  # the deployed copy the plist names is a different file from the one being
+  # run - a stale copy in another directory, or a promote that has not
+  # happened - and that is invisible from the outside: the daemon runs, says
+  # nothing, and records with whatever code it was given.
+  _dprog=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
+  if [ -n "$_dprog" ] && [ -r "$_dprog" ]; then
+    _dbid=$(build_id_of "$_dprog")
+    _mbid=$(build_id)
+    if [ "$_dbid" != "$_mbid" ]; then
+      printf '    > %sthe recorder runs a DIFFERENT build of my-lc than this one%s\n' "$C_BAD" "$C_OFF"
+      printf '    > %s   build %s%s\n' "$_dprog" "$_dbid" \
+        "$( [ "$(file_epoch "$_dprog")" -lt "$(file_epoch "$0")" ] 2>/dev/null && printf ' (older)' )"
+      printf '    > %s   build %s   <- the one you just ran\n' "$0" "$_mbid"
+      printf '    > deploy to that path, then: %s restart %s\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+    fi
   fi
   _el="/var/log/mine/root/$SCRIPT_NAME-runlog.err"
   if [ -s "$_el" ]; then
@@ -3427,9 +3434,15 @@ script_version_string() {
   fi
 }
 
-build_id() {
-  _bi=$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)
-  [ -n "$_bi" ] || _bi=$(cksum < "$0" 2>/dev/null | cut -d" " -f1)
+build_id() { build_id_of "$0"; }
+
+# The same identity, for any file - so the build the recorder RUNS can be
+# compared with the build asking the question. Comparing mtimes was the first
+# attempt and it answered the wrong question: it said which file is newer,
+# when what matters is whether they are the same bytes at all.
+build_id_of() {
+  _bi=$(shasum -a 256 "$1" 2>/dev/null | cut -c1-12)
+  [ -n "$_bi" ] || _bi=$(cksum < "$1" 2>/dev/null | cut -d" " -f1)
   printf '%s' "${_bi:-unknown}"
 }
 
@@ -5199,6 +5212,16 @@ t_runlog() {
     "$(plutil -extract ProgramArguments.0 raw -o - "$_rl/p.plist" 2>/dev/null)"
   t_eq 'with the collect verb, so the daemon IS my-lc' '--runlog-collect' \
     "$(plutil -extract ProgramArguments.1 raw -o - "$_rl/p.plist" 2>/dev/null)"
+
+  # the recorder IS my-lc, so its build id must equal this one - and comparing
+  # mtimes (the first attempt) answered a different question: which file is
+  # newer, not whether they are the same bytes
+  t_eq 'a file identifies itself by content' "$(build_id)" "$(build_id_of "$0")"
+  cp "$0" "$_rl/other"; printf '\n# different\n' >> "$_rl/other"
+  case "$(build_id_of "$_rl/other")" in
+    "$(build_id)") t_no 'build ids differ' 'a different id' 'the same id' ;;
+    *) t_ok 'and a copy that differs by one line gets a different id' ;;
+  esac
 
   # an orphan is loaded, so it has a status like anything else - it was the
   # last row in the tool that printed a bare '-'
