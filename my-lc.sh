@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="3a8a241"
+SCRIPT_COMMIT="4f30bc3"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1500,6 +1500,7 @@ cmd_install() {
     printf '      - run %s --runlog-collect, restarted for as long as it is installed\n' "$_prog"
     printf '      - record launchd run events into %s\n' "$(runlog_file '<user>')"
     printf '      - so that a run time costs a file read instead of ~15s of log scanning\n'
+    printf '\n  afterwards, %s install reports what it has collected\n' "$SCRIPT_NAME"
     printf '\nadd --go to carry it out, or type go: '
     if [ -t 0 ]; then read -r _ans; else _ans=; fi
     [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
@@ -1515,7 +1516,13 @@ cmd_install() {
   msgn "starting $RUNLOG_LABEL ..."; [ "$VRB" = 1 ] && printf '\n'
   det 'bootstrap puts it into the system domain for this boot'
   if lc bootstrap system "$_rp"; then
-    if launchctl print "system/$RUNLOG_LABEL" >/dev/null 2>&1; then step_ok
+    if launchctl print "system/$RUNLOG_LABEL" >/dev/null 2>&1; then
+      step_ok
+      # A daemon that was just started tells you nothing about whether it is
+      # RECORDING. Say where to look, rather than leaving the user to guess
+      # that 'install' is also the status command.
+      msg "to see what it has collected:  $SCRIPT_NAME install"
+      msg "to see the daemon itself:      $SCRIPT_NAME $RUNLOG_LABEL"
     else step_fail 'launchctl reported success, but the service is not in the domain'; fi
   else
     step_fail "$(translate_lc_error)"
