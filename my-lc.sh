@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="807d892"
+SCRIPT_COMMIT="f4a269e"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -184,11 +184,14 @@ TRIGGER — why it would run, read from the plist
 STATUS — whatever is relevant for that kind of service
   run 4d2h pid 1869   running, with uptime
   FAIL 127 x3         last exit code, run count
-  ok 12x              exited cleanly
+  OK                  exited cleanly
   every 3600s / cal   a timer that has not run yet
   waiting             armed on a socket, path or XPC name
   not-started         nothing runs it until you 'start' it, or until the
                       next boot if its STATE is @on
+  stopped             the same, but it demonstrably ran since this boot -
+                      it wrote a log, or my-lc started it - so it was
+                      started and then stopped
   not-run-yet         started and idle - there is no run to report yet
   !! CANNOT-WORK      it needs a GUI login session, and the system domain
                       has none - so no status of its own is worth showing.
@@ -986,7 +989,7 @@ discover_scope() {
         if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); status="every " iv "s" extra }
         else if (trig ~ /cal/)   status = "cal" extra
         else if (trig ~ /sock|xpc|watch|queue/) status = "waiting" extra
-        else if (e == "0")       status = "ok" extra
+        else if (e == "0")       status = "OK" extra
         # loaded and armed on nothing launchd can name: it is waiting for a
         # person. '-' left the reader to work that out from two other columns
         else                     status = "not-run-yet" extra
@@ -1102,6 +1105,22 @@ discover_scope() {
       [ -z "$_last" ] && _last=$_lm
       [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
     done
+    # 'stopped' or merely 'not-started'? launchd keeps no trace of a job it
+    # has booted out - no runs, no exit code, not even that the label existed
+    # - so the difference is knowable only from evidence my-lc holds anyway:
+    # output written since boot, or a start of its own since boot. Absent
+    # both, say the neutral thing. This can only ever UNDER-claim: a service
+    # stopped without ever writing a log still reads not-started.
+    case "$_su" in
+      not-started*)
+        _ev=0
+        [ -n "$_last" ] && [ -n "$BOOT_EPOCH" ] && [ "$_last" -gt "$BOOT_EPOCH" ] 2>/dev/null && _ev=1
+        if [ "$_ev" = 0 ]; then
+          _mk=$(file_epoch "$(mark_file "$_lab")")
+          [ -n "$_mk" ] && [ -n "$BOOT_EPOCH" ] && [ "$_mk" -gt "$BOOT_EPOCH" ] 2>/dev/null && _ev=1
+        fi
+        [ "$_ev" = 1 ] && _su="stopped${_su#not-started}" ;;
+    esac
     # No log to date it by? A boot-triggered failure happened at boot.
     _since=$_last; _sincewhat=dead
     if [ -z "$_since" ] && [ -n "$BOOT_EPOCH" ]; then
@@ -3417,6 +3436,12 @@ t_matrix() {
 
   t_run "$_lab" enable >/dev/null 2>&1
   t_eq 'off  + enable        -> @on' '@on' "$(t_state "$_lab")"
+  # never started in this boot, and nothing has written a log: the neutral
+  # word is the only true one
+  case "$(t_run "$_lab" list)" in
+    *not-started*) t_ok '@on  status         -> not-started, with no evidence either way' ;;
+    *) t_no 'untouched @on status' 'not-started' "$(t_run "$_lab" list)" ;;
+  esac
 
   t_run "$_lab" disable >/dev/null 2>&1
   t_eq '@on  + disable       -> off' 'off' "$(t_state "$_lab")"
@@ -3444,10 +3469,12 @@ t_matrix() {
 
   # STATUS must say what the state MEANS, not print a dash and leave the
   # reader to infer it from the STATE and TRIGGER columns.
+  # ...but once my-lc has started it in this boot, 'not-started' would be a
+  # worse answer than the one the evidence supports
   t_run "$_lab" stop >/dev/null 2>&1
   case "$(t_run "$_lab" list)" in
-    *'not-started'*) t_ok '@on  status         -> says it is not started, not "-"' ;;
-    *) t_no '@on status' 'not-started' "$(t_run "$_lab" list)" ;;
+    *stopped*) t_ok 'on   + stop           -> stopped, because it demonstrably ran' ;;
+    *) t_no 'stopped after a stop' 'stopped' "$(t_run "$_lab" list)" ;;
   esac
   t_run "$_lab" start >/dev/null 2>&1
 
