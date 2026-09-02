@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.2"
-SCRIPT_COMMIT="49943dc"
+SCRIPT_COMMIT="bb64713"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -300,6 +300,7 @@ exit_meaning() {
     129) _em='killed: HUP'  ;; 130) _em='killed: INT'  ;; 131) _em='killed: QUIT' ;;
     134) _em='killed: ABRT' ;; 137) _em='killed: KILL' ;; 139) _em='killed: SEGV' ;;
     141) _em='killed: PIPE' ;; 143) _em='killed: TERM' ;;
+    255) _em='out of range'           ; _el='the program exited -1, or with a code that did not fit in a byte - the reason is in its own stderr, not in the number' ;;
     *)   _em= ;;
   esac
   [ -n "${_el:-}" ] && [ "$2" != short ] && { printf '%s' "$_el"; _el=; return 0; }
