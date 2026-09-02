@@ -3383,6 +3383,20 @@ stamp_version() {
 
   _new=$(git -C "$_here" rev-parse --short HEAD 2>/dev/null) \
     || die 'the repository has no commits yet - commit first'
+
+  # A stamp ends in 'git commit --amend'. Amending a commit that is already
+  # on the remote REWRITES PUBLISHED HISTORY: the next push is rejected as
+  # non-fast-forward, and the only ways out are a force-push or a reset.
+  # The idempotency check below cannot catch it, because the stamped sha
+  # necessarily lags HEAD by one and so never equals it - so stamping twice
+  # walks the commit forward for ever, each step rewriting what was pushed.
+  if git -C "$_here" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1 \
+     && git -C "$_here" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+    printf '%s: HEAD (%s) is already on the remote.\n' "$SCRIPT_NAME" "$_new" >&2
+    printf '    > stamping amends it, which would rewrite published history\n' >&2
+    printf '    > commit your change first, then stamp that commit\n' >&2
+    die 'nothing to stamp: this commit is already released'
+  fi
   _cur=$(awk -F\" '/^SCRIPT_COMMIT=/ { print $2; exit }' "$_self")
   if [ "$_new" = "$_cur" ]; then
     printf 'SCRIPT_COMMIT already matches HEAD (%s); nothing to do\n' "$_new"
