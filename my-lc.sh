@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.6"
-SCRIPT_COMMIT="ee9f22f"
+SCRIPT_COMMIT="5b6932b"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1770,8 +1770,12 @@ cmd_install() {
           printf '\n'
           # the tested path, including the bootstrap retry: launchd needs a
           # moment to release a label after a bootout
-          DOMAIN=system
-          _label=$RUNLOG_LABEL; _plist=$_rp; _state=on; _trig=boot+keep; _ef=; _of=
+          # every variable v_restart reads about the service, not just the
+          # ones that were obvious: it stops FIRST, so a missing one is not a
+          # refusal, it is a service left stopped
+          DOMAIN=system; _dm=system
+          _label=$RUNLOG_LABEL; _plist=$_rp; _state=on; _trig=boot+keep
+          _pr=$_had; _us=; _ef=; _of=
           v_restart
         else
           msg "left running; $SCRIPT_NAME restart $RUNLOG_LABEL picks up the new one"
@@ -2383,6 +2387,15 @@ session_trap() {
   printf 'evidence'
 }
 
+# The program a plist names, launchd's way round: Program if there is one,
+# else the first argument. Used when a caller knows the plist but not the
+# program - refusing there would strand a service that has just been stopped.
+program_of_plist() {
+  _pp2=$(plutil -extract Program raw -o - "$1" 2>/dev/null)
+  [ -n "$_pp2" ] || _pp2=$(plutil -extract ProgramArguments.0 raw -o - "$1" 2>/dev/null)
+  printf '%s' "$_pp2"
+}
+
 # Report how the running service differs from its plist, if at all.
 show_loaded_diff() {
   _dl=$1; _dd=$2; _dp=$3
@@ -2819,6 +2832,10 @@ v_start() {
               return 0 ;;
   esac
   [ -n "$_plist" ] || { msg "$_label has no plist on disk; nothing to start"; EXITCODE=1; return 0; }
+  # A caller that knows the plist but forgot the program is a caller bug, and
+  # refusing here would strand a service that 'restart' has already stopped.
+  # The plist is the authority anyway.
+  [ -n "$_pr" ] || _pr=$(program_of_plist "$_plist")
   # launchctl bootstrap only REGISTERS the job - it returns 0 without ever
   # touching the program, so a missing binary is not discovered until
   # launchd execs it. Reporting 'done' for that is a false success, and
@@ -5436,6 +5453,21 @@ t_runlog() {
   t_eq 'a run still going is yellow'          "$C_WARN" "$(status_colour 'RUNNING SINCE:x')"
   t_eq 'and a mere state is left plain'       ''        "$(status_colour 'NOT-RUN')"
   C_ON=$C_SAVE; C_OFF=$C_OFF_SAVE
+
+  # A caller that knows the plist but not the program must not be refused:
+  # 'restart' stops FIRST, so a refusal there leaves the service stopped -
+  # which is exactly what it did.
+  runlog_plist_content /usr/bin/true > "$_rl/args.plist"
+  t_eq 'the program is read from ProgramArguments when there is no Program' \
+    '/usr/bin/true' "$(program_of_plist "$_rl/args.plist")"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict><key>Label</key><string>x</string>\n'
+    printf '<key>Program</key><string>/bin/echo</string>\n'
+    printf '<key>ProgramArguments</key><array><string>argv0</string></array>\n'
+    printf '</dict></plist>\n'; } > "$_rl/both.plist"
+  t_eq 'and Program wins when both are set, as launchd does it' \
+    '/bin/echo' "$(program_of_plist "$_rl/both.plist")"
 
   # the plist my-lc writes for itself must be a plist launchd accepts
   runlog_plist_content /usr/bin/true > "$_rl/p.plist"
