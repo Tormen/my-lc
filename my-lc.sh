@@ -13,8 +13,8 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0.4"
-SCRIPT_COMMIT="36b5a68"
+SCRIPT_VERSION="v1.0.5"
+SCRIPT_COMMIT="1127b4a"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -24,6 +24,8 @@ DBG=0
 DEEPDBG=0
 DBG_LOG=
 GO=0
+PURGE=0
+WANT_RUNLOG=
 NOW=0
 UID_OVERRIDE=
 CONFIG_OVERRIDE=
@@ -58,6 +60,10 @@ ERR_TAIL=10
 BIG_DELTA=1048576
 BOOTSTRAP_TRIES=3
 RUN_WAIT=5
+RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
+RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
+RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
+RUNLOG_MAX_LINES=20000
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
@@ -97,6 +103,17 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
            labels are acted on together, since no service is two labels
            at once. A .plist path, a bare label and system/<label> are
            interchangeable.
+  my-lc's own installation (not a service verb):
+  install    install the run recorder: a LaunchDaemon, written by my-lc
+             itself, that streams launchd's own events and reduces them to
+             one line per run. launchd keeps no run times, and reading them
+             back from the system log costs ~15s per hour, so this is the
+             only way a run time can be free. Needs root: streaming is
+             admin-only, and one root daemon serves every domain.
+  uninstall  remove it. --purge also deletes everything my-lc ever wrote:
+             its state directories (INCLUDING plists 'delete' put aside),
+             its own logs, and the zsh completion it installs.
+
   VERB     status (default) | list | start | stop | restart | run | kill
            | enable | disable | edit | delete | truncate [err|out]
            | undelete            (recognised in any position)
@@ -435,6 +452,20 @@ BOOTSTRAP_TRIES=3
 # - and one still alive when the wait ends is reported as started with no
 # outcome yet.
 RUN_WAIT=5
+
+# The run recorder ('install'). launchd keeps no run times at all, and
+# 'log show' costs ~15s per hour of history, so a daemon streams launchd's
+# own events live and reduces them to one line per event. ONE root daemon
+# serves every domain: streaming needs root, and a user agent could not do
+# it - but pid 1's events name their domain, so it demultiplexes into each
+# user's own state directory, @USER@ being that user.
+RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
+RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
+RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
+
+# Records kept per file before the oldest are dropped. One line is ~50
+# bytes, so the default is about a megabyte per user.
+RUNLOG_MAX_LINES=20000
 
 # A log delta larger than this (bytes) is reported as a size rather than a
 # line count: counting lines means reading the whole thing, and a
@@ -1250,6 +1281,306 @@ select_records() {
   fi
 
   sort -f "$TMPD/sel" > "$_out"
+}
+
+# ======================================================================
+# the run recorder
+# ======================================================================
+
+runlog_plist() { printf '%s/%s.plist' "$RUNLOG_PLIST_DIR" "$RUNLOG_LABEL"; }
+
+# Where one user's records live. The daemon runs as root and writes into
+# every user's own directory rather than one shared file, so the per-user
+# layout - and its permissions - survive.
+runlog_file() { printf '%s' "$RUNLOG_STATE" | sed "s|@USER@|$1|"; printf '/runs.tsv'; }
+
+# Only the three transitions that answer "when did it run", plus launchd's
+# own complaints. Filtering at the source keeps the daemon's own cost near
+# zero: unfiltered, pid 1 emits ~11 events a second.
+runlog_predicate() {
+  printf '%s' 'processID == 1 AND (eventMessage BEGINSWITH "service state: spawning"'
+  printf '%s' ' OR eventMessage BEGINSWITH "service inactive"'
+  printf '%s' ' OR eventMessage BEGINSWITH "removing service"'
+  printf '%s' ' OR messageType == "Error")'
+}
+
+# One record per event: epoch, domain, label, event, detail. Kept apart from
+# the streaming so the suite can feed it fixture lines without root - and
+# without waiting for a service to do something.
+#
+# Two shapes have to be read, because launchd emits them differently:
+#   [system/eu.no-panic.getmail:] service state: spawning   <- label in the subsystem
+#   [system:] service inactive: eu.no-panic.getmail         <- label in the message
+# Reading only the first lost every END event, which is the one that dates a
+# run. And 'log --style compact' prints LOCAL time with NO offset, so the
+# offset is supplied and refreshed - converting it as UTC would shift every
+# record by the timezone, and a daemon that outlives a DST change would
+# shift them differently.
+runlog_reduce() {
+  awk -v tmpl="$RUNLOG_STATE" -v cap="$RUNLOG_MAX_LINES" -v off="${1:-$(date +%z)}" '
+    function days_from_civil(y, m, d,   era, yoe, doy, doe) {
+      if (m <= 2) y = y - 1
+      era = int((y >= 0 ? y : y - 399) / 400)
+      yoe = y - era * 400
+      doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+      doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+      return era * 146097 + doe - 719468
+    }
+    function offset_seconds(o,   sign) {
+      sign = (substr(o, 1, 1) == "-") ? -1 : 1
+      o = substr(o, 2)
+      return sign * ((substr(o, 1, 2) + 0) * 3600 + (substr(o, 3, 2) + 0) * 60)
+    }
+    function epoch_of(date, tm,   a, b) {
+      split(date, a, "-")
+      split(tm, b, ":")
+      return days_from_civil(a[1] + 0, a[2] + 0, a[3] + 0) * 86400 \
+             + (b[1] + 0) * 3600 + (b[2] + 0) * 60 + int(b[3]) - offs
+    }
+    function user_of(dom, uid,   cmd) {
+      if (dom == "system") return "root"
+      if (uid == "") return ""
+      if (uid in unames) return unames[uid]
+      cmd = "id -un " uid " 2>/dev/null"
+      cmd | getline unames[uid]
+      close(cmd)
+      return unames[uid]
+    }
+    function emit(f, line,   tmp) {
+      print line >> f
+      fflush(f)
+      if (++n[f] % 500 != 0) return
+      # a DST change during the daemon lifetime would otherwise skew every
+      # later record by an hour
+      cmd = "date +%z"; cmd | getline off; close(cmd); offs = offset_seconds(off)
+      tmp = f ".compact"
+      if (system("tail -n " cap " " f " > " tmp " 2>/dev/null && mv " tmp " " f) != 0)
+        system("rm -f " tmp)
+    }
+    BEGIN { offs = offset_seconds(off) }
+    {
+      if (NF < 6) next
+      # NOT by field number: an error line reads "[system/<label> [74500]:]"
+      # and pads its type column with two spaces, so both the subsystem and
+      # the message land in the wrong fields. Every subsystem block ends
+      # ":]", which is a delimiter neither shape can break.
+      if (match($0, /\[(system|gui)[\/:]/) == 0) next
+      rest = substr($0, RSTART + 1)
+      e = index(rest, ":]")
+      if (e == 0) next
+      sf = substr(rest, 1, e - 1)
+      sub(/ \[[0-9]+\]$/, "", sf)
+      msg = substr(rest, e + 2)
+      sub(/^[[:space:]]+/, "", msg)
+      nparts = split(sf, u, "/")
+      dom = u[1]
+      if (dom != "system" && dom != "gui") next
+      uid = (dom == "gui") ? u[2] : ""
+      lab = ""
+      if (dom == "system" && nparts >= 2) lab = u[2]
+      if (dom == "gui"    && nparts >= 3) lab = u[3]
+      if      (msg ~ /^service state: spawning/) ev = "START"
+      else if (msg ~ /^service inactive/)        ev = "END"
+      else if (msg ~ /^removing service/)        ev = "GONE"
+      else if ($3 == "E")                        ev = "ERR"
+      else                                       next
+      # the shape that carries the label in the message rather than the
+      # subsystem: "service inactive: <label>"
+      if (lab == "" && (p = index(msg, ": ")) > 0) lab = substr(msg, p + 2)
+      sub(/[[:space:]]+$/, "", lab)
+      if (lab == "" || lab ~ /[[:space:]]/) next
+      who = user_of(dom, uid)
+      if (who == "") next
+      f = tmpl "/runs.tsv"
+      gsub(/@USER@/, who, f)
+      if (!(f in ready)) {
+        d = f; sub(/\/[^\/]*$/, "", d)
+        system("mkdir -p " d " 2>/dev/null; touch " f " 2>/dev/null; chown " who " " f " 2>/dev/null")
+        ready[f] = 1
+      }
+      detail = (ev == "ERR") ? msg : "-"
+      gsub(/\t/, " ", detail)
+      emit(f, epoch_of($1, $2) "\t" dom "\t" lab "\t" ev "\t" detail)
+    }
+  '
+}
+
+# The daemon body. It never exits on its own: KeepAlive restarts it if the
+# stream dies, which is the only way this ends.
+cmd_runlog_collect() {
+  [ "$(id -u)" = 0 ] || die "the run recorder needs root: streaming the system log is admin-only"
+  /usr/bin/log stream --level default --style compact --predicate "$(runlog_predicate)" \
+    | runlog_reduce
+}
+
+runlog_plist_content() {
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+  printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+  printf '<plist version="1.0">\n<dict>\n'
+  printf '  <key>Label</key>\n  <string>%s</string>\n' "$RUNLOG_LABEL"
+  printf '  <key>ProgramArguments</key>\n  <array>\n'
+  printf '    <string>%s</string>\n' "$1"
+  printf '    <string>--runlog-collect</string>\n'
+  printf '  </array>\n'
+  printf '  <key>RunAtLoad</key>\n  <true/>\n'
+  printf '  <key>KeepAlive</key>\n  <true/>\n'
+  printf '  <key>StandardErrorPath</key>\n  <string>/var/log/mine/root/%s.err</string>\n' "$SCRIPT_NAME-runlog"
+  printf '  <key>StandardOutPath</key>\n  <string>/var/log/mine/root/%s.out</string>\n' "$SCRIPT_NAME-runlog"
+  printf '</dict>\n</plist>\n'
+}
+
+# The path this copy was invoked as. The plist has to name a program, and
+# that is the one thing my-lc legitimately knows about itself - it is NOT
+# a search for its own source, which stays forbidden.
+runlog_program() {
+  case "$0" in
+    /*) printf '%s' "$0" ;;
+    *)  printf '%s/%s' "$(cd "$(dirname "$0")" 2>/dev/null && pwd)" "$(basename "$0")" ;;
+  esac
+}
+
+cmd_install() {
+  _rp=$(runlog_plist)
+  _prog=$(runlog_program)
+  if [ -f "$_rp" ]; then
+    _had=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
+    if [ "$_had" = "$_prog" ]; then
+      msg "the run recorder is already installed ($RUNLOG_LABEL)"
+    else
+      msg "the run recorder is installed, but names a different program"
+      printf '    > installed: %s\n' "$_had" >&2
+      printf '    > this copy: %s\n' "$_prog" >&2
+      printf "    > '%s uninstall' then install again to point it here\\n" "$SCRIPT_NAME" >&2
+      EXITCODE=1; return 0
+    fi
+  fi
+  if [ "$(id -u)" != 0 ]; then
+    msg "installing the run recorder needs root - it writes a LaunchDaemon"
+    printf '    > streaming launchd events is admin-only, so ONE root daemon\n' >&2
+    printf '    > serves every domain; a per-user agent cannot do it at all\n' >&2
+    printf '    > rerun as root: %s install\n' "$SCRIPT_NAME" >&2
+    EXITCODE=1; return 0
+  fi
+  if [ "$GO" != 1 ]; then
+    printf 'this would install the run recorder:\n\n'
+    printf '  %s%s%s\n' "$C_HDR" "$RUNLOG_LABEL" "$C_OFF"
+    printf '      - write %s\n' "$_rp"
+    printf '      - run %s --runlog-collect, restarted for as long as it is installed\n' "$_prog"
+    printf '      - record launchd run events into %s\n' "$(runlog_file '<user>')"
+    printf '      - so that a run time costs a file read instead of ~15s of log scanning\n'
+    printf '\nadd --go to carry it out, or type go: '
+    if [ -t 0 ]; then read -r _ans; else _ans=; fi
+    [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
+    printf '\n'
+  fi
+  [ -f "$_rp" ] || {
+    msgn "writing $_rp ..."; [ "$VRB" = 1 ] && printf '\n'
+    _tmp="$TMPD/runlog.plist"
+    runlog_plist_content "$_prog" > "$_tmp"
+    if run mv "$_tmp" "$_rp" && chmod 644 "$_rp" && chown root:wheel "$_rp"; then step_ok
+    else step_fail 'could not write the plist'; return 0; fi
+  }
+  msgn "starting $RUNLOG_LABEL ..."; [ "$VRB" = 1 ] && printf '\n'
+  det 'bootstrap puts it into the system domain for this boot'
+  if lc bootstrap system "$_rp"; then
+    if launchctl print "system/$RUNLOG_LABEL" >/dev/null 2>&1; then step_ok
+    else step_fail 'launchctl reported success, but the service is not in the domain'; fi
+  else
+    step_fail "$(translate_lc_error)"
+  fi
+}
+
+cmd_uninstall() {
+  _rp=$(runlog_plist)
+  if [ ! -f "$_rp" ] && ! launchctl print "system/$RUNLOG_LABEL" >/dev/null 2>&1; then
+    msg "the run recorder is not installed"
+    return 0
+  fi
+  if [ "$(id -u)" != 0 ]; then
+    msg "removing the run recorder needs root"
+    printf '    > rerun as root: %s uninstall\n' "$SCRIPT_NAME" >&2
+    EXITCODE=1; return 0
+  fi
+  if [ "$GO" != 1 ]; then
+    printf 'this would remove the run recorder:\n\n'
+    printf '  %s%s%s\n' "$C_HDR" "$RUNLOG_LABEL" "$C_OFF"
+    printf '      - stop it\n'
+    printf '      - delete %s\n' "$_rp"
+    if [ "$PURGE" = 1 ]; then
+      purge_traces plan
+    else
+      printf '      - keep everything it wrote (--purge deletes that too)\n'
+    fi
+    printf '\nadd --go to carry it out, or type go: '
+    if [ -t 0 ]; then read -r _ans; else _ans=; fi
+    [ "$_ans" = go ] || { printf 'nothing done\n'; return 0; }
+    printf '\n'
+  fi
+  msgn "stopping $RUNLOG_LABEL ..."; [ "$VRB" = 1 ] && printf '\n'
+  if lc bootout "system/$RUNLOG_LABEL"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  if [ -f "$_rp" ]; then
+    msgn "deleting $_rp ..."; [ "$VRB" = 1 ] && printf '\n'
+    if run rm -f "$_rp"; then step_ok; else step_fail 'could not remove the plist'; fi
+  fi
+  if [ "$PURGE" = 1 ]; then
+    purge_traces apply
+  else
+    msg "the collected records are kept; --purge would have deleted them"
+  fi
+}
+
+# Everything my-lc has ever written, per user it wrote it for. $1 = 'plan'
+# to list it, 'apply' to remove it. The state directory is NOT only the run
+# records: it also holds the plists 'delete' put aside, and removing those
+# is the one irreversible thing here - so they are counted, by name, in the
+# plan rather than swept up silently.
+purge_traces() {
+  _mode=$1
+  _root=$(printf '%s' "$RUNLOG_STATE" | sed 's|/@USER@.*||')
+  for _dir in "$_root"/*; do
+    [ -d "$_dir" ] || continue
+    _u=${_dir##*/}
+    _sd=$(printf '%s' "$RUNLOG_STATE" | sed "s|@USER@|$_u|")
+    [ -d "$_sd" ] || continue
+    # counted with a glob, not 'ls | grep -c': that prints 0 AND exits 1 on
+    # no match, so the usual '|| echo 0' fallback doubles the output
+    _nd=0
+    for _dp in "$_sd"/deleted/*.plist.*; do
+      [ -f "$_dp" ] && _nd=$((_nd + 1))
+    done
+    if [ "$_mode" = plan ]; then
+      printf '      - delete %s\n' "$_sd"
+      [ "$_nd" -gt 0 ] 2>/dev/null && printf '        %s%s%s\n' "$C_BAD" \
+        "including $_nd plist(s) put aside by 'delete' - undelete could no longer restore them" "$C_OFF"
+    else
+      run rm -rf "$_sd"
+    fi
+    _cmp=$(purge_completion_path "$_u")
+    if [ -n "$_cmp" ] && [ -f "$_cmp" ]; then
+      if [ "$_mode" = plan ]; then printf '      - delete %s\n' "$_cmp"
+      else run rm -f "$_cmp"; fi
+    fi
+  done
+  for _lf in "/var/log/mine/root/$SCRIPT_NAME-runlog.err" "/var/log/mine/root/$SCRIPT_NAME-runlog.out"; do
+    [ -f "$_lf" ] || continue
+    if [ "$_mode" = plan ]; then printf '      - delete %s\n' "$_lf"
+    else run rm -f "$_lf"; fi
+  done
+  if [ "$_mode" = plan ]; then
+    printf '      %s\n' "the 'fpath=(...)' line in each ~/.zshrc is left alone - it is yours,"
+    printf '      %s\n' "and harmless once the completion file is gone"
+  else
+    step_ok
+  fi
+}
+
+# Where a given user's completion file would be. my-lc installs it under
+# the user's own HOME, so purging another user's copy means naming their
+# home directory rather than reading ours.
+purge_completion_path() {
+  _h=$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //')
+  [ -n "$_h" ] && [ -d "$_h" ] || return 0
+  printf '%s/.zsh/completions/_%s' "$_h" "$SCRIPT_NAME"
 }
 
 # ======================================================================
@@ -2687,6 +3018,12 @@ parse_args() {
       --daemons)     SCOPE=daemons ;;
       --now)         NOW=1 ;;
       --go)          GO=1 ;;
+      --purge)       PURGE=1 ;;
+      # my-lc's own installation, not a verb applied to services: these act
+      # on the run recorder my-lc installs and owns.
+      install)       WANT_RUNLOG=install ;;
+      uninstall)     WANT_RUNLOG=uninstall ;;
+      --runlog-collect) WANT_RUNLOG=collect ;;
       -Q|--quiet)    QUIET=1 ;;
       -V|--verbose)  VRB=1 ;;
       -D|--debug)    DBG=1
@@ -3112,6 +3449,18 @@ main() {
 
   if [ "$TESTS" = 1 ]; then run_tests; exit "$EXITCODE"; fi
 
+  # The run recorder is my-lc's own installation - it needs no service
+  # table, and the collector must not touch anything the daemon would then
+  # keep re-touching for the life of the machine.
+  if [ -n "$WANT_RUNLOG" ]; then
+    case "$WANT_RUNLOG" in
+      collect)   cmd_runlog_collect ;;
+      install)   install_zsh_completions; cmd_install ;;
+      uninstall) cmd_uninstall ;;
+    esac
+    exit "$EXITCODE"
+  fi
+
   install_zsh_completions
 
   resolve_domain
@@ -3268,6 +3617,7 @@ run_tests() {
   t_logsizes
   t_sessiontrap
   t_filters
+  t_runlog
   t_plistchecks
   t_restartrace
   t_chain
@@ -4463,6 +4813,69 @@ t_filters() {
   t_eq 'an exact label plus a substring still narrows' \
     '' "$(_sel 'eu.no-panic.other cron')"
   APPLE_MODE=$APPLE_SAVE; FILTER_STATE=$FILTER_STATE_SAVE; DB=$DB_SAVE
+}
+
+t_runlog() {
+  t_sec 'Z. the run recorder'
+  _rl="$TMPD/runlog"; mkdir -p "$_rl"
+  RUNLOG_STATE_SAVE=$RUNLOG_STATE; RUNLOG_STATE="$_rl/@USER@/my-lc"
+  _me=$(id -un)
+
+  # launchd emits the same fact in two shapes; reading only the first lost
+  # every END event, which is the one that dates a run
+  { printf '2026-09-02 07:37:22.517109 Df launchd[1:96846f8] [system/eu.no-panic.t1:] service state: spawning\n'
+    printf '2026-09-02 07:37:25.100000 Df launchd[1:96846f8] [system:] service inactive: eu.no-panic.t1\n'
+    printf "2026-09-02 02:12:05.202 E  launchd[1:971dc5c] [system/eu.no-panic.t2 [74500]:] Missing executable detected. Job: 'eu.no-panic.t2'\n"
+    printf '2026-09-02 03:57:16.023 Df launchd[1:976852b] [system:] removing service: eu.no-panic.t2\n'
+    printf '2026-09-02 07:40:00.000 Df launchd[1:1234] [gui/%s/eu.no-panic.t3:] service state: spawning\n' "$(id -u)"
+    printf '2026-09-02 07:40:01.000 Df launchd[1:1234] [system:] some unrelated chatter\n'
+  } | runlog_reduce '+0200'
+  _rf="$_rl/root/my-lc/runs.tsv"
+  _uf="$_rl/$_me/my-lc/runs.tsv"
+
+  t_eq 'the label in the SUBSYSTEM is read'        'START' "$(awk -F"$FS1" '$3=="eu.no-panic.t1" && $4=="START" { print $4 }' "$_rf")"
+  t_eq 'and the label in the MESSAGE is read too'  'END'   "$(awk -F"$FS1" '$3=="eu.no-panic.t1" && $4=="END" { print $4 }' "$_rf")"
+  t_eq "launchd's own complaint is kept, message only" \
+    "Missing executable detected. Job: 'eu.no-panic.t2'" \
+    "$(awk -F"$FS1" '$4=="ERR" { print $5 }' "$_rf")"
+  t_eq 'a bootout is recorded as GONE'             'GONE'  "$(awk -F"$FS1" '$4=="GONE" { print $4 }' "$_rf")"
+  t_eq 'chatter that names no service is dropped'  '4'     "$(awk 'END { print NR }' "$_rf")"
+
+  # the timestamp is LOCAL with no offset in this format: converting it as
+  # UTC would shift every record by the timezone
+  _want=$(date -j -f '%Y-%m-%d %H:%M:%S %z' '2026-09-02 07:37:22 +0200' +%s 2>/dev/null)
+  t_eq 'the local timestamp is converted with its offset, exactly' \
+    "$_want" "$(awk -F"$FS1" '$4=="START" { print $1; exit }' "$_rf")"
+
+  # one root daemon serves every domain, so a gui event must land in THAT
+  # user's own state directory, not in root's
+  t_eq "a gui event goes to the user's own file" 'eu.no-panic.t3' \
+    "$(awk -F"$FS1" '{ print $3 }' "$_uf" 2>/dev/null)"
+  t_eq 'and never into the root file' '' \
+    "$(awk -F"$FS1" '$3=="eu.no-panic.t3" { print $3 }' "$_rf")"
+  RUNLOG_STATE=$RUNLOG_STATE_SAVE
+
+  # the plist my-lc writes for itself must be a plist launchd accepts
+  runlog_plist_content /usr/bin/true > "$_rl/p.plist"
+  if plutil -lint "$_rl/p.plist" >/dev/null 2>&1; then t_ok 'the generated plist is valid'
+  else t_no 'generated plist' 'a valid plist' "$(plutil -lint "$_rl/p.plist" 2>&1)"; fi
+  t_eq 'it carries the configured label' "$RUNLOG_LABEL" \
+    "$(plutil -extract Label raw -o - "$_rl/p.plist" 2>/dev/null)"
+  t_eq 'and names the program it was told to' '/usr/bin/true' \
+    "$(plutil -extract ProgramArguments.0 raw -o - "$_rl/p.plist" 2>/dev/null)"
+  t_eq 'with the collect verb, so the daemon IS my-lc' '--runlog-collect' \
+    "$(plutil -extract ProgramArguments.1 raw -o - "$_rl/p.plist" 2>/dev/null)"
+
+  # and it must refuse politely rather than half-installing
+  if [ "$(id -u)" = 0 ]; then
+    t_skip 'install refuses without root' 'running as root'
+  else
+    _o=$(MY_LC_CONFIG="$T_CONF" "$0" install 2>&1)
+    case "$_o" in *'needs root'*) t_ok 'install without root says so, and why' ;;
+      *) t_no 'install without root' 'needs root' "$_o" ;; esac
+    case "$_o" in *'admin-only'*) t_ok 'and explains that one root daemon serves every domain' ;;
+      *) t_no 'install explains' 'admin-only' "$_o" ;; esac
+  fi
 }
 
 t_undelete() {
