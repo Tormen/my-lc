@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.2"
-SCRIPT_COMMIT="2847483"
+SCRIPT_COMMIT="49943dc"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -57,6 +57,7 @@ STATE_DIR=
 ERR_TAIL=10
 BIG_DELTA=1048576
 BOOTSTRAP_TRIES=3
+RUN_WAIT=5
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
@@ -413,6 +414,14 @@ ERR_TAIL=10
 # instance down straight after a bootout, and reports 'Input/output error'
 # until it is done; one retry a second apart clears it.
 BOOTSTRAP_TRIES=3
+
+# How long (seconds) 'run' waits for launchd to record what the run DID.
+# kickstart returns as soon as the program is spawned, so without this wait
+# there is nothing to report but 'the request was accepted'. A program that
+# is still alive after half that time is reported as running, not waited out
+# - and one still alive when the wait ends is reported as started with no
+# outcome yet.
+RUN_WAIT=5
 
 # A log delta larger than this (bytes) is reported as a size rather than a
 # line count: counting lines means reading the whole thing, and a
@@ -1910,15 +1919,72 @@ v_restart() {
   v_start
 }
 
+# 'kickstart' returns once launchd has SPAWNED the program: its exit code
+# says the request was accepted, NOT that the run worked. Wait for launchd
+# to record an outcome - the run counter moves and a last exit code appears
+# - so that 'done' can keep meaning 'it worked'. Prints one of:
+#   'running <pid>' | 'exit <code>' | 'gone' | 'unknown'
+await_run() {
+  _ar_before=${1:-0}
+  _ar_left=$((RUN_WAIT * 5))
+  # A program that fails instantly is still alive for the first sample or
+  # two, so a pid alone proves nothing yet. Only a process that OUTLIVES
+  # the grace period is reported as running rather than waited out.
+  _ar_grace=$((_ar_left / 2)); [ "$_ar_grace" -ge 1 ] || _ar_grace=1
+  _ar_seen=0
+  while :; do
+    LIVE_PRINT_KEY=; live_print "$DOMAIN" "$_label"
+    if [ ! -s "$TMPD/print.live" ]; then printf 'gone'; return 0; fi
+    _ar_pid=$(awk '/^\tpid = /             { print $3; exit }' "$TMPD/print.live")
+    _ar_runs=$(awk '/^\truns = /           { print $3; exit }' "$TMPD/print.live")
+    if [ -n "$_ar_pid" ] && [ "$_ar_pid" != 0 ]; then
+      _ar_seen=$((_ar_seen + 1))
+      if [ "$_ar_seen" -ge "$_ar_grace" ]; then printf 'running %s' "$_ar_pid"; return 0; fi
+    elif [ -n "$_ar_runs" ] && [ "$_ar_runs" -gt "$_ar_before" ] 2>/dev/null; then
+      # launchd bumps 'runs' when it SPAWNS, so the exit code is only this
+      # run's once the process is gone - which is why this is an elif.
+      printf 'exit %s' "$(awk '/^\tlast exit code = / { print $5; exit }' "$TMPD/print.live")"
+      return 0
+    fi
+    _ar_left=$((_ar_left - 1))
+    if [ "$_ar_left" -le 0 ]; then printf 'unknown'; return 0; fi
+    sleep 0.2
+  done
+}
+
 v_run() {
   case "$_state" in
     off|@off) msg "$_label is disabled; 'enable' it first"; EXITCODE=1; return 0 ;;
     @on)      msg "$_label is not started; 'start' it first"; EXITCODE=1; return 0 ;;
   esac
   write_mark "$_label" "$_ef" "$_of" exact
+  _rb=$(live_runs "$DOMAIN" "$_label"); _rb=${_rb:-0}
   msgn "running $_label ..."; [ "$VRB" = 1 ] && printf '\n'
   det "kickstart -k runs the program now, restarting it if it is already up"
-  if lc kickstart -k "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  if ! lc kickstart -k "$DOMAIN/$_label"; then step_fail "$(translate_lc_error)"; return 0; fi
+  det "waiting up to ${RUN_WAIT}s for launchd to record how the run ended"
+  _out=$(await_run "$_rb")
+  case "$_out" in
+    running\ *)
+      [ "$QUIET" = 1 ] || { [ "$VRB" = 1 ] && printf '  ' || printf ' '
+                            printf 'started, still running as pid %s\n' "${_out#running }"; } ;;
+    'exit 0') step_ok ;;
+    exit\ *)
+      _rc2=${_out#exit }
+      _rm=$(exit_meaning "$_rc2" long)
+      step_fail "the program ran and exited $_rc2${_rm:+ = $_rm}"
+      # The exit code is the headline; the program's own stderr is the
+      # story, and it is one 'status' away - name the file rather than
+      # leaving the user to find it.
+      _lerr=$(sed -n 's/^	stderr path = //p' "$TMPD/print.live")
+      _lerr=${_lerr:-$_ef}
+      [ -n "$_lerr" ] && printf '    > its stderr: %s\n' "$_lerr" >&2 ;;
+    gone) step_fail 'launchd accepted the request and then dropped the service' ;;
+    *)
+      [ "$QUIET" = 1 ] || { [ "$VRB" = 1 ] && printf '  ' || printf ' '
+                            printf 'started; still no outcome after %ss - check with: %s %s\n' \
+                              "$RUN_WAIT" "$SCRIPT_NAME" "$_label"; } ;;
+  esac
 }
 
 v_kill() {
@@ -4022,6 +4088,45 @@ t_failures() {
   case "$_o" in *'launchctl exited'*) t_no 'stale output suppressed' 'no evidence block' "$_o" ;;
     *) t_ok 'a success prints no stale failure text' ;; esac
   DOMAIN=$DOMAIN_SAVE; TMPD=$TMPD_SAVE
+
+  # 'kickstart' returns 0 as soon as the program is SPAWNED, so a run that
+  # fails instantly used to be reported as 'done'. The verb has to report
+  # what the run DID.
+  _mkr() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$1"
+      printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>%s</string></array>\n' "$2"
+      printf '  <key>StandardErrorPath</key><string>%s/%s.err</string>\n' "$_fd" "$1"
+      printf '</dict></plist>\n'; } > "$_fd/$1.plist"
+  }
+  _l3="$SELFTEST_PREFIX-runfail"; t_guard "$_l3"
+  _mkr "$_l3" 'echo it broke >&2; exit 7'
+  MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l3" enable --now >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l3" run 2>&1); _rc=$?
+  case "$_o" in *'exited 7'*) t_ok 'run reports the exit code the program ended with' ;;
+    *) t_no 'run reports the outcome' 'exited 7' "$_o" ;; esac
+  case "$_o" in *' done'*) t_no 'no false done from run' 'no "done"' "$_o" ;;
+    *) t_ok 'a run that failed is not reported as done' ;; esac
+  t_eq 'and run exits non-zero when the program did' 1 "$_rc"
+  case "$_o" in *"$_fd/$_l3.err"*) t_ok 'and it names the stderr that holds the reason' ;;
+    *) t_no 'stderr named' "$_fd/$_l3.err" "$_o" ;; esac
+
+  _l4="$SELFTEST_PREFIX-runok"; t_guard "$_l4"
+  _mkr "$_l4" 'exit 0'
+  MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l4" enable --now >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l4" run 2>&1); _rc=$?
+  case "$_o" in *' done'*) t_ok 'a run that succeeded still says done' ;;
+    *) t_no 'successful run' 'done' "$_o" ;; esac
+  t_eq 'and it exits zero' 0 "$_rc"
+
+  _l5="$SELFTEST_PREFIX-runlong"; t_guard "$_l5"
+  _mkr "$_l5" 'sleep 300'
+  MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l5" enable --now >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$_fd/conf" "$0" $_sf "$_l5" run 2>&1)
+  case "$_o" in *'still running as pid '*) t_ok 'a program still alive is reported as running, not finished' ;;
+    *) t_no 'long run' 'still running as pid N' "$_o" ;; esac
   cleanup_fixtures
 }
 
