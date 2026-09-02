@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="de4b4b7"
+SCRIPT_COMMIT="2b182b1"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1059,8 +1059,16 @@ discover_scope() {
            fi
          fi ;;
     esac
-    [ "$_ei" = '?PENDING' ] && _ei=$(log_indicator "$_ef")
-    [ "$_oi" = '?PENDING' ] && _oi=$(log_indicator "$_of")
+    _say=; case "$_su" in FAIL*) _say=say ;; esac
+    [ "$VRB" = 1 ] && _say=say
+    [ "$_ei" = '?PENDING' ] && _ei=$(log_indicator "$_ef" "$_say")
+    [ "$_oi" = '?PENDING' ] && _oi=$(log_indicator "$_of" "$_say")
+    # A plist with no path at all never reaches log_indicator: the join
+    # settles it. Say it here, without a fork for every quiet row.
+    if [ "$_say" = say ]; then
+      [ "$_ei" = '-' ] && _ei='no path set'
+      [ "$_oi" = '-' ] && _oi='no path set'
+    fi
     # When both streams point at ONE file the count is not stderr alone, and
     # saying so matters: it is the difference between "90 lines of errors"
     # and "90 lines of ordinary logging that happen to include stderr".
@@ -1117,9 +1125,14 @@ discover_scope() {
 }
 
 # "12L 3h" for a non-empty log, "-" for missing/empty.
+# $2 = 'say': spell out what '-' is hiding. '-' conflates three different
+# facts - no path in the plist, a path with no file yet, and a file that is
+# there and empty - and on a FAILED service the difference is the whole
+# question of whether you can see why. Spelling it out on every healthy row
+# would bury the one that matters, so the caller decides.
 log_indicator() {
-  [ -n "$1" ] || { printf -- '-'; return; }
-  [ -e "$1" ] || { printf -- '-'; return; }
+  [ -n "$1" ] || { [ "$2" = say ] && printf 'no path set' || printf -- '-'; return; }
+  [ -e "$1" ] || { [ "$2" = say ] && printf 'no file yet'  || printf -- '-'; return; }
   # A log destination is not always a regular file: several Apple daemons
   # point StandardOutPath at /dev/console. Reading one of those BLOCKS
   # forever, so a device, fifo or socket is reported as what it is and
@@ -1127,7 +1140,7 @@ log_indicator() {
   [ -f "$1" ] || { printf 'dev'; return; }
   [ -r "$1" ] || { printf '?'; return; }
   _sz=$(wc -c < "$1" 2>/dev/null | tr -d ' ')
-  [ "${_sz:-0}" -gt 0 ] 2>/dev/null || { printf -- '-'; return; }
+  [ "${_sz:-0}" -gt 0 ] 2>/dev/null || { [ "$2" = say ] && printf 'empty' || printf -- '-'; return; }
   _ln=$(wc -l < "$1" 2>/dev/null | tr -d ' ')
   _mt=$(file_epoch "$1")
   # 'last' is not decoration: the file's mtime is when the most recent line
@@ -1306,13 +1319,12 @@ render_table() {
     # every non-empty one is coloured. The single exception is a log shared
     # with stdout: there is no way to tell an error from ordinary output in
     # it, so it is reported in words and left plain.
-    if [ "$_er" = '-' ]; then printf -- '-'
-    else
-      case "$_er" in
-        merged*) printf '%s' "$_er" ;;
-        *)       printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF" ;;
-      esac
-    fi
+    # Only an actual line count is worth alarming about. '-', an explanation
+    # of what is not there, and a log shared with stdout are all plain.
+    case "$_er" in
+      [0-9]*) printf '%s%s%s' "$C_BAD" "$_er" "$C_OFF" ;;
+      *)      printf '%s' "$_er" ;;
+    esac
     [ "$VRB" = 1 ] && printf ' %s' "$_ou"
     printf '\n'
     if [ "$VRB" = 1 ]; then
@@ -1522,6 +1534,13 @@ render_record() {
       printf '  %-10s %s%s\n' 'stdout:' "$_of" "$(log_paren "$_of" "$_ofd")"
     fi
   fi
+  # A service with no StandardErrorPath cannot tell anyone why it failed.
+  # That is worth a line of its own: the alternative is a record that simply
+  # says nothing about stderr, which reads as 'fine'.
+  [ -n "$_ef" ] || printf '  %-10s %s\n' 'stderr:' \
+    'none - no StandardErrorPath, so anything it writes is discarded'
+  [ -n "$_of" ] || [ "$VRB" != 1 ] || printf '  %-10s %s\n' 'stdout:' \
+    'none - no StandardOutPath, so anything it writes is discarded'
   show_log_delta "$_l" "$_ef" "$_of"
   if [ "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" = evidence ]; then
     printf '  %-10s %s%s%s\n' 'session:' "$C_BAD" \
@@ -1549,7 +1568,11 @@ live_print() {
 # the current LOAD: bootout discards them, so a restart resets the count to
 # zero and clears the failure that made you look.
 live_runs()      { live_print "$1" "$2"; awk '/^\truns = /           { print $3; exit }' "$TMPD/print.live"; }
-live_lastexit()  { live_print "$1" "$2"; awk '/^\tlast exit code = / { print $5; exit }' "$TMPD/print.live"; }
+# launchd annotates the code itself - 'last exit code = 78: EX_CONFIG' - and
+# my-lc renders the meaning its own way, so keep the number alone.
+live_lastexit()  { live_print "$1" "$2"
+                   awk '/^\tlast exit code = / { c=$5; sub(/:.*/, "", c); print c; exit }' \
+                       "$TMPD/print.live"; }
 
 defn_from_launchctl() {
   live_print "$1" "$2"
@@ -4295,6 +4318,18 @@ t_sessiontrap() {
   t_eq 'and never in the agent domain' \
     '' "$(session_trap gui /usr/bin/foo 'FAIL 255' "$_sd/gui.err")"
 
+  # '-' in ERR conflates three facts; on a FAILED service the difference is
+  # whether you can see why it failed at all.
+  t_eq 'a missing path is spelled out when it matters' \
+    'no path set' "$(log_indicator '' say)"
+  t_eq 'a path with no file yet is not the same thing' \
+    'no file yet' "$(log_indicator "$_sd/nope.err" say)"
+  : > "$_sd/blank.err"
+  t_eq 'and neither is a file that is there and empty' \
+    'empty' "$(log_indicator "$_sd/blank.err" say)"
+  t_eq 'a healthy row keeps the quiet dash' '-' "$(log_indicator '' '')"
+  t_eq 'and so does one whose log is merely empty' '-' "$(log_indicator "$_sd/blank.err" '')"
+
   # D: the gutter exists only when this listing has something to put in it
   _row() { printf '%s%s' "$1" "$FS1"; shift
            for _fld in "$@"; do printf '%s%s' "$_fld" "$FS1"; done; printf '\n'; }
@@ -4537,6 +4572,15 @@ t_timefmt() {
 
 t_exitcodes() {
   t_sec 'I. exit codes are explained, not just numbered'
+  # launchd writes 'last exit code = 78: EX_CONFIG'; my-lc renders the
+  # meaning itself, so the number must come out of that line alone.
+  LIVE_SAVE=$LIVE_PRINT_KEY
+  LIVE_PRINT_KEY='d/l'
+  printf '\truns = 1\n\tlast exit code = 78: EX_CONFIG\n' > "$TMPD/print.live"
+  t_eq "launchd's own annotation is not part of the code" '78' "$(live_lastexit d l)"
+  printf '\truns = 1\n\tlast exit code = 0\n' > "$TMPD/print.live"
+  t_eq 'a bare code still reads as itself' '0' "$(live_lastexit d l)"
+  LIVE_PRINT_KEY=$LIVE_SAVE
   t_eq 'sysexits 78 is a config error'    'config error'      "$(exit_meaning 78 short)"
   t_eq 'sysexits 71 is an OS error'       'OS error'          "$(exit_meaning 71 short)"
   t_eq '127 is a missing program'         'not found'         "$(exit_meaning 127 short)"
