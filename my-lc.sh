@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="e2c4efd"
+SCRIPT_COMMIT="b776988"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1584,19 +1584,36 @@ runlog_reduce() {
   '
 }
 
+# How far back the next read must reach: to the newest record already held,
+# plus an overlap so nothing falls between two reads. That one rule covers
+# every gap - the seconds before the recorder starts at boot, a crash, a
+# stop, a machine that was off - without any of them being a special case.
+# Capped, because the cost of a read is its window.
+runlog_window() {
+  _newest=0
+  _base=$(printf '%s' "$RUNLOG_STATE" | sed 's|/@USER@.*||')
+  for _d in "$_base"/*; do
+    [ -d "$_d" ] || continue
+    _f=$(runlog_file "${_d##*/}")
+    [ -f "$_f" ] && [ -r "$_f" ] || continue
+    _e=$(tail -n 1 "$_f" 2>/dev/null | cut -f1)
+    case "$_e" in ''|*[!0-9]*) continue ;; esac
+    [ "$_e" -gt "$_newest" ] 2>/dev/null && _newest=$_e
+  done
+  if [ "$_newest" = 0 ]; then printf '%s' "$RUNLOG_BACKFILL"; return 0; fi
+  _gap=$(( $(now_epoch) - _newest + 10 ))
+  [ "$_gap" -lt "$((RUNLOG_POLL + 10))" ] && _gap=$((RUNLOG_POLL + 10))
+  [ "$_gap" -gt "$RUNLOG_BACKFILL" ] && _gap=$RUNLOG_BACKFILL
+  printf '%s' "$_gap"
+}
+
 # The daemon body. It never returns on its own: KeepAlive restarts it if it
 # dies, which is the only way it ends.
 cmd_runlog_collect() {
   [ "$(id -u)" = 0 ] || die "the run recorder needs root: reading the system log is admin-only"
-  # The first read reaches back, because the recorder cannot be the first
-  # thing launchd starts and everything before it would otherwise be lost.
-  _win=$RUNLOG_BACKFILL
   while :; do
-    /usr/bin/log show --last "${_win}s" --style compact \
+    /usr/bin/log show --last "$(runlog_window)s" --style compact \
       --predicate "$(runlog_predicate)" 2>/dev/null | runlog_reduce
-    # each window overlaps the last, so nothing falls between two reads; the
-    # overlap is dropped by epoch in the reducer
-    _win=$((RUNLOG_POLL + 10))
     sleep "$RUNLOG_POLL"
   done
 }
@@ -4680,6 +4697,24 @@ t_logsizes() {
     'empty, last '*) t_ok 'an empty log says so, and still dates the run that emptied it' ;;
     *) t_no 'empty log note' 'empty, last <when>' "$(log_size_note "$_lg/empty")" ;;
   esac
+  # The window reaches back to the newest record held, so a gap of any origin
+  # - the seconds before the recorder starts at boot, a crash, a stop, a
+  # machine that was off - is read rather than lost. Capped, because a read
+  # costs its window.
+  _wd="$TMPD/window"; mkdir -p "$_wd/root/my-lc"
+  RUNLOG_STATE_SAVE4=$RUNLOG_STATE; RUNLOG_STATE="$_wd/@USER@/my-lc"
+  POLL_SAVE=$RUNLOG_POLL; BF_SAVE=$RUNLOG_BACKFILL
+  RUNLOG_POLL=60; RUNLOG_BACKFILL=900
+  _wf="$_wd/root/my-lc/runs.tsv"
+  t_eq 'with nothing recorded it reads the backfill window' 900 "$(runlog_window)"
+  printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 30 ))" > "$_wf"
+  t_eq 'a fresh record still reads a whole poll plus the overlap' 70 "$(runlog_window)"
+  printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 400 ))" > "$_wf"
+  t_eq 'a gap is covered to its far end' 410 "$(runlog_window)"
+  printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 99999 ))" > "$_wf"
+  t_eq 'and a very long gap is capped, not paid for' 900 "$(runlog_window)"
+  RUNLOG_POLL=$POLL_SAVE; RUNLOG_BACKFILL=$BF_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE4
+
   # Windows overlap on purpose, so the same event is read more than once and
   # must be written once. Without this the file grows by a whole window every
   # poll, and every 'last run' would be the newest COPY rather than the run.
