@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="03d8137"
+SCRIPT_COMMIT="59b9299"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -5560,6 +5560,10 @@ t_calendar() {
     printf '  <key>Label</key><string>%s</string>\n' "$_ilab"
     printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
     printf '  <key>StartInterval</key><integer>600</integer>\n'
+    # a COMPOUND trigger, as every real one is: boot+keep+every600s, not the
+    # bare 'every600s' that a single-key fixture would produce
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '  <key>KeepAlive</key><false/>\n'
     printf '</dict></plist>\n'; } > "$_cd2/$_ilab.plist"
   _iran=$(( $(now_epoch) - 60 ))
   printf '%s\t%s\t%s\t%s\t-\n' "$_iran" "$SCOPE" "$_ilab" END >> "$_rlf"
