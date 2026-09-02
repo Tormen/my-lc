@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="0480721"
+SCRIPT_COMMIT="e2c4efd"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -213,6 +213,9 @@ STATUS — whatever is relevant for that kind of service
   LAST-WROTE:         when its log was last written, which is NOT when it
                       last ran - a service can run hourly and stay silent
   NEXT:               computed from the plist, for calendar jobs only
+  NEXT~:              an ETA for an interval job: the last run plus its
+                      interval, so it needs a recorded run ('install').
+                      One in the past means overdue, not wrong
   FAIL 127 x3         last exit code, run count
   EVERY 3600s / CAL   a timer that has not run yet
   WAITING             armed on a socket, path or XPC name
@@ -1293,6 +1296,18 @@ discover_scope() {
         if [ -n "$_pl" ]; then
           _nx=$(next_calendar "$_pl")
           [ -n "$_nx" ] && _su="$_su NEXT:$(when "$_nx")"
+        fi ;;
+      # An interval job has an ETA rather than a schedule: launchd restarts it
+      # <interval> after the last run, so the answer is only as good as the
+      # last run - which is why this needs the recorder, and why it is '~'.
+      # An estimate in the PAST is not wrong, it is overdue, and worth seeing.
+      *every*)
+        if [ -n "$_lastrun" ]; then
+          _iv=${_tg#*every}; _iv=${_iv%%+*}; _iv=${_iv%s}
+          case "$_iv" in
+            ''|*[!0-9]*) ;;
+            *) _su="$_su NEXT~:$(when "$((_lastrun + _iv))")" ;;
+          esac
         fi ;;
     esac
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
@@ -5412,6 +5427,27 @@ t_calendar() {
     *) t_no 'recorder wins' "LAST:$_dues" "$_o" ;; esac
   case "$_o" in *DUE-WAS*) t_no 'agreement is silent' 'no DUE-WAS' "$_o" ;;
     *) t_ok 'and when it matches the schedule, the check says nothing' ;; esac
+
+  # an interval job has no schedule to compute from, only an ETA: the last
+  # run plus its interval, which is why it needs a recorded run at all
+  _ilab="$SELFTEST_PREFIX-every"
+  t_guard "$_ilab"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_ilab"
+    printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+    printf '  <key>StartInterval</key><integer>600</integer>\n'
+    printf '</dict></plist>\n'; } > "$_cd2/$_ilab.plist"
+  _iran=$(( $(now_epoch) - 60 ))
+  printf '%s\t%s\t%s\t%s\t-\n' "$_iran" "$SCOPE" "$_ilab" END >> "$_rlf"
+  MY_LC_CONFIG="$_cd2/conf" "$0" $_sf2 "$_ilab" enable --now >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$_cd2/conf" "$0" $_sf2 "$_ilab" list 2>&1)
+  _eta=$(date -r "$((_iran + 600))" '+%Y-%m-%d_%H%M')
+  case "$_o" in *"NEXT~:$_eta"*) t_ok 'an interval job gets an ETA: the last run plus its interval' ;;
+    *) t_no 'interval ETA' "NEXT~:$_eta" "$_o" ;; esac
+  case "$_o" in *NEXT:*) t_no 'ETA is marked as estimated' 'NEXT~:, never NEXT:' "$_o" ;;
+    *) t_ok 'and it is marked ~, because it is only as good as that last run' ;; esac
 
   # the same run, an hour late: the two disagree, and that is worth saying
   printf '%s\t%s\t%s\t%s\t-\n' "$((_due + 3600))" "$SCOPE" "$_clab" END > "$_rlf"
