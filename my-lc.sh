@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="ff04d2b"
+SCRIPT_COMMIT="5bd38a8"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3836,6 +3836,7 @@ run_tests() {
   t_sessiontrap
   t_filters
   t_runlog
+  t_calendar
   t_plistchecks
   t_restartrace
   t_chain
@@ -5126,6 +5127,51 @@ t_runlog() {
     case "$_o" in *'admin-only'*) t_ok 'and explains that one root daemon serves every domain' ;;
       *) t_no 'install explains' 'admin-only' "$_o" ;; esac
   fi
+}
+
+t_calendar() {
+  t_sec 'AA. NEXT: for a calendar job'
+  _cl="$TMPD/cal"; mkdir -p "$_cl"
+  _mkcal() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict><key>Label</key><string>cal</string>\n'
+      printf '%s\n' "$1"
+      printf '</dict></plist>\n'; } > "$_cl/c.plist"
+    next_calendar "$_cl/c.plist"
+  }
+  _now=$(now_epoch)
+
+  _e=$(_mkcal '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>20</integer></dict>')
+  t_eq 'a fixed time gives that time'      '0320' "$(date -r "${_e:-0}" '+%H%M' 2>/dev/null)"
+  if [ -n "$_e" ] && [ "$_e" -gt "$_now" ]; then t_ok 'and it is in the FUTURE, never the last one'
+  else t_no 'next is future' "> $_now" "$_e"; fi
+
+  # omitted keys are wildcards, exactly as launchd treats them: an Hour with
+  # no Minute means every minute of that hour, not the top of it
+  _e=$(_mkcal '<key>StartCalendarInterval</key><dict><key>Minute</key><integer>30</integer></dict>')
+  t_eq 'a minute alone repeats every hour' '30' "$(date -r "${_e:-0}" '+%M' 2>/dev/null)"
+  _e=$(_mkcal '<key>StartCalendarInterval</key><dict><key>Hour</key><integer>13</integer></dict>')
+  t_eq 'an hour alone is every minute of it, so the next is on the hour or later' \
+    '13' "$(date -r "${_e:-0}" '+%H' 2>/dev/null)"
+
+  # a weekday is 0..7 with both 0 and 7 meaning Sunday
+  _e=$(_mkcal '<key>StartCalendarInterval</key><dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>')
+  t_eq 'Weekday 0 means Sunday'            '7'  "$(date -r "${_e:-0}" '+%u' 2>/dev/null)"
+  _e=$(_mkcal '<key>StartCalendarInterval</key><dict><key>Day</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>')
+  t_eq 'a day of month lands on that day'  '01' "$(date -r "${_e:-0}" '+%d' 2>/dev/null)"
+
+  # several entries: the answer is the soonest of them
+  _e=$(_mkcal '<key>StartCalendarInterval</key><array><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>20</integer></dict><dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict></array>')
+  case "$(date -r "${_e:-0}" '+%H%M' 2>/dev/null)" in
+    0320|1545) t_ok 'an array of entries answers with one of them' ;;
+    *) t_no 'array entry' '0320 or 1545' "$(date -r "${_e:-0}" '+%H%M' 2>/dev/null)" ;;
+  esac
+  if [ -n "$_e" ] && [ "$_e" -gt "$_now" ]; then t_ok 'and with the SOONEST of them, not merely the first'
+  else t_no 'array soonest' "> $_now" "$_e"; fi
+
+  t_eq 'a plist with no calendar key answers nothing' '' \
+    "$(_mkcal '<key>RunAtLoad</key><true/>')"
 }
 
 t_undelete() {
