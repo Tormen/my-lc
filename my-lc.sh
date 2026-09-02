@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="5bd38a8"
+SCRIPT_COMMIT="21b9f19"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -60,6 +60,7 @@ ERR_TAIL=10
 BIG_DELTA=1048576
 BOOTSTRAP_TRIES=3
 RUN_WAIT=5
+CAL_SKEW=300
 RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
 RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
 RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
@@ -474,6 +475,13 @@ ERR_TAIL=10
 # instance down straight after a bootout, and reports 'Input/output error'
 # until it is done; one retry a second apart clears it.
 BOOTSTRAP_TRIES=3
+
+# How far a calendar job may run from its scheduled minute before my-lc says
+# so. Two INDEPENDENT sources answer "when did it last run" for such a job:
+# the recorder observed it, and the plist says when it was due. Comparing
+# them costs one subtraction and turns every calendar row into a standing
+# check on my-lc's own calendar arithmetic - and on the service's punctuality.
+CAL_SKEW=300
 
 # How long (seconds) 'run' waits for launchd to record what the run DID.
 # kickstart returns as soon as the program is spawned, so without this wait
@@ -1108,6 +1116,36 @@ discover_scope() {
         [ "$TIME_FORMAT" = absolute ] && _sn="$_sn [$(human_age $(( $(now_epoch) - _ep )) )]"
         _su=$(printf '%s' "$_su" | sed "s|$(printf '\003')$_ep|$_sn|") ;;
     esac
+    # The newest of its own logs, needed BEFORE the status is composed: it is
+    # evidence, and evidence outranks an inference that contradicts it.
+    _last=
+    for _lp in "$_ef" "$_of"; do
+      [ -n "$_lp" ] || continue
+      _lm=$(file_epoch "$_lp") || continue
+      [ -n "$_lm" ] || continue
+      [ -z "$_last" ] && _last=$_lm
+      [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
+    done
+    # When it last ran, decided once for every kind of row. The recorder
+    # OBSERVED it; failing that there may be something to reason from, and a
+    # reasoned answer is marked '~'. An inference the log DISPROVES is not
+    # printed at all: a service whose log was written long after boot plainly
+    # ran after boot, whatever its trigger says.
+    _lt=; _lts=
+    if [ -n "$_lastrun" ]; then
+      _lts=$(when "$_lastrun"); _lt="LAST:$_lts"
+    else
+      _inf=
+      case "$_tg" in
+        *cal*) [ -n "$_pl" ] && _inf=$(prev_calendar "$_pl") ;;
+      esac
+      if [ -z "$_inf" ]; then
+        case "$_tg" in *boot*) _inf=$BOOT_EPOCH ;; esac
+      fi
+      if [ -n "$_inf" ] && { [ -z "$_last" ] || [ "$_last" -le "$_inf" ] 2>/dev/null; }; then
+        _lts=$(when "$_inf"); _lt="LAST~:$_lts"
+      fi
+    fi
     # \001 carries the RAW exit code. It is printed next to the word derived
     # from it - OK beside [0], FAILED beside [1 general error] - so a wrong
     # derivation is visible in ordinary output instead of needing a test that
@@ -1119,19 +1157,9 @@ discover_scope() {
         _code=${_rest%% *}
         _tail=${_rest#"$_code"}
         _mn=$(exit_meaning "$_code" short)
-        _br="[$_code${_mn:+ $_mn}]"
-        # LAST: is a real run time and only the recorder has those. Without
-        # one there is still an inference worth making: a boot-triggered
-        # service that HAS run, and is not running now, ran when it was
-        # loaded - and that was at boot, which the kernel dates exactly.
-        # It is marked '~' because it is reasoned, not observed.
-        _lt=
-        if [ -n "$_lastrun" ]; then _lt="LAST:$(when "$_lastrun")"
-        else case "$_tg" in
-               *boot*) [ -n "$BOOT_EPOCH" ] && _lt="LAST~:$(when "$BOOT_EPOCH")" ;;
-             esac
-        fi
-        _su="$_word ${_lt}$_br$_tail" ;;
+        _su="$_word ${_lt}[$_code${_mn:+ $_mn}]$_tail" ;;
+      # a row with no exit code to bracket still deserves its run time
+      *) [ -n "$_lt" ] && _su="$_su $_lt" ;;
     esac
     # A broken program is WHY a stopped service is stopped, so for one that
     # is not running it is the fact worth showing. A running service proves
@@ -1185,17 +1213,6 @@ discover_scope() {
       _oi='same file'
     fi
 
-    # When did it last do anything? The newest of its log files is the only
-    # evidence launchd leaves behind. For a FAILED service that is the
-    # difference between "it broke" and "it has been broken since July".
-    _last=
-    for _lp in "$_ef" "$_of"; do
-      [ -n "$_lp" ] || continue
-      _lm=$(file_epoch "$_lp") || continue
-      [ -n "$_lm" ] || continue
-      [ -z "$_last" ] && _last=$_lm
-      [ "$_lm" -gt "$_last" ] 2>/dev/null && _last=$_lm
-    done
     # 'stopped' or merely 'not-started'? launchd keeps no trace of a job it
     # has booted out - no runs, no exit code, not even that the label existed
     # - so the difference is knowable only from evidence my-lc holds anyway:
@@ -1212,11 +1229,30 @@ discover_scope() {
         fi
         [ "$_ev" = 1 ] && _su="STOPPED${_su#NOT-STARTED}" ;;
     esac
+    # Cross-check, where both answers exist and were arrived at independently:
+    # the recorder OBSERVED when the run happened, the plist COMPUTES when it
+    # was due. Agreement is silent; a gap is real information - the schedule
+    # changed, the run was late, or something started it by hand - and it is a
+    # free regression test on the calendar arithmetic above.
+    case "$_tg" in
+      *cal*)
+        # only where a LAST: is actually on the row: a service that never
+        # started has nothing to be late for
+        if [ -n "$_lastrun" ] && [ -n "$_pl" ] && [ "$_lt" = "LAST:${_lts:-}" ]; then
+          _due=$(prev_calendar "$_pl")
+          if [ -n "$_due" ]; then
+            _skew=$((_lastrun - _due)); [ "$_skew" -lt 0 ] && _skew=$(( - _skew ))
+            [ "$_skew" -gt "$CAL_SKEW" ] && _su="$_su DUE-WAS:$(when "$_due")"
+          fi
+        fi ;;
+    esac
     # The log's mtime is when the service last WROTE, which is not when it
     # last RAN - a service that runs every minute and speaks once an hour
     # would otherwise be reported as an hour stale. Named for what it is.
-    if [ -n "$_last" ] && [ "$_last" != "$_lastrun" ]; then
-      _su="$_su LAST-WROTE:$(when "$_last")"
+    if [ -n "$_last" ]; then
+      _lw=$(when "$_last")
+      # the log written at the very minute the run is dated says nothing new
+      [ "$_lw" = "${_lts:-}" ] || _su="$_su LAST-WROTE:$_lw"
     fi
     # NEXT: exists for exactly one kind of service, and nothing else on the
     # screen can tell you - launchd exposes no next-fire time at all.
@@ -1548,6 +1584,16 @@ runlog_status() {
     printf '\n'
   done
   [ "$_any" = 1 ] || printf '    > no records yet - nothing has started or stopped since it came up\n'
+  # A promoted my-lc does not reach a daemon that is already running: the
+  # process keeps the code it started with. Its own stderr file is dated
+  # when launchd created it, which is when the process started.
+  _pmt=$(file_epoch "$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)")
+  _smt=$(file_epoch "/var/log/mine/root/$SCRIPT_NAME-runlog.err")
+  if [ -n "$_pmt" ] && [ -n "$_smt" ] && [ "$_pmt" -gt "$_smt" ] 2>/dev/null; then
+    printf '    > %sthe running instance started %s, before this my-lc was installed (%s)%s\n' \
+      "$C_WARN" "$(when "$_smt")" "$(when "$_pmt")" "$C_OFF"
+    printf '    > %s restart %s   picks up the new one\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+  fi
   _el="/var/log/mine/root/$SCRIPT_NAME-runlog.err"
   if [ -s "$_el" ]; then
     printf '    > %s%s: %s%s\n' "$C_BAD" "$_el" "$(log_size_note "$_el")" "$C_OFF"
@@ -1561,6 +1607,7 @@ cmd_install() {
     _had=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
     if [ "$_had" = "$_prog" ]; then
       runlog_status
+      return 0
     else
       msg "the run recorder is installed, but names a different program"
       printf '    > installed: %s\n' "$_had" >&2
@@ -2168,8 +2215,16 @@ show_loaded_diff() {
 # The result is an epoch computed with the CURRENT UTC offset, so an
 # occurrence on the far side of a DST change can be an hour out. Recomputing
 # per candidate would need a timezone database this cannot have.
-next_calendar() {
-  plutil -p "$1" 2>/dev/null | awk -v now="$(now_epoch)" -v offtxt="$(date +%z)" '
+next_calendar() { calendar_edge "$1" 1; }
+
+# The PREVIOUS occurrence is as computable as the next one, and it is the only
+# way a calendar job can date its last run before the recorder has seen one.
+# Reasoned, not observed - hence LAST~ - and the log mtime beside it is the
+# check: a schedule that says 03:17 next to a log written at 03:17 agrees.
+prev_calendar() { calendar_edge "$1" -1; }
+
+calendar_edge() {
+  plutil -p "$1" 2>/dev/null | awk -v now="$(now_epoch)" -v offtxt="$(date +%z)" -v dir="$2" '
     function offset_seconds(o,   sign) {
       sign = (substr(o, 1, 1) == "-") ? -1 : 1
       o = substr(o, 2)
@@ -2222,25 +2277,34 @@ next_calendar() {
       today = int(nowl / 86400)
       nowmin = int((nowl % 86400) / 60)
       best = ""
+      back = (dir < 0)
       for (e = 1; e <= n; e++) {
         if (!((e SUBSEP "Minute") in has) && !((e SUBSEP "Hour") in has) \
             && !((e SUBSEP "Day") in has) && !((e SUBSEP "Weekday") in has) \
             && !((e SUBSEP "Month") in has)) continue
-        for (dd = 0; dd <= 400; dd++) {
+        for (i = 0; i <= 400; i++) {
+          dd = back ? -i : i
           days = today + dd
           split(civil_from_days(days), c, "/")
           wd = (days + 4) % 7; if (wd < 0) wd += 7
           if (!want(e, "Month", c[2] + 0)) continue
           if (!want(e, "Day",   c[3] + 0)) continue
           if (((e SUBSEP "Weekday") in has) && (val[e, "Weekday"] % 7) != wd) continue
+          # forwards: the FIRST match after now. backwards: the LAST match
+          # before it, so the scan runs the other way too.
           got = 0
-          for (h = 0; h < 24 && !got; h++) {
+          for (hi = 0; hi < 24 && !got; hi++) {
+            h = back ? 23 - hi : hi
             if (!want(e, "Hour", h)) continue
-            for (mi = 0; mi < 60; mi++) {
+            for (mj = 0; mj < 60; mj++) {
+              mi = back ? 59 - mj : mj
               if (!want(e, "Minute", mi)) continue
-              if (dd == 0 && (h * 60 + mi) <= nowmin) continue
+              if (dd == 0) {
+                if (!back && (h * 60 + mi) <= nowmin) continue
+                if (back  && (h * 60 + mi) >= nowmin) continue
+              }
               cand = days * 86400 + h * 3600 + mi * 60 - offs
-              if (best == "" || cand < best) best = cand
+              if (best == "" || (back ? (cand > best) : (cand < best))) best = cand
               got = 1
               break
             }
@@ -3851,6 +3915,7 @@ run_tests() {
   t_filters
   t_runlog
   t_calendar
+  t_stamp
   t_plistchecks
   t_restartrace
   t_chain
@@ -5186,6 +5251,79 @@ t_calendar() {
 
   t_eq 'a plist with no calendar key answers nothing' '' \
     "$(_mkcal '<key>RunAtLoad</key><true/>')"
+
+  # End to end: the recorder OBSERVES when a run happened, the plist COMPUTES
+  # when it was due, and my-lc compares them. Agreement is silent; a gap is
+  # reported, which is a standing regression test on the arithmetic above.
+  _cd2="$_cl/live"; mkdir -p "$_cd2/st" "$_cd2/rl/$(id -un)/my-lc"
+  _clab="$SELFTEST_PREFIX-cal"
+  t_guard "$_clab"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_clab"
+    printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+    printf '  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>17</integer></dict>\n'
+    printf '</dict></plist>\n'; } > "$_cd2/$_clab.plist"
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nRUNLOG_STATE="%s/rl/@USER@/my-lc"\n' \
+    "$_cd2" "$_cd2" "$_cd2" "$_cd2" > "$_cd2/conf"
+  printf 'DEFAULT_FILTER_STATE=all\nCOLOR=never\nCAL_SKEW=300\n' >> "$_cd2/conf"
+  _sf2=; [ "$SCOPE" = agents ] && _sf2=--agents
+  _rlf="$_cd2/rl/$(id -un)/my-lc/runs.tsv"
+
+  # a run recorded AT the scheduled minute: the two agree, and nothing is said
+  _due=$(next_calendar "$_cd2/$_clab.plist")
+  _due=$((_due - 86400))
+  printf '%s\t%s\t%s\t%s\t-\n' "$_due" "$SCOPE" "$_clab" END > "$_rlf"
+  MY_LC_CONFIG="$_cd2/conf" "$0" $_sf2 "$_clab" enable --now >/dev/null 2>&1
+  _dues=$(date -r "$_due" '+%Y-%m-%d_%H%M')
+  _o=$(MY_LC_CONFIG="$_cd2/conf" "$0" $_sf2 "$_clab" list 2>&1)
+  case "$_o" in *"LAST:$_dues"*) t_ok 'a recorded run is reported as LAST:, not inferred' ;;
+    *) t_no 'recorder wins' "LAST:$_dues" "$_o" ;; esac
+  case "$_o" in *DUE-WAS*) t_no 'agreement is silent' 'no DUE-WAS' "$_o" ;;
+    *) t_ok 'and when it matches the schedule, the check says nothing' ;; esac
+
+  # the same run, an hour late: the two disagree, and that is worth saying
+  printf '%s\t%s\t%s\t%s\t-\n' "$((_due + 3600))" "$SCOPE" "$_clab" END > "$_rlf"
+  _o=$(MY_LC_CONFIG="$_cd2/conf" "$0" $_sf2 "$_clab" list 2>&1)
+  case "$_o" in *"DUE-WAS:$_dues"*) t_ok 'a run that missed its slot is reported against the schedule' ;;
+    *) t_no 'skew reported' "DUE-WAS:$_dues" "$_o" ;; esac
+  cleanup_fixtures
+}
+
+t_stamp() {
+  t_sec 'AB. --stamp-version never rewrites published history'
+  if ! command -v git >/dev/null 2>&1; then
+    t_skip 'the stamp guard' 'git is not on PATH'; return 0
+  fi
+  _g="$TMPD/stampfix"; mkdir -p "$_g"
+  git init -q --bare "$_g/remote" 2>/dev/null
+  git init -q "$_g/work" 2>/dev/null
+  _gw="git -C $_g/work -c user.email=t@example.invalid -c user.name=t -c commit.gpgsign=false"
+  cp "$0" "$_g/work/my-lc.sh"; chmod 755 "$_g/work/my-lc.sh"
+  $_gw add my-lc.sh >/dev/null 2>&1
+  $_gw commit -q -m first >/dev/null 2>&1
+  $_gw branch -M main >/dev/null 2>&1
+  $_gw remote add origin "$_g/remote" >/dev/null 2>&1
+  $_gw push -q -u origin main >/dev/null 2>&1
+
+  # HEAD is now on the remote: stamping would amend a released commit, and
+  # the next push would be rejected as non-fast-forward
+  _o=$(MY_LC_CONFIG="$T_CONF" "$_g/work/my-lc.sh" --stamp-version 2>&1); _rc=$?
+  case "$_o" in *'already released'*) t_ok 'stamping a pushed commit is refused' ;;
+    *) t_no 'stamp guard' 'nothing to stamp: this commit is already released' "$_o" ;; esac
+  case "$_o" in *'rewrite published history'*) t_ok 'and it says why, not just no' ;;
+    *) t_no 'stamp guard reason' 'rewrite published history' "$_o" ;; esac
+  t_eq 'and it exits non-zero' 1 "$_rc"
+  t_eq 'the commit is untouched' "$($_gw rev-parse HEAD)" "$($_gw rev-parse origin/main)"
+
+  # ...but an unpushed commit is exactly what a stamp is FOR
+  printf '\n# a change worth stamping\n' >> "$_g/work/my-lc.sh"
+  $_gw add my-lc.sh >/dev/null 2>&1
+  $_gw commit -q -m second >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$T_CONF" "$_g/work/my-lc.sh" --stamp-version 2>&1)
+  case "$_o" in *'stamped SCRIPT_COMMIT'*) t_ok 'an unpushed commit still stamps' ;;
+    *) t_no 'stamp works' 'stamped SCRIPT_COMMIT: ...' "$_o" ;; esac
 }
 
 t_undelete() {
