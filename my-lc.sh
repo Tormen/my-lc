@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="9abe317"
+SCRIPT_COMMIT="b28b21d"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -333,7 +333,7 @@ log_size_note() {
   if [ "$_lsz" -le "$BIG_DELTA" ] 2>/dev/null; then
     printf '%sL, %s%s' "$(wc -l < "$1" 2>/dev/null | tr -d ' ')" "$(human_size "$_lsz")" "$_lwhen"
   else
-    printf '%s, too big to count cheaply%s' "$(human_size "$_lsz")" "$_lwhen"
+    printf '%s, too big to count lines cheaply%s' "$(human_size "$_lsz")" "$_lwhen"
   fi
 }
 
@@ -3874,8 +3874,8 @@ t_logsizes() {
   # is reported by size alone
   _sv=$BIG_DELTA; BIG_DELTA=1   # the file is 6 bytes, so this makes it "large"
   case "$(log_size_note "$_lg/three")" in
-    *'too big to count cheaply'*) t_ok 'a large log is reported by size alone' ;;
-    *) t_no 'large log note' 'too big to count cheaply' "$(log_size_note "$_lg/three")" ;;
+    *'too big to count lines cheaply'*) t_ok 'a large log is reported by size alone' ;;
+    *) t_no 'large log note' 'too big to count lines cheaply' "$(log_size_note "$_lg/three")" ;;
   esac
   BIG_DELTA=$_sv
 }
