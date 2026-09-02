@@ -87,6 +87,14 @@ writes to and never mentions again.
 → my-lc's **ERR** column, and `my-lc <service> status` showing the log
 lines added since that service last started.
 
+**5. A daemon has no login session, and nothing says so.** A job in
+`/Library/LaunchDaemons` gets the uid its `UserName` asks for, but not that
+user's GUI session — so anything that talks to a per-user helper
+(`automator`, `open`, an app) fails there while the identical command works
+when you type it in Terminal. launchd's only comment is an exit code.
+→ my-lc marks the row **`!!`** and, in the record, names it: either from the
+plist alone, or from the service's own stderr.
+
 ### What my-lc does *not* claim
 
 launchctl's verb set is badly named, not badly designed. `bootout` really

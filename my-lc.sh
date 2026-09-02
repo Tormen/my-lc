@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.2"
-SCRIPT_COMMIT="bb64713"
+SCRIPT_COMMIT="b32ed5b"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -185,6 +185,9 @@ STATUS — whatever is relevant for that kind of service
   ok 12x              exited cleanly
   every 3600 / cal    a timer that has not run yet
   waiting             armed on a socket, path or XPC name
+  A leading !! means the service cannot work where it is: it needs a GUI
+  login session, and the system domain has none. 'status <label>' says
+  why. The fix is to move the plist to /Library/LaunchAgents.
   'as <user>' is appended only when it differs from the default for its
   scope (daemons run as root, agents as the session user). -V always shows
   it, and adds the OUT column, the plist path and the program.
@@ -1203,11 +1206,25 @@ render_table() {
   _ws=$(awk -F"$FS1" '{ if (length($7)>m) m=length($7) } END { print (m<6?6:m) }' "$_f")
   _dom=0; [ "$SCOPE" = both ] && _dom=1
 
+  # A service that cannot work where it is put deserves a mark, but a mark on
+  # some rows and not others leaves the STATUS text ragged - so the gutter
+  # exists only when THIS listing has something to put in it.
+  : > "$TMPD/traps"
+  _gut=0
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
+    [ -n "$_l" ] || continue
+    if [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ]; then
+      printf '%s\n' "$_l" >> "$TMPD/traps"; _gut=1
+    fi
+  done < "$_f"
+
   # header
   if [ "$QUIET" != 1 ]; then
     printf '%s' "$C_HDR"
     [ "$_dom" = 1 ] && printf '%-10s ' DOMAIN
-    printf '%-*s %-6s %-*s %-*s %s' "$_wl" LABEL STATE "$_wt" TRIGGER "$_ws" STATUS ERR
+    printf '%-*s %-6s %-*s ' "$_wl" LABEL STATE "$_wt" TRIGGER
+    [ "$_gut" = 1 ] && printf '   '
+    printf '%-*s %s' "$_ws" STATUS ERR
     [ "$VRB" = 1 ] && printf ' %s' OUT
     printf '%s\n' "$C_OFF"
   fi
@@ -1228,6 +1245,11 @@ render_table() {
     printf '%-*s ' "$_wl" "$_l"
     printf '%s%-6s%s ' "$_c" "$_st" "$C_OFF"
     printf '%-*s ' "$_wt" "$_tr"
+    if [ "$_gut" = 1 ]; then
+      if grep -qxF "$_l" "$TMPD/traps" 2>/dev/null
+      then printf '%s!!%s ' "$C_BAD" "$C_OFF"
+      else printf '   '; fi
+    fi
     # A failure or a broken program is the most actionable cell on the
     # screen; it should not render like an ordinary status. Padding is
     # computed from the uncoloured text, since escape bytes count in %-*s.
@@ -1399,6 +1421,10 @@ render_record() {
       'NOT A FILE')     printf '  %-10s %s%s%s\n' '' "$C_BAD" 'this path is a DIRECTORY, not a program' "$C_OFF" ;;
       '?'*)             printf '  %-10s %s\n' '' "$_pv - rerun as root to tell" ;;
     esac
+    if [ "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" = static ]; then
+      printf '  %-10s %s%s%s\n' '' "$C_BAD" 'needs a GUI login session, and the system domain has none:' "$C_OFF"
+      printf '  %-10s %s\n' '' 'move the plist to /Library/LaunchAgents'
+    fi
   fi
   if [ -n "$_us" ]; then printf '  %-10s %s\n' 'runs as:' "$_us"
   else
@@ -1457,6 +1483,11 @@ render_record() {
     fi
   fi
   show_log_delta "$_l" "$_ef" "$_of"
+  if [ "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" = evidence ]; then
+    printf '  %-10s %s%s%s\n' 'session:' "$C_BAD" \
+      'that stderr is a GUI-session failure, and the system domain has no' "$C_OFF"
+    printf '  %-10s %s\n' '' 'login session: move the plist to /Library/LaunchAgents'
+  fi
 }
 
 # launchd keeps the definition it was given at bootstrap time. Editing the
@@ -1523,6 +1554,30 @@ log_paren() {
   [ "$1" = "$2" ] || _lp1="as loaded${_lp1:+; $_lp1}"
   [ -n "$_lp1" ] && printf '   (%s)' "$_lp1"
   return 0
+}
+
+# The system domain has NO login session: a job there gets the uid its plist
+# asks for, but not that user's Mach bootstrap namespace. Anything that needs
+# a per-user GUI helper - Automator Runner, WindowServer, an app - therefore
+# cannot work as a daemon, however it is configured, while the identical
+# command typed in Terminal works. Two ways to know, one from the plist and
+# one from the service's own words. Prints 'static' or 'evidence'; returns
+# non-zero when there is no trap.
+#   $1 domain  $2 program  $3 status  $4 stderr path
+SESSION_ERRORS='communicate with a helper application|Connection to window server failed|establish the default connection to the WindowServer|not permitted to communicate with WindowServer'
+
+session_trap() {
+  [ "$1" = system ] || return 1
+  # These two are a GUI session with extra steps; nothing they are asked to
+  # do can succeed here. Deliberately NOT 'the program lives in an .app':
+  # that fires on working daemons like com.backblaze.bzserv.
+  case "$2" in /usr/bin/automator|/usr/bin/open) printf 'static'; return 0 ;; esac
+  case "$3" in FAIL*) ;; *) return 1 ;; esac
+  [ -n "$4" ] && [ -f "$4" ] && [ -r "$4" ] || return 1
+  # Only the tail: this runs per failed row, and a crash-looping daemon can
+  # leave a gigabyte behind.
+  tail -c 4096 "$4" 2>/dev/null | grep -qE "$SESSION_ERRORS" || return 1
+  printf 'evidence'
 }
 
 # Report how the running service differs from its plist, if at all.
@@ -3108,6 +3163,7 @@ run_tests() {
   t_verbose
   t_pstime
   t_logsizes
+  t_sessiontrap
   t_plistchecks
   t_restartrace
   t_chain
@@ -4129,6 +4185,61 @@ t_failures() {
   case "$_o" in *'still running as pid '*) t_ok 'a program still alive is reported as running, not finished' ;;
     *) t_no 'long run' 'still running as pid N' "$_o" ;; esac
   cleanup_fixtures
+}
+
+t_sessiontrap() {
+  t_sec 'X. the daemon/session trap'
+  _sd="$TMPD/sess"; mkdir -p "$_sd"
+
+  # B: known from the plist alone, before it has ever run
+  t_eq 'automator as a daemon is a trap on sight' \
+    'static' "$(session_trap system /usr/bin/automator waiting '')"
+  t_eq 'and so is open' \
+    'static' "$(session_trap system /usr/bin/open waiting '')"
+  t_eq 'the same program as an AGENT is fine - it has a session' \
+    '' "$(session_trap gui /usr/bin/automator waiting '')"
+  t_eq 'an ordinary daemon program is not a trap' \
+    '' "$(session_trap system /bin/sh 'FAIL 1' '')"
+
+  # the rejected heuristic: a bundled program is NOT evidence of anything
+  t_eq 'a program inside an .app bundle is not flagged' \
+    '' "$(session_trap system /Applications/Backblaze.app/Contents/MacOS/bzserv 'FAIL 1' '')"
+
+  # A: known from the service's own words
+  printf 'Couldn\342\200\231t communicate with a helper application.\n' > "$_sd/gui.err"
+  printf 'cannot open input file\n' > "$_sd/plain.err"
+  t_eq 'a session error in the stderr of a FAILED daemon is recognised' \
+    'evidence' "$(session_trap system /usr/bin/foo 'FAIL 255' "$_sd/gui.err")"
+  t_eq "and the curly apostrophe in Apple's message does not defeat it" \
+    'evidence' "$(session_trap system /usr/bin/foo 'FAIL 255' "$_sd/gui.err")"
+  t_eq 'an unrelated failure is left alone' \
+    '' "$(session_trap system /usr/bin/foo 'FAIL 1' "$_sd/plain.err")"
+  t_eq 'the same stderr on a service that has NOT failed says nothing' \
+    '' "$(session_trap system /usr/bin/foo waiting "$_sd/gui.err")"
+  t_eq 'and never in the agent domain' \
+    '' "$(session_trap gui /usr/bin/foo 'FAIL 255' "$_sd/gui.err")"
+
+  # D: the gutter exists only when this listing has something to put in it
+  _row() { printf '%s%s' "$1" "$FS1"; shift
+           for _fld in "$@"; do printf '%s%s' "$_fld" "$FS1"; done; printf '\n'; }
+  _clean="$_sd/clean.db"; _trap="$_sd/trap.db"
+  _row good.service system /tmp/g.plist - on manual 'ok' - - /bin/sh '' '' '' '' > "$_clean"
+  cp "$_clean" "$_trap"
+  _row bad.service system /tmp/b.plist - on watch 'FAIL 255' - - /usr/bin/automator '' '' '' '' >> "$_trap"
+  SCOPE_SAVE=$SCOPE; SCOPE=daemons
+  _o=$(render_table "$_clean")
+  case "$_o" in *'!!'*) t_no 'no gutter when nothing is flagged' 'no !!' "$_o" ;;
+    *) t_ok 'a listing with nothing to flag pays nothing for the gutter' ;; esac
+  case "$_o" in *'TRIGGER STATUS'*) t_ok 'and STATUS keeps its place in the header' ;;
+    *) t_no 'header unchanged' 'TRIGGER STATUS' "$_o" ;; esac
+  _o=$(render_table "$_trap")
+  case "$_o" in *'!! FAIL 255'*) t_ok 'a trapped row is marked !! in front of its status' ;;
+    *) t_no 'row marked' '!! FAIL 255' "$_o" ;; esac
+  case "$_o" in *'TRIGGER    STATUS'*) t_ok 'and the header opens a gutter to keep STATUS aligned' ;;
+    *) t_no 'header gutter' 'TRIGGER    STATUS' "$_o" ;; esac
+  case "$_o" in *'manual     ok'*) t_ok 'so an unflagged row lines up with the flagged one' ;;
+    *) t_no 'unflagged row padded' 'manual     ok' "$_o" ;; esac
+  SCOPE=$SCOPE_SAVE
 }
 
 t_undelete() {
