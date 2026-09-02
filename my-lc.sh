@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="4f30bc3"
+SCRIPT_COMMIT="0b3b6ef"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -301,7 +301,28 @@ setup_color() {
 # "after a reload". A circular-arrow glyph (U+21BB) was tried first, but
 # terminal fonts substitute it for an unrelated mark, which turned the one
 # column that had to be self-explanatory into noise.
-state_render() { printf '%s' "$1"; }
+# The record paints STATE and STATUS exactly as the table does. Colour comes
+# from setup_color, which honours COLOR=auto by testing [ -t 1 ] - so a piped
+# or redirected run is plain, and only that.
+state_render() {
+  case "$1" in
+    on)       printf '%s%s%s' "$C_ON"   "$1" "$C_OFF" ;;
+    @on|@off) printf '%s%s%s' "$C_WARN" "$1" "$C_OFF" ;;
+    off)      printf '%s%s%s' "$C_DIM"  "$1" "$C_OFF" ;;
+    orphan)   printf '%s%s%s' "$C_BAD"  "$1" "$C_OFF" ;;
+    *)        printf '%s' "$1" ;;
+  esac
+}
+
+# The one cell worth colouring, by the same rule as the table: a failure or a
+# broken program, never an ordinary status.
+status_colour() {
+  case "$1" in
+    *'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
+      printf '%s' "$C_BAD" ;;
+    FAIL*) printf '%s' "$C_BAD" ;;
+  esac
+}
 
 # What an exit code MEANS. A bare 'FAIL 78' makes the reader go and look it
 # up, which is the same failure as launchctl's numeric errors. 64-78 are the
@@ -1296,15 +1317,19 @@ runlog_plist() { printf '%s/%s.plist' "$RUNLOG_PLIST_DIR" "$RUNLOG_LABEL"; }
 # layout - and its permissions - survive.
 runlog_file() { printf '%s' "$RUNLOG_STATE" | sed "s|@USER@|$1|"; printf '/runs.tsv'; }
 
-# Only the three transitions that answer "when did it run", plus launchd's
-# own complaints. Filtering at the source keeps the daemon's own cost near
-# zero: unfiltered, pid 1 emits ~11 events a second.
-runlog_predicate() {
-  printf '%s' 'processID == 1 AND (eventMessage BEGINSWITH "service state: spawning"'
-  printf '%s' ' OR eventMessage BEGINSWITH "service inactive"'
-  printf '%s' ' OR eventMessage BEGINSWITH "removing service"'
-  printf '%s' ' OR messageType == "Error")'
-}
+# Deliberately COARSE. Filtering the three transitions at the source was the
+# obvious optimisation and it broke the daemon outright: 'log stream'
+# block-buffers into a pipe, and a predicate that selective emits a few dozen
+# bytes an hour, so the buffer never fills and awk sees nothing for hours.
+# The daemon looks perfectly healthy while recording nothing - running, stderr
+# empty, no records - which is exactly how it behaved.
+#
+# pid 1 alone emits ~11 events a second, so the buffer flushes every few
+# seconds, and the events my-lc does not want are dropped by the reducer -
+# which had to identify them precisely anyway. 'script' would give a pty and
+# line buffering, but it echoes a stray ^D into the stream and needs a tty
+# on stdin that a daemon does not have.
+runlog_predicate() { printf '%s' 'processID == 1'; }
 
 # One record per event: epoch, domain, label, event, detail. Kept apart from
 # the streaming so the suite can feed it fixture lines without root - and
@@ -1361,6 +1386,7 @@ runlog_reduce() {
     }
     BEGIN { offs = offset_seconds(off) }
     {
+      sub(/\r$/, "")   # a pty ends its lines CR LF
       if (NF < 6) next
       # NOT by field number: an error line reads "[system/<label> [74500]:]"
       # and pads its type column with two spaces, so both the subsystem and
@@ -1751,7 +1777,7 @@ show_last_run() {
   _xc=$(live_lastexit "$1" "$2")
   case "$_xc" in ''|'(never'*) _xc= ;; esac
   case "$3" in
-    run\ *) printf '  %-10s %s\n' 'last run:' \
+    RUN\ *) printf '  %-10s %s\n' 'last run:' \
               "#$_rn is the one running now${_xc:+, the one before it exited $_xc}" ;;
     *)     printf '  %-10s %s\n' 'last run:' \
               "#$_rn${_xc:+, exited $_xc}, counting from the last (re)load" ;;
@@ -1785,7 +1811,7 @@ render_record() {
   printf '  %-10s %s\n' 'trigger:' "$_tr"
   if [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ]
   then printf '  %-10s %s%s%s\n' 'status:' "$C_BAD" "$(trap_status "$_su")" "$C_OFF"
-  else printf '  %-10s %s\n' 'status:'  "$_su"
+  else printf '  %-10s %s%s%s\n' 'status:' "$(status_colour "$_su")" "$_su" "$C_OFF"
   fi
   _rl=
   for _lp in "$_ef" "$_of"; do
@@ -1806,7 +1832,7 @@ render_record() {
   fi
   if [ -n "$_rl" ]; then
     case "$_su" in
-      run\ *) printf '  %-10s %s\n' 'last log:' \
+      RUN\ *) printf '  %-10s %s\n' 'last log:' \
                 "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
       *)      printf '  %-10s %s\n' 'dead since:' \
                 "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
@@ -4893,6 +4919,23 @@ t_runlog() {
   t_eq 'and never into the root file' '' \
     "$(awk -F"$FS1" '$3=="eu.no-panic.t3" { print $3 }' "$_rf")"
   RUNLOG_STATE=$RUNLOG_STATE_SAVE
+
+  # The predicate must stay coarse: a selective one starves the pipe buffer
+  # and the daemon records nothing while looking perfectly healthy.
+  t_eq 'the stream predicate is coarse, and filtering happens in the reducer' \
+    'processID == 1' "$(runlog_predicate)"
+
+  # colour is decided by setup_color alone: COLOR=auto tests [ -t 1 ], so a
+  # piped run is plain and nothing else strips it
+  C_SAVE=$C_ON; C_OFF_SAVE=$C_OFF
+  C_ON=$(printf '\033[32m'); C_OFF=$(printf '\033[0m')
+  case "$(state_render on)" in
+    *"$C_ON"*) t_ok 'the record paints STATE like the table does' ;;
+    *) t_no 'state colour' 'a colour escape' "$(state_render on)" ;;
+  esac
+  t_eq 'and a failure is the one status worth colouring' "$C_BAD" "$(status_colour 'FAIL 1')"
+  t_eq 'an ordinary one is left alone'                   ''       "$(status_colour 'OK')"
+  C_ON=$C_SAVE; C_OFF=$C_OFF_SAVE
 
   # the plist my-lc writes for itself must be a plist launchd accepts
   runlog_plist_content /usr/bin/true > "$_rl/p.plist"
