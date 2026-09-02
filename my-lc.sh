@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="21b9f19"
+SCRIPT_COMMIT="fcd2224"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1158,7 +1158,10 @@ discover_scope() {
         _tail=${_rest#"$_code"}
         _mn=$(exit_meaning "$_code" short)
         _su="$_word ${_lt}[$_code${_mn:+ $_mn}]$_tail" ;;
-      # a row with no exit code to bracket still deserves its run time
+      # A running service needs no LAST: - SINCE: already dates the run that
+      # is happening, and an older one beside it reads as a contradiction.
+      RUNNING*) ;;
+      # any other row with no exit code to bracket still deserves its run time
       *) [ -n "$_lt" ] && _su="$_su $_lt" ;;
     esac
     # A broken program is WHY a stopped service is stopped, so for one that
