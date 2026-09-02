@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="2b182b1"
+SCRIPT_COMMIT="b4e8885"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -187,6 +187,9 @@ STATUS — whatever is relevant for that kind of service
   ok 12x              exited cleanly
   every 3600 / cal    a timer that has not run yet
   waiting             armed on a socket, path or XPC name
+  not loaded          not in the domain: nothing runs it until a reload
+                      ('start' now, or leave it for the next boot)
+  not run yet         loaded and idle - launchd has no run to report yet
   !! CANNOT WORK      it needs a GUI login session, and the system domain
                       has none - so no status of its own is worth showing.
                       'status <label>' gives the evidence; the fix is to
@@ -984,8 +987,14 @@ discover_scope() {
         else if (trig ~ /cal/)   status = "cal" extra
         else if (trig ~ /sock|xpc|watch|queue/) status = "waiting" extra
         else if (e == "0")       status = "ok" extra
-        else                     status = "-" extra
-      } else status = "-" extra
+        # loaded and armed on nothing launchd can name: it is waiting for a
+        # person. '-' left the reader to work that out from two other columns
+        else                     status = "not run yet" extra
+      }
+      # Not in the domain at all, so launchd has no pid, no exit code and no
+      # armed trigger to report. That is a fact worth stating: '-' reads as
+      # "unknown", and this is precisely known.
+      else status = "not loaded" extra
 
       # the two fields that need the filesystem are resolved afterwards,
       # and only for the handful of services that actually have paths
@@ -3432,6 +3441,15 @@ t_matrix() {
   else
     t_no 'on + run re-ran the program' "a pid different from $_pidb" "$_pida"
   fi
+
+  # STATUS must say what the state MEANS, not print a dash and leave the
+  # reader to infer it from the STATE and TRIGGER columns.
+  t_run "$_lab" stop >/dev/null 2>&1
+  case "$(t_run "$_lab" list)" in
+    *'not loaded'*) t_ok '@on  status         -> says it is not loaded, not "-"' ;;
+    *) t_no '@on status' 'not loaded' "$(t_run "$_lab" list)" ;;
+  esac
+  t_run "$_lab" start >/dev/null 2>&1
 
   t_run "$_lab" disable >/dev/null 2>&1
   t_eq 'on   + disable       -> @off' '@off' "$(t_state "$_lab")"
