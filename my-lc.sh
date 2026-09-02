@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="3d6fc9c"
+SCRIPT_COMMIT="fb3720a"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1646,10 +1646,16 @@ runlog_status() {
       printf '    > deploy to that path, then: %s restart %s\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
     else
       # Same bytes on disk, but a running process keeps the code it started
-      # with: a deploy does not reach it. Its own stderr file is dated when
-      # launchd created it, which is when the process started.
+      # with: a deploy does not reach it. The start time must come from the
+      # PROCESS - the stderr file's mtime was the first attempt and it is not
+      # that at all: launchd creates the file once and never touches it
+      # again, so it kept naming a start hours before the process began.
       _pmt=$(file_epoch "$_dprog")
-      _smt=$(file_epoch "/var/log/mine/root/$SCRIPT_NAME-runlog.err")
+      _smt=
+      if [ -n "$_pid" ] && [ "$_pid" != 0 ]; then
+        load_ps_map
+        _smt=$(awk -F"$FS1" -v p="$_pid" '$1 == p { print $2; exit }' "$TMPD/psmap")
+      fi
       if [ -n "$_pmt" ] && [ -n "$_smt" ] && [ "$_pmt" -gt "$_smt" ] 2>/dev/null; then
         printf '    > %sit started %s, and %s was written %s - a deploy does not\n' \
           "$C_WARN" "$(when "$_smt")" "$_dprog" "$(when "$_pmt")"
