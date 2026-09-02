@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="b464ed8"
+SCRIPT_COMMIT="bdec017"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------

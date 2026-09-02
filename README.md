@@ -209,7 +209,7 @@ a way to learn the raw commands.
   didn't it?". Every watched path gets its own block:
 
 ```
-  watches:  /Users/MINE/system/services/ftp/in/scans/            ok dir
+  watches:  /var/spool/incoming/scans/                          ok dir
               last change 3h12m ago (2026-09-01 17:24:06)
               newest entry: scan_0042.pdf (3h12m ago)
             /some/gone/path                                      MISSING
