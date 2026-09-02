@@ -13,8 +13,8 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a20827f"
+SCRIPT_VERSION="v1.0.1"
+SCRIPT_COMMIT="e22e655"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
