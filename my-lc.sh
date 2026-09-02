@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="aa1d4b9"
+SCRIPT_COMMIT="19916f3"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -380,7 +380,7 @@ log_size_note() {
   if [ ! -e "$1" ]; then printf 'does not exist yet'; return; fi
   if [ ! -f "$1" ]; then printf 'not a regular file'; return; fi
   if [ ! -r "$1" ]; then printf 'not readable as %s' "$(id -un)"; return; fi
-  _lsz=$(stat -f '%z' "$1" 2>/dev/null)
+  _lsz=$(stat -Lf '%z' "$1" 2>/dev/null)
   [ -n "$_lsz" ] || return 0
   _lmt=$(file_epoch "$1")
   _lwhen=
@@ -434,7 +434,11 @@ human_age() {
 now_epoch() { date '+%s'; }
 
 # mtime of a file as an epoch, empty when it does not exist
-file_epoch() { [ -e "$1" ] && stat -f '%m' "$1" 2>/dev/null; }
+# -L, always: BSD stat uses lstat by default, so a symlinked path is dated by
+# the LINK rather than by the file. /LINKS/sbin/my-lc is a symlink whose own
+# mtime is when the link was made - hours older than the file it points at -
+# and that silently defeated a check comparing a program against its process.
+file_epoch() { [ -e "$1" ] && stat -Lf '%m' "$1" 2>/dev/null; }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -729,7 +733,7 @@ path_verdict() {
 # written out three times and drifted between them.
 #   echoes 0-7, or nothing when the path cannot be stat'd
 perm_bit() {
-  _pbs=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || return 1
+  _pbs=$(stat -Lf '%u %g %Lp' "$1" 2>/dev/null) || return 1
   _pbo=${_pbs%% *}; _pbr=${_pbs#* }; _pbg=${_pbr%% *}; _pbm=${_pbr##* }
   _pbu=$(id -u "$2" 2>/dev/null) || return 1
   # root is bound by none of them for reading, and for execute needs only
@@ -790,7 +794,7 @@ program_verdict() {
     [ -x "$1" ] && { printf 'ok'; return; }
   fi
 
-  _pst=$(stat -f '%Lp' "$1" 2>/dev/null) || { printf '?'; return; }
+  _pst=$(stat -Lf '%Lp' "$1" 2>/dev/null) || { printf '?'; return; }
   # No execute bit at all is definitive, for every user including root.
   [ $(( 0$_pst & 73 )) = 0 ] && { printf 'NOT EXECUTABLE'; return; }
   # root may execute anything that carries any execute bit.
@@ -1621,6 +1625,18 @@ runlog_status() {
         "$( [ "$(file_epoch "$_dprog")" -lt "$(file_epoch "$0")" ] 2>/dev/null && printf ' (older)' )"
       printf '    > %s   build %s   <- the one you just ran\n' "$0" "$_mbid"
       printf '    > deploy to that path, then: %s restart %s\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+    else
+      # Same bytes on disk, but a running process keeps the code it started
+      # with: a deploy does not reach it. Its own stderr file is dated when
+      # launchd created it, which is when the process started.
+      _pmt=$(file_epoch "$_dprog")
+      _smt=$(file_epoch "/var/log/mine/root/$SCRIPT_NAME-runlog.err")
+      if [ -n "$_pmt" ] && [ -n "$_smt" ] && [ "$_pmt" -gt "$_smt" ] 2>/dev/null; then
+        printf '    > %sit started %s, and %s was written %s - a deploy does not\n' \
+          "$C_WARN" "$(when "$_smt")" "$_dprog" "$(when "$_pmt")"
+        printf '      reach a process that is already running%s\n' "$C_OFF"
+        printf '    > %s restart %s   picks up the new one\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+      fi
     fi
   fi
   _el="/var/log/mine/root/$SCRIPT_NAME-runlog.err"
@@ -1977,8 +1993,8 @@ render_record() {
     # When a launch item was installed, and when its definition last
     # changed, are two different questions: an old plist that changed
     # yesterday is a very different story from one untouched since install.
-    _pb=$(stat -f '%B' "$_p" 2>/dev/null)
-    _pm=$(stat -f '%m' "$_p" 2>/dev/null)
+    _pb=$(stat -Lf '%B' "$_p" 2>/dev/null)
+    _pm=$(stat -Lf '%m' "$_p" 2>/dev/null)
     if [ -n "$_pb" ] && [ -n "$_pm" ]; then
       if [ "$_pb" = "$_pm" ]; then
         printf '  %-10s %s\n' '' "written $(when "$_pb"), unchanged since"
@@ -3502,7 +3518,7 @@ stamp_version() {
   _tmp=$(mktemp) || die 'could not create a temp file'
   sed "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_new\"|" "$_self" > "$_tmp" \
     || { rm -f "$_tmp"; die 'could not rewrite SCRIPT_COMMIT'; }
-  _mode=$(stat -f '%Lp' "$_self" 2>/dev/null)
+  _mode=$(stat -Lf '%Lp' "$_self" 2>/dev/null)
   mv "$_tmp" "$_self" || { rm -f "$_tmp"; die 'could not replace the file'; }
   [ -n "$_mode" ] && chmod "$_mode" "$_self"
   printf 'stamped SCRIPT_COMMIT: %s -> %s\n' "${_cur:-<empty>}" "$_new"
@@ -4617,6 +4633,18 @@ t_logsizes() {
     'empty, last '*) t_ok 'an empty log says so, and still dates the run that emptied it' ;;
     *) t_no 'empty log note' 'empty, last <when>' "$(log_size_note "$_lg/empty")" ;;
   esac
+  # BSD stat uses lstat, so a symlinked log was dated and sized by the LINK -
+  # a file my-lc never means. Every stat in the tool passes -L now.
+  printf 'aaaa\n' > "$_lg/real"
+  ln -sf real "$_lg/via-link"
+  touch -t 202001010101 "$_lg/real"
+  t_eq 'a symlinked log is dated by the FILE, not the link' \
+    "$(file_epoch "$_lg/real")" "$(file_epoch "$_lg/via-link")"
+  case "$(log_size_note "$_lg/via-link")" in
+    '1L, 5B'*) t_ok 'and sized by the file too' ;;
+    *) t_no 'symlink size' '1L, 5B, ...' "$(log_size_note "$_lg/via-link")" ;;
+  esac
+
   t_eq 'a missing log says so'             'does not exist yet' "$(log_size_note "$_lg/nope")"
   t_eq 'a directory is not a log'          'not a regular file' "$(log_size_note "$_lg")"
   # counting lines in a huge log means reading it all, so past BIG_DELTA it
