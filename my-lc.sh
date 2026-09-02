@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="b776988"
+SCRIPT_COMMIT="03d8137"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -67,6 +67,7 @@ RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
 RUNLOG_MAX_LINES=20000
 RUNLOG_POLL=60
 RUNLOG_BACKFILL=900
+RECENT_RUNS=6
 WIDTH_LABEL=auto
 COLOR=auto
 EDITOR_CMD=""
@@ -529,6 +530,10 @@ RUNLOG_MAX_LINES=20000
 # proportional to the WINDOW, not to the events in it: ~2.3s for 5 minutes,
 # so a 70s window costs about a second of CPU a minute.
 RUNLOG_POLL=60
+
+# How many recorded events 'status <label>' lists. They are the only run
+# history that exists: launchd keeps a COUNT and nothing else.
+RECENT_RUNS=6
 
 # How far back the FIRST read reaches, in seconds. launchd has no start
 # ordering for daemons - RunAtLoad is all there is - so the recorder can
@@ -1289,6 +1294,19 @@ discover_scope() {
       # the log written at the very minute the run is dated says nothing new
       [ "$_lw" = "${_lts:-}" ] || _su="$_su LAST-WROTE:$_lw"
     fi
+    # A watch that is not ARMED will never fire, and looks exactly like one
+    # that is: the service sits there and nothing happens. launchd says so in
+    # the event channel and nothing else does. Only watch and queue rows pay
+    # for the per-service query - a handful on any machine.
+    case "$_tg" in
+      *watch*|*queue*)
+        live_print "$_dm" "$_lab"
+        if [ -s "$TMPD/print.live" ]; then
+          case "$(awk '/watching = /{ print $3; exit }' "$TMPD/print.live")" in
+            0) _su="$_su NOT-ARMED" ;;
+          esac
+        fi ;;
+    esac
     # NEXT: exists for exactly one kind of service, and nothing else on the
     # screen can tell you - launchd exposes no next-fire time at all.
     case "$_tg" in
@@ -1313,6 +1331,11 @@ discover_scope() {
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
            "$_pr" "$_us" "$_ef" "$_of" "$_wat" >> "$DB"
   done < "$TMPD/joined"
+  # The armed check leaves one service's 'launchctl print' in the cache, and
+  # everything after this asks about OTHER services - a record view, the
+  # loaded-vs-disk diff. Dropping the key costs one re-read and removes a
+  # whole class of question about which service the cached bytes belong to.
+  LIVE_PRINT_KEY=
 
   # 4. loaded services with no plist on disk are orphans, still worth showing
   while IFS="$FS1" read -r _l _p _x; do
@@ -1354,6 +1377,23 @@ attach_last_run() {
     { print $0 FS ((($1 in seen)) ? seen[$1] : "") }
   ' FS="$FS1" OFS="$FS1" "$_rlf" "$1" > "$2" 2>/dev/null || return 1
   return 0
+}
+
+# What the recorder holds for one label, newest last. This is the only run
+# history there is - launchd keeps a count and nothing else - and it exists
+# only for what has happened since 'install'.
+runlog_recent() {
+  case "$DOMAIN" in
+    system) _ru2=root ;;
+    *)      _ru2=$(id -un "$DOMAIN_UID" 2>/dev/null) ;;
+  esac
+  [ -n "$_ru2" ] || return 0
+  _rf2=$(runlog_file "$_ru2")
+  [ -f "$_rf2" ] && [ -r "$_rf2" ] || return 0
+  awk -F"$FS1" -v l="$1" -v n="${2:-6}" '
+    $3 == l { line[++c] = $0 }
+    END { for (i = (c > n ? c - n + 1 : 1); i <= c; i++) print line[i] }
+  ' "$_rf2"
 }
 
 # "12L 3h" for a non-empty log, "-" for missing/empty.
@@ -1884,10 +1924,15 @@ render_table() {
   _gut=0; _wtrap=0
   while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
     [ -n "$_l" ] || continue
-    [ -n "$(session_trap "$_d" "$_pr" "$_su" "$_ef")" ] || continue
+    _tp=$(session_trap "$_d" "$_pr" "$_su" "$_ef")
+    # A watch that is not armed is the same KIND of fact - this service
+    # cannot do its job - so it earns the same mark. But its status is still
+    # true and still useful, so unlike a session trap it is not replaced.
+    _tsu=$_su
+    case "$_su" in *NOT-ARMED*) ;; *) [ -n "$_tp" ] || continue ;; esac
     # 'waiting' on a service that can never run is a lie, so it is replaced
     # outright; a FAIL is true as far as it goes, so the cause is added to it.
-    _tsu=$TRAP_STATUS
+    [ -n "$_tp" ] && _tsu=$TRAP_STATUS
     printf '%s%s%s\n' "$_l" "$FS1" "$_tsu" >> "$TMPD/traps"
     [ "${#_tsu}" -gt "$_wtrap" ] && _wtrap=${#_tsu}
     _gut=1
@@ -2052,6 +2097,21 @@ render_record() {
              [ -n "$_long" ] && printf '  %-10s %s\n' '' "exit $_code = $_long" ;;
   esac
   show_last_run "$_d" "$_l" "$_su"
+  # The recorded history. launchd has none of this: it keeps a run COUNT and
+  # the last exit code, so every line here comes from the recorder, and a
+  # service that has not run since 'install' has none.
+  _rec=$(runlog_recent "$_l" "$RECENT_RUNS")
+  if [ -n "$_rec" ]; then
+    _rfirst=1
+    printf '%s\n' "$_rec" | while IFS="$FS1" read -r _re _rd _rl2 _rv _rx; do
+      [ -n "$_re" ] || continue
+      if [ "$_rfirst" = 1 ]; then _rlbl='recent:'; _rfirst=0; else _rlbl=''; fi
+      case "$_rv" in
+        ERR) printf '  %-10s %s%s  %-5s %s%s\n' "$_rlbl" "$C_BAD" "$(when "$_re")" "$_rv" "$_rx" "$C_OFF" ;;
+        *)   printf '  %-10s %s  %s\n' "$_rlbl" "$(when "$_re")" "$_rv" ;;
+      esac
+    done
+  fi
   if [ -n "$_p" ]; then
     printf '  %-10s %s\n' 'plist:' "$_p"
     # When a launch item was installed, and when its definition last
@@ -2146,6 +2206,21 @@ render_record() {
       printf '  %-10s %-56s %s\n' "$_lbl" "$_w" "$_pv"
       watch_detail "$_w" "$_pv"
     done
+    # A watch that is not ARMED looks exactly like one that is: the service
+    # sits there, and nothing ever fires. launchd says so in the event
+    # channel, and nothing else does.
+    case "$_tr" in
+      *watch*|*queue*)
+        live_print "$_d" "$_l"
+        if [ -s "$TMPD/print.live" ]; then
+          _arm=$(awk '/watching = /{ print $3; exit }' "$TMPD/print.live")
+          case "$_arm" in
+            1) printf '  %-10s %s\n' '' 'armed: launchd is watching it now' ;;
+            0) printf '  %-10s %s%s%s\n' '' "$C_BAD" \
+                 'armed: NO - launchd is NOT watching, so nothing will fire it' "$C_OFF" ;;
+          esac
+        fi ;;
+    esac
     case "$_tr" in
       *watch*) printf '  %-10s %s\n' '' 'note: WatchPaths fires when a watched DIRECTORY gains or loses'
                printf '  %-10s %s\n' '' '      an entry, not when a file inside it is edited in place' ;;
@@ -5224,6 +5299,18 @@ t_sessiontrap() {
     'CANNOT-WORK no-GUI-session' "$(trap_status WAITING)"
   case "$_o" in *"!! $TRAP_STATUS"*) t_ok 'the table row says the cause, not the symptom' ;;
     *) t_no 'status text' "!! $TRAP_STATUS" "$_o" ;; esac
+
+  # A watch that is not armed cannot fire: the same KIND of fact as a session
+  # trap, so the same mark - but its status is true and useful, so unlike a
+  # trap it is kept rather than replaced.
+  _armed="$_sd/armed.db"
+  _row good.service system /tmp/g.plist - on manual 'OK [0]' - - /bin/sh '' '' '' '' > "$_armed"
+  _row deaf.service system /tmp/d.plist - on watch 'NOT-RUN NOT-ARMED' - - /bin/sh '' '' '' '' >> "$_armed"
+  _o2=$(render_table "$_armed")
+  case "$_o2" in *'!! NOT-RUN NOT-ARMED'*) t_ok 'a watch that is not armed is marked, and keeps its status' ;;
+    *) t_no 'not-armed mark' '!! NOT-RUN NOT-ARMED' "$_o2" ;; esac
+  case "$_o2" in *"$TRAP_STATUS"*) t_no 'not replaced' 'the row keeps its own status' "$_o2" ;;
+    *) t_ok 'and is not turned into CANNOT-WORK, which it is not' ;; esac
 
   _row notyet.service system /tmp/w.plist - on watch 'WAITING' - - /usr/bin/automator '' '' '' '' >> "$_trap"
   _o=$(render_table "$_trap")
