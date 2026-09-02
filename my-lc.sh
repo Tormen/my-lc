@@ -201,9 +201,16 @@ TRIGGER — why it would run, read from the plist
   directory is ?, never a false MISSING.
 
 STATUS — whatever is relevant for that kind of service
-  RUN 4d2h pid 1869   running, with uptime
+  RUNNING SINCE:<when> [4d2h] pid 1869
+  OK LAST:<when>[0]   the raw exit code beside the word derived from it, so
+  FAILED LAST:<when>[1 general error]        a wrong reading is visible here
+  LAST:               a real run time, from the recorder ('install')
+  LAST~:              inferred, not observed: a boot-triggered service that
+                      has run, ran when it was loaded - i.e. at boot
+  LAST-WROTE:         when its log was last written, which is NOT when it
+                      last ran - a service can run hourly and stay silent
+  NEXT:               computed from the plist, for calendar jobs only
   FAIL 127 x3         last exit code, run count
-  OK                  exited cleanly
   EVERY 3600s / CAL   a timer that has not run yet
   WAITING             armed on a socket, path or XPC name
   NOT-STARTED         nothing runs it until you 'start' it, or until the
@@ -1113,10 +1120,18 @@ discover_scope() {
         _tail=${_rest#"$_code"}
         _mn=$(exit_meaning "$_code" short)
         _br="[$_code${_mn:+ $_mn}]"
-        # LAST: is a real run time, and only the recorder has those; without
-        # it the bracket still says what the last run did.
-        if [ -n "$_lastrun" ]; then _su="$_word LAST:$(when "$_lastrun")$_br$_tail"
-        else                        _su="$_word $_br$_tail"; fi ;;
+        # LAST: is a real run time and only the recorder has those. Without
+        # one there is still an inference worth making: a boot-triggered
+        # service that HAS run, and is not running now, ran when it was
+        # loaded - and that was at boot, which the kernel dates exactly.
+        # It is marked '~' because it is reasoned, not observed.
+        _lt=
+        if [ -n "$_lastrun" ]; then _lt="LAST:$(when "$_lastrun")"
+        else case "$_tg" in
+               *boot*) [ -n "$BOOT_EPOCH" ] && _lt="LAST~:$(when "$BOOT_EPOCH")" ;;
+             esac
+        fi
+        _su="$_word ${_lt}$_br$_tail" ;;
     esac
     # A broken program is WHY a stopped service is stopped, so for one that
     # is not running it is the fact worth showing. A running service proves
@@ -1203,17 +1218,15 @@ discover_scope() {
     if [ -n "$_last" ] && [ "$_last" != "$_lastrun" ]; then
       _su="$_su LAST-WROTE:$(when "$_last")"
     fi
-    # A failure with no log at all cannot be dated from a file - but a
-    # boot-triggered service that is dead now died at boot, and the kernel
-    # knows when that was. Only THAT case is added: when there is a log,
-    # LAST-WROTE already carries its time and saying it twice is noise.
-    if [ -z "$_last" ] && [ -n "$BOOT_EPOCH" ]; then
-      case "$_su" in
-        FAILED*) case "$_tg" in
-                   *boot*) _su="$_su, dead since boot $(when "$BOOT_EPOCH")" ;;
-                 esac ;;
-      esac
-    fi
+    # NEXT: exists for exactly one kind of service, and nothing else on the
+    # screen can tell you - launchd exposes no next-fire time at all.
+    case "$_tg" in
+      *cal*)
+        if [ -n "$_pl" ]; then
+          _nx=$(next_calendar "$_pl")
+          [ -n "$_nx" ] && _su="$_su NEXT:$(when "$_nx")"
+        fi ;;
+    esac
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
            "$_pr" "$_us" "$_ef" "$_of" "$_wat" >> "$DB"
   done < "$TMPD/joined"
@@ -2142,6 +2155,102 @@ show_loaded_diff() {
     'DIFFERS from the plist on disk - restart to apply' "$C_OFF"
   diff "$TMPD/defn.loaded" "$TMPD/defn.disk" 2>/dev/null \
     | sed -n 's/^< /             running: /p; s/^> /             on disk: /p'
+}
+
+# When a StartCalendarInterval job runs NEXT. Unlike every other time in this
+# tool it is not observed but COMPUTED, and it is the one thing on the screen
+# that nothing else can tell you - launchd exposes no next-fire time.
+#
+# Omitted keys are wildcards, exactly as launchd treats them: Hour 3 with no
+# Minute means every minute of 03:00-03:59, not 03:00. Day and Weekday given
+# together are ANDed here.
+#
+# The result is an epoch computed with the CURRENT UTC offset, so an
+# occurrence on the far side of a DST change can be an hour out. Recomputing
+# per candidate would need a timezone database this cannot have.
+next_calendar() {
+  plutil -p "$1" 2>/dev/null | awk -v now="$(now_epoch)" -v offtxt="$(date +%z)" '
+    function offset_seconds(o,   sign) {
+      sign = (substr(o, 1, 1) == "-") ? -1 : 1
+      o = substr(o, 2)
+      return sign * ((substr(o, 1, 2) + 0) * 3600 + (substr(o, 3, 2) + 0) * 60)
+    }
+    function days_from_civil(y, m, d,   era, yoe, doy, doe) {
+      if (m <= 2) y = y - 1
+      era = int((y >= 0 ? y : y - 399) / 400)
+      yoe = y - era * 400
+      doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+      doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+      return era * 146097 + doe - 719468
+    }
+    function civil_from_days(z,   era, doe, yoe, y, doy, mp, d, m) {
+      z += 719468
+      era = int((z >= 0 ? z : z - 146096) / 146097)
+      doe = z - era * 146097
+      yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+      y = yoe + era * 400
+      doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+      mp = int((5 * doy + 2) / 153)
+      d = doy - int((153 * mp + 2) / 5) + 1
+      m = mp + (mp < 10 ? 3 : -9)
+      if (m <= 2) y = y + 1
+      return y "/" m "/" d
+    }
+    # one entry per calendar dict; an array of them is several
+    function want(e, key, v) { return (!((e SUBSEP key) in has)) || val[e, key] == v }
+    BEGIN { offs = offset_seconds(offtxt); n = 0; inblock = 0 }
+    /"StartCalendarInterval" *=>/ {
+      inblock = 1; depth = 0
+      if ($0 ~ /=> *\{/) { n = 1; depth = 1 }
+      next
+    }
+    inblock {
+      if ($0 ~ /\{/) { n++; depth++; next }
+      if ($0 ~ /\}/) { depth--; if (depth <= 0 && $0 !~ /^ *[0-9]+ *=> *\{/) { if (depth < 0) inblock = 0 } next }
+      if ($0 ~ /\]/) { inblock = 0; next }
+      if (match($0, /"[A-Za-z]+" *=> *[0-9]+/)) {
+        k = $0; sub(/^[^"]*"/, "", k); sub(/".*/, "", k)
+        v = $0; sub(/.*=> */, "", v); v = v + 0
+        if (n == 0) n = 1
+        has[n, k] = 1; val[n, k] = v
+      }
+      next
+    }
+    END {
+      if (n == 0) exit 0
+      nowl = now + offs
+      today = int(nowl / 86400)
+      nowmin = int((nowl % 86400) / 60)
+      best = ""
+      for (e = 1; e <= n; e++) {
+        if (!((e SUBSEP "Minute") in has) && !((e SUBSEP "Hour") in has) \
+            && !((e SUBSEP "Day") in has) && !((e SUBSEP "Weekday") in has) \
+            && !((e SUBSEP "Month") in has)) continue
+        for (dd = 0; dd <= 400; dd++) {
+          days = today + dd
+          split(civil_from_days(days), c, "/")
+          wd = (days + 4) % 7; if (wd < 0) wd += 7
+          if (!want(e, "Month", c[2] + 0)) continue
+          if (!want(e, "Day",   c[3] + 0)) continue
+          if (((e SUBSEP "Weekday") in has) && (val[e, "Weekday"] % 7) != wd) continue
+          got = 0
+          for (h = 0; h < 24 && !got; h++) {
+            if (!want(e, "Hour", h)) continue
+            for (mi = 0; mi < 60; mi++) {
+              if (!want(e, "Minute", mi)) continue
+              if (dd == 0 && (h * 60 + mi) <= nowmin) continue
+              cand = days * 86400 + h * 3600 + mi * 60 - offs
+              if (best == "" || cand < best) best = cand
+              got = 1
+              break
+            }
+          }
+          if (got) break
+        }
+      }
+      if (best != "") print best
+    }
+  '
 }
 
 # The command line as launchd would execute it: the program plus every
