@@ -13,8 +13,8 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0.2"
-SCRIPT_COMMIT="b32ed5b"
+SCRIPT_VERSION="v1.0.3"
+SCRIPT_COMMIT="1a84301"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3447,6 +3447,29 @@ t_version() {
   # ...and an identical copy MUST report the same one
   _b3=$(/bin/dash "$TMPD/v1" --version 2>&1)
   t_eq 'an identical file reports the same build id' "$_b1" "$_b3"
+
+  # A released version number must never be reused. Once a tag exists and
+  # HEAD has moved past it, the version in the file is stale and the next
+  # release would republish a number that already means something else.
+  # This is the one check the build id cannot make: it knows the bytes
+  # differ, not that the NAME was already taken.
+  # The TOOL must never know where its source lives; a test may look at the
+  # directory of the file it was told to run, which is not the same thing.
+  _sdir=$(dirname "$0")
+  if ! command -v git >/dev/null 2>&1 || ! git -C "$_sdir" rev-parse --git-dir >/dev/null 2>&1
+  then t_skip 'the version has not been released already' 'not a git checkout'
+  else
+    _tagged=$(git -C "$_sdir" tag -l "$VERSION")
+    if [ -z "$_tagged" ]; then
+      t_ok "$VERSION is not a released tag yet - nothing to reuse"
+    elif [ "$(git -C "$_sdir" rev-list -n1 "$VERSION")" \
+         = "$(git -C "$_sdir" rev-parse HEAD)" ]; then
+      t_ok "$VERSION is tagged, and HEAD is that release"
+    else
+      t_no 'the version is stale' "a version later than the tagged $VERSION" \
+        "SCRIPT_VERSION is still $VERSION, but HEAD has moved past that tag - bump it"
+    fi
+  fi
 }
 
 t_program() {
