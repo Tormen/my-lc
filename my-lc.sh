@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="1127b4a"
+SCRIPT_COMMIT="3a8a241"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -104,7 +104,9 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
            at once. A .plist path, a bare label and system/<label> are
            interchangeable.
   my-lc's own installation (not a service verb):
-  install    install the run recorder: a LaunchDaemon, written by my-lc
+  install    install the run recorder, or - when it is already installed -
+             report whether it is running and how much it has collected.
+             It is a LaunchDaemon, written by my-lc
              itself, that streams launchd's own events and reduces them to
              one line per run. launchd keeps no run times, and reading them
              back from the system log costs ~15s per hour, so this is the
@@ -1439,13 +1441,43 @@ runlog_program() {
   esac
 }
 
+# Is it running, and is it actually collecting anything? A daemon that is up
+# but recording nothing looks identical to a healthy one from the outside,
+# so the record count and the newest timestamp are the answer, not the pid.
+runlog_status() {
+  _rp=$(runlog_plist)
+  _pid=$(launchctl print "system/$RUNLOG_LABEL" 2>/dev/null | awk '/^\tpid = / { print $3; exit }')
+  if [ -n "$_pid" ] && [ "$_pid" != 0 ]
+  then msg "the run recorder is installed and RUNNING (pid $_pid)"
+  else msg "the run recorder is installed, but is NOT running - 'my-lc $RUNLOG_LABEL' says why"; fi
+  printf '    > %s\n' "$_rp"
+  _base=$(printf '%s' "$RUNLOG_STATE" | sed 's|/@USER@.*||')
+  _any=0
+  for _d in "$_base"/*; do
+    [ -d "$_d" ] || continue
+    _f=$(runlog_file "${_d##*/}")
+    [ -f "$_f" ] && [ -r "$_f" ] || continue
+    _any=1
+    _n=$(awk 'END { print NR+0 }' "$_f")
+    _nw=$(awk -F"$FS1" 'END { print $1 }' "$_f")
+    printf '    > %s   %s record(s)' "$_f" "$_n"
+    [ -n "$_nw" ] && printf ', newest %s' "$(when "$_nw")"
+    printf '\n'
+  done
+  [ "$_any" = 1 ] || printf '    > no records yet - nothing has started or stopped since it came up\n'
+  _el="/var/log/mine/root/$SCRIPT_NAME-runlog.err"
+  if [ -s "$_el" ]; then
+    printf '    > %s%s: %s%s\n' "$C_BAD" "$_el" "$(log_size_note "$_el")" "$C_OFF"
+  fi
+}
+
 cmd_install() {
   _rp=$(runlog_plist)
   _prog=$(runlog_program)
   if [ -f "$_rp" ]; then
     _had=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
     if [ "$_had" = "$_prog" ]; then
-      msg "the run recorder is already installed ($RUNLOG_LABEL)"
+      runlog_status
     else
       msg "the run recorder is installed, but names a different program"
       printf '    > installed: %s\n' "$_had" >&2
@@ -4865,6 +4897,21 @@ t_runlog() {
     "$(plutil -extract ProgramArguments.0 raw -o - "$_rl/p.plist" 2>/dev/null)"
   t_eq 'with the collect verb, so the daemon IS my-lc' '--runlog-collect' \
     "$(plutil -extract ProgramArguments.1 raw -o - "$_rl/p.plist" 2>/dev/null)"
+
+  # 'install' on an installed recorder must REPORT, not re-install: a daemon
+  # that is up while collecting nothing looks healthy from the pid alone.
+  _fake="$_rl/plistdir"; mkdir -p "$_fake"
+  RUNLOG_PLIST_DIR_SAVE=$RUNLOG_PLIST_DIR; RUNLOG_PLIST_DIR="$_fake"
+  RUNLOG_STATE_SAVE2=$RUNLOG_STATE; RUNLOG_STATE="$_rl/@USER@/my-lc"
+  runlog_plist_content "$(runlog_program)" > "$(runlog_plist)"
+  _o=$(cmd_install 2>&1)
+  case "$_o" in *'already installed'*) t_no 'install reports' 'a status, not a bare line' "$_o" ;;
+    *'run recorder is installed'*) t_ok 'install on an installed recorder reports its state' ;;
+    *) t_no 'install status' 'the run recorder is installed...' "$_o" ;; esac
+  case "$_o" in *'record(s)'*) t_ok 'and says how much it has actually collected' ;;
+    *'no records yet'*) t_ok 'and says plainly that it has collected nothing yet' ;;
+    *) t_no 'install status counts' 'record(s) or "no records yet"' "$_o" ;; esac
+  RUNLOG_PLIST_DIR=$RUNLOG_PLIST_DIR_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE2
 
   # and it must refuse politely rather than half-installing
   if [ "$(id -u)" = 0 ]; then
