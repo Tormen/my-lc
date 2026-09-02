@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="b288207"
+SCRIPT_COMMIT="9abe317"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -93,8 +93,10 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
 
   FILTER   any word that is not a verb or an option: a case-insensitive
            substring matched against the label, the plist path and the
-           program path. Several words are ANDed. A .plist path, a bare
-           label and system/<label> are interchangeable.
+           program path. Several words are ANDed - but several EXACT
+           labels are acted on together, since no service is two labels
+           at once. A .plist path, a bare label and system/<label> are
+           interchangeable.
   VERB     status (default) | list | start | stop | restart | run | kill
            | enable | disable | edit | delete | truncate [err|out]
            | undelete            (recognised in any position)
@@ -1174,18 +1176,37 @@ select_records() {
   [ "$WANT_STDERR"  = 1 ] && { awk -F"$FS1" '$12!=""' "$TMPD/sel" > "$TMPD/sel2"; mv "$TMPD/sel2" "$TMPD/sel"; }
   [ "$WANT_STDOUT"  = 1 ] && { awk -F"$FS1" '$13!=""' "$TMPD/sel" > "$TMPD/sel2"; mv "$TMPD/sel2" "$TMPD/sel"; }
 
-  # filter words: exact target first, else substring over label+plist+program
+  # Several filter words NARROW: 'cron refresh' means the services matching
+  # both. But several EXACT labels cannot narrow - no service is two labels
+  # at once, so narrowing always yields nothing - and can only mean "these
+  # ones". Union them instead, which is what naming two services to a verb
+  # evidently asks for.
+  _nf=0; _allexact=1
   for _f in $FILTERS; do
-    _exact=$(resolve_target "$_f")
-    if [ -n "$_exact" ]; then
-      awk -F"$FS1" -v l="$_exact" '$1==l' "$TMPD/sel" > "$TMPD/sel2"
-    else
-      _lf=$(lower "$_f")
-      awk -F"$FS1" -v f="$_lf" '
-        { s=tolower($1 " " $3 " " $10); if (index(s,f)) print }' "$TMPD/sel" > "$TMPD/sel2"
-    fi
-    mv "$TMPD/sel2" "$TMPD/sel"
+    _nf=$((_nf + 1))
+    [ -n "$(resolve_target "$_f")" ] || { _allexact=0; break; }
   done
+  if [ "$_nf" -gt 1 ] && [ "$_allexact" = 1 ]; then
+    : > "$TMPD/sel2"
+    for _f in $FILTERS; do
+      awk -F"$FS1" -v l="$(resolve_target "$_f")" '$1==l' "$TMPD/sel" >> "$TMPD/sel2"
+    done
+    # the same label twice must not act twice
+    sort -u "$TMPD/sel2" > "$TMPD/sel"
+  else
+    # exact target first, else substring over label+plist+program
+    for _f in $FILTERS; do
+      _exact=$(resolve_target "$_f")
+      if [ -n "$_exact" ]; then
+        awk -F"$FS1" -v l="$_exact" '$1==l' "$TMPD/sel" > "$TMPD/sel2"
+      else
+        _lf=$(lower "$_f")
+        awk -F"$FS1" -v f="$_lf" '
+          { s=tolower($1 " " $3 " " $10); if (index(s,f)) print }' "$TMPD/sel" > "$TMPD/sel2"
+      fi
+      mv "$TMPD/sel2" "$TMPD/sel"
+    done
+  fi
 
   sort -f "$TMPD/sel" > "$_out"
 }
@@ -2822,7 +2843,7 @@ do_action() {
   _sel=$1
   _n=$(wc -l < "$_sel" | tr -d ' ')
   if [ "$_n" = 0 ]; then
-    err "nothing matched$( [ -n "$FILTERS" ] && printf ':%s' "$FILTERS" )"
+    err "nothing matched$( [ -n "$FILTERS" ] && printf ': %s' "$FILTERS" )"
     return 0
   fi
   if [ "$VERB" = edit ] && [ "$_n" -gt 1 ]; then
@@ -2922,7 +2943,7 @@ do_undelete() {
 
   _n=$(wc -l < "$TMPD/del.sel" | tr -d ' ')
   if [ "$_n" = 0 ]; then
-    err "nothing deleted matches$( [ -n "$FILTERS" ] && printf ':%s' "$FILTERS" )"
+    err "nothing deleted matches$( [ -n "$FILTERS" ] && printf ': %s' "$FILTERS" )"
     printf '    > run '\''my-lc undelete'\'' with no filter to see what there is\n' >&2
     return 0
   fi
@@ -3192,6 +3213,7 @@ run_tests() {
   t_pstime
   t_logsizes
   t_sessiontrap
+  t_filters
   t_plistchecks
   t_restartrace
   t_chain
@@ -4316,6 +4338,35 @@ t_sessiontrap() {
     *) t_no 'record status' 'FAIL 255 as me - no GUI session' "$_o" ;; esac
   case "$_o" in *'needs a GUI login session'*) t_ok 'and the program block says it can never work here' ;;
     *) t_no 'record program note' 'needs a GUI login session' "$_o" ;; esac
+}
+
+t_filters() {
+  t_sec 'Y. several filter words'
+  _fd2="$TMPD/filt"; mkdir -p "$_fd2"
+  _r() { printf '%s\t' "$@"; printf '\n'; }
+  DB_SAVE=$DB; DB="$_fd2/db"
+  { _r eu.no-panic.cron_one system /a.plist - on boot ok - - /bin/sh '' '' '' ''
+    _r eu.no-panic.cron_two system /b.plist - on boot ok - - /bin/sh '' '' '' ''
+    _r eu.no-panic.other    system /c.plist - on boot ok - - /usr/bin/true '' '' '' ''
+  } > "$DB"
+  _sel() { FILTERS=$1 select_records "$DB" "$_fd2/out" >/dev/null 2>&1
+           awk -F"$FS1" '{ print $1 }' "$_fd2/out" | tr '\n' ' ' | sed 's/ $//'; }
+  FILTER_STATE_SAVE=$FILTER_STATE; FILTER_STATE=all
+  APPLE_SAVE=$APPLE_MODE; APPLE_MODE=include
+
+  t_eq 'one word still matches by substring' \
+    'eu.no-panic.cron_one eu.no-panic.cron_two' "$(_sel cron)"
+  t_eq 'two substrings still NARROW' \
+    'eu.no-panic.cron_one' "$(_sel 'cron one')"
+  # two exact labels cannot narrow - no service is both - so they mean 'these'
+  t_eq 'two exact labels are acted on together' \
+    'eu.no-panic.cron_one eu.no-panic.other' \
+    "$(_sel 'eu.no-panic.cron_one eu.no-panic.other')"
+  t_eq 'the same label twice acts once' \
+    'eu.no-panic.other' "$(_sel 'eu.no-panic.other eu.no-panic.other')"
+  t_eq 'an exact label plus a substring still narrows' \
+    '' "$(_sel 'eu.no-panic.other cron')"
+  APPLE_MODE=$APPLE_SAVE; FILTER_STATE=$FILTER_STATE_SAVE; DB=$DB_SAVE
 }
 
 t_undelete() {
