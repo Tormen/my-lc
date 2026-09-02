@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="0b3b6ef"
+SCRIPT_COMMIT="ff04d2b"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1034,16 +1034,20 @@ discover_scope() {
       } else if (vrb == 1) extra = " as " def
 
       e = (lab in lec) ? lec[lab] : ""
+      # STATUS says what happened to the RUN. What would run it NEXT belongs
+      # to the TRIGGER column, and repeating it here (EVERY 60s, CAL,
+      # WAITING) said nothing the row did not already say one column left.
+      # (No apostrophes in here: this comment lives inside a single-quoted
+      # awk program, and one would end the quote.)
+      # \001 marks a raw exit code the shell must render with its meaning and
+      # the time of the run it belongs to.
       if (p != "") {
-        status = (p in start) ? ("RUN \003" start[p] " pid " p extra) \
-                              : ("RUN pid " p extra)
+        status = (p in start) ? ("RUNNING SINCE:\003" start[p] " pid " p extra) \
+                              : ("RUNNING pid " p extra)
       } else if (e != "" && e != "-" && e != "0") {
-        status = "FAIL " e "\002" extra
+        status = "FAILED\001" e extra
       } else if (ld || st == "@off") {
-        if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); sub(/s$/,"",iv); status="EVERY " iv "s" extra }
-        else if (trig ~ /cal/)   status = "CAL" extra
-        else if (trig ~ /sock|xpc|watch|queue/) status = "WAITING" extra
-        else if (e == "0")       status = "OK" extra
+        if (e == "0")            status = "OK\001" e extra
         # loaded and armed on nothing launchd can name: it is waiting for a
         # person. '-' left the reader to work that out from two other columns
         else                     status = "NOT-RUN" extra
@@ -1064,8 +1068,13 @@ discover_scope() {
     }
   ' "$TMPD/disabled.$_dset" "$TMPD/loaded" "$TMPD/psmap" "$TMPD/parsed" > "$TMPD/joined"
 
+  # 3a2. the recorder's answer to "when did it last run", joined on as one
+  # more field. launchd itself has no such fact; without the recorder the
+  # field is empty and the row simply says nothing about it.
+  attach_last_run "$TMPD/joined" "$TMPD/joined.last" && mv "$TMPD/joined.last" "$TMPD/joined"
+
   # 3b. resolve only the rows that need to touch the filesystem
-  while IFS="$FS1" read -r _lab _dm _pl _ap _st _tg _su _ei _oi _pr _us _ef _of _wat; do
+  while IFS="$FS1" read -r _lab _dm _pl _ap _st _tg _su _ei _oi _pr _us _ef _of _wat _lastrun; do
     [ -n "$_lab" ] || continue
     [ "$_pl"  = "$EM" ] && _pl=;  [ "$_tg" = "$EM" ] && _tg=
     [ "$_su"  = "$EM" ] && _su=;  [ "$_pr" = "$EM" ] && _pr=
@@ -1082,19 +1091,32 @@ discover_scope() {
     esac
     SEEN="$SEEN$_lab "
     # \003 marks a moment in time that awk could not render: BSD awk has no
-    # strftime, and only the shell knows the configured style.
+    # strftime, and only the shell knows the configured style. An uptime is
+    # added beside it - with TIME_FORMAT=relative the timestamp IS an age,
+    # so saying it twice would be noise.
     case "$_su" in
       *"$(printf '\003')"*)
         _ep=${_su#*"$(printf '\003')"}; _ep=${_ep%% *}
-        _su=$(printf '%s' "$_su" | sed "s/$(printf '\003')$_ep/$(when "$_ep")/") ;;
+        _sn=$(when "$_ep")
+        [ "$TIME_FORMAT" = absolute ] && _sn="$_sn [$(human_age $(( $(now_epoch) - _ep )) )]"
+        _su=$(printf '%s' "$_su" | sed "s|$(printf '\003')$_ep|$_sn|") ;;
     esac
-    # \002 marks where the exit code's meaning goes; awk cannot know it
+    # \001 carries the RAW exit code. It is printed next to the word derived
+    # from it - OK beside [0], FAILED beside [1 general error] - so a wrong
+    # derivation is visible in ordinary output instead of needing a test that
+    # thought to look for it.
     case "$_su" in
-      *"$(printf '\002')"*)
-        _code=${_su#FAIL }; _code=${_code%%"$(printf '\002')"*}
+      *"$(printf '\001')"*)
+        _word=${_su%%"$(printf '\001')"*}
+        _rest=${_su#*"$(printf '\001')"}
+        _code=${_rest%% *}
+        _tail=${_rest#"$_code"}
         _mn=$(exit_meaning "$_code" short)
-        if [ -n "$_mn" ]; then _su=$(printf '%s' "$_su" | sed "s/$(printf '\002')/ $_mn/")
-        else                   _su=$(printf '%s' "$_su" | sed "s/$(printf '\002')//"); fi ;;
+        _br="[$_code${_mn:+ $_mn}]"
+        # LAST: is a real run time, and only the recorder has those; without
+        # it the bracket still says what the last run did.
+        if [ -n "$_lastrun" ]; then _su="$_word LAST:$(when "$_lastrun")$_br$_tail"
+        else                        _su="$_word $_br$_tail"; fi ;;
     esac
     # A broken program is WHY a stopped service is stopped, so for one that
     # is not running it is the fact worth showing. A running service proves
@@ -1175,19 +1197,21 @@ discover_scope() {
         fi
         [ "$_ev" = 1 ] && _su="STOPPED${_su#NOT-STARTED}" ;;
     esac
-    # No log to date it by? A boot-triggered failure happened at boot.
-    _since=$_last; _sincewhat=dead
-    if [ -z "$_since" ] && [ -n "$BOOT_EPOCH" ]; then
-      case "$_su" in
-        FAIL*) case "$_tg" in *boot*) _since=$BOOT_EPOCH; _sincewhat='dead since boot' ;; esac ;;
-      esac
+    # The log's mtime is when the service last WROTE, which is not when it
+    # last RAN - a service that runs every minute and speaks once an hour
+    # would otherwise be reported as an hour stale. Named for what it is.
+    if [ -n "$_last" ] && [ "$_last" != "$_lastrun" ]; then
+      _su="$_su LAST-WROTE:$(when "$_last")"
     fi
-    if [ -n "$_since" ]; then
-      _lage=$(when "$_since")
+    # A failure with no log at all cannot be dated from a file - but a
+    # boot-triggered service that is dead now died at boot, and the kernel
+    # knows when that was. Only THAT case is added: when there is a log,
+    # LAST-WROTE already carries its time and saying it twice is noise.
+    if [ -z "$_last" ] && [ -n "$BOOT_EPOCH" ]; then
       case "$_su" in
-        RUN\ *) ;;
-        FAIL*)  _su="$_su, $_sincewhat $_lage" ;;
-        *)      [ "$VRB" = 1 ] && _su="$_su, last $_lage" ;;
+        FAILED*) case "$_tg" in
+                   *boot*) _su="$_su, dead since boot $(when "$BOOT_EPOCH")" ;;
+                 esac ;;
       esac
     fi
     db_row "$_lab" "$_dm" "$_pl" "$_ap" "$_st" "$_tg" "$_su" "$_ei" "$_oi" \
@@ -1204,6 +1228,25 @@ discover_scope() {
     [ "$APPLE_MODE" = only ]    && [ "$_apple" = 0 ] && continue
     db_row "$_l" "$_dom" "" "$_apple" orphan manual - - - "" "" "" "" "" >> "$DB"
   done < "$TMPD/loaded"
+}
+
+# The newest recorded event per label, appended to every row as one more
+# field. The recorder writes into the state directory of the user whose
+# domain the event belongs to, so the file to read follows the DOMAIN, not
+# whoever is running my-lc.
+attach_last_run() {
+  case "$DOMAIN" in
+    system) _ru=root ;;
+    *)      _ru=$(id -un "$DOMAIN_UID" 2>/dev/null) ;;
+  esac
+  [ -n "$_ru" ] || return 1
+  _rlf=$(runlog_file "$_ru")
+  [ -f "$_rlf" ] && [ -r "$_rlf" ] || return 1
+  awk -F"$FS1" -v rf="$_rlf" '
+    FILENAME == rf { if ($1 + 0 > seen[$3]) seen[$3] = $1 + 0; next }
+    { print $0 FS ((($1 in seen)) ? seen[$1] : "") }
+  ' FS="$FS1" OFS="$FS1" "$_rlf" "$1" > "$2" 2>/dev/null || return 1
+  return 0
 }
 
 # "12L 3h" for a non-empty log, "-" for missing/empty.
@@ -1228,8 +1271,9 @@ log_indicator() {
   # 'last' is not decoration: the file's mtime is when the most recent line
   # was written, not when the first error happened, and the bare timestamp
   # read as either.
-  if [ -n "$_mt" ]; then printf '%sL last %s' "$_ln" "$(when "$_mt")"
-  else                   printf '%sL' "$_ln"; fi
+  # No timestamp here: STATUS carries LAST-WROTE, and the same moment in two
+  # columns of the same row is noise. ERR answers "how much", not "when".
+  printf '%sL' "$_ln"
 }
 
 # ======================================================================
@@ -5064,9 +5108,13 @@ t_errcolumn() {
   _sp=$(printf '%s\n' "$_o" | grep -- '-ec-split')
   case "$_sp" in *'merged'*) t_no 'a separate stderr is not called merged' 'no merged' "$_sp" ;;
     *) t_ok 'a separate stderr is not described as merged' ;; esac
-  # the timestamp must say WHICH moment it is: mtime is the LAST write
-  case "$_sp" in *'last '*) t_ok 'the stderr timestamp is labelled as the last write' ;;
-    *) t_no 'timestamp labelled' 'NNL last <when>' "$_sp" ;; esac
+  # the moment belongs to STATUS as LAST-WROTE, and must not be repeated in
+  # ERR: the same timestamp twice in one row is noise, and ERR answers "how
+  # much", not "when"
+  case "$_sp" in *'LAST-WROTE:'*) t_ok 'the write time is in STATUS, named for what it is' ;;
+    *) t_no 'write time in STATUS' 'LAST-WROTE:<when>' "$_sp" ;; esac
+  case "$_sp" in *'L last '*) t_no 'ERR does not repeat the time' 'a bare line count' "$_sp" ;;
+    *) t_ok 'and ERR gives the volume alone, not the time again' ;; esac
 
   # every real stderr is coloured - that IS the case worth looking at
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=always\n' \
