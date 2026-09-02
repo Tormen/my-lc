@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="19916f3"
+SCRIPT_COMMIT="3d6fc9c"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1556,8 +1556,27 @@ runlog_reduce() {
 # stream dies, which is the only way this ends.
 cmd_runlog_collect() {
   [ "$(id -u)" = 0 ] || die "the run recorder needs root: streaming the system log is admin-only"
+  # The pipeline must die WITH this shell. A bootout sends SIGTERM to the job;
+  # dash does not pass that to the children of a pipeline, so 'log stream' and
+  # awk outlive it, keep the label busy, and the bootstrap that follows fails
+  # with launchd's generic 'Input/output error' - which is how a restart left
+  # this service stopped. Signalling the process group takes them all.
   /usr/bin/log stream --level default --style compact --predicate "$(runlog_predicate)" \
-    | runlog_reduce
+    | runlog_reduce &
+  _cpid=$!
+  # Signal the process GROUP, since the pipeline's children are grandchildren
+  # of this shell and 'kill $_cpid' would leave them running. Only when this
+  # shell actually leads the group, though: under launchd it does, but run by
+  # hand from a terminal it does not, and there the group is the caller's.
+  _pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  if [ "$_pgid" = "$$" ]; then
+    trap 'kill -TERM 0 2>/dev/null; exit 0' TERM INT HUP
+  else
+    # killing the subshell alone leaves the pipeline it forked, so take its
+    # children with it
+    trap 'pkill -P "$_cpid" 2>/dev/null; kill -TERM "$_cpid" 2>/dev/null; exit 0' TERM INT HUP
+  fi
+  wait "$_cpid"
 }
 
 runlog_plist_content() {
