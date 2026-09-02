@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="d7b1eb0"
+SCRIPT_COMMIT="807d892"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -187,9 +187,9 @@ STATUS — whatever is relevant for that kind of service
   ok 12x              exited cleanly
   every 3600s / cal   a timer that has not run yet
   waiting             armed on a socket, path or XPC name
-  not-loaded          not in the domain: nothing runs it until a reload
-                      ('start' now, or leave it for the next boot)
-  not-run-yet         loaded and idle - launchd has no run to report yet
+  not-started         nothing runs it until you 'start' it, or until the
+                      next boot if its STATE is @on
+  not-run-yet         started and idle - there is no run to report yet
   !! CANNOT-WORK      it needs a GUI login session, and the system domain
                       has none - so no status of its own is worth showing.
                       'status <label>' gives the evidence; the fix is to
@@ -994,7 +994,7 @@ discover_scope() {
       # Not in the domain at all, so launchd has no pid, no exit code and no
       # armed trigger to report. That is a fact worth stating: '-' reads as
       # "unknown", and this is precisely known.
-      else status = "not-loaded" extra
+      else status = "not-started" extra
 
       # the two fields that need the filesystem are resolved afterwards,
       # and only for the handful of services that actually have paths
@@ -3446,8 +3446,8 @@ t_matrix() {
   # reader to infer it from the STATE and TRIGGER columns.
   t_run "$_lab" stop >/dev/null 2>&1
   case "$(t_run "$_lab" list)" in
-    *'not-loaded'*) t_ok '@on  status         -> says it is not loaded, not "-"' ;;
-    *) t_no '@on status' 'not-loaded' "$(t_run "$_lab" list)" ;;
+    *'not-started'*) t_ok '@on  status         -> says it is not started, not "-"' ;;
+    *) t_no '@on status' 'not-started' "$(t_run "$_lab" list)" ;;
   esac
   t_run "$_lab" start >/dev/null 2>&1
 
@@ -4345,6 +4345,10 @@ t_sessiontrap() {
   : > "$_sd/blank.err"
   t_eq 'and neither is a file that is there and empty' \
     'empty' "$(log_indicator "$_sd/blank.err" say)"
+  case "$(t_run "$SELFTEST_PREFIX-plain" list)" in
+    *loaded*) t_no 'no launchctl words in STATUS' "my-lc's own verbs" 'the word "loaded"' ;;
+    *) t_ok 'STATUS names my-lc verbs, never launchctl vocabulary' ;;
+  esac
   t_eq 'a healthy row keeps the quiet dash' '-' "$(log_indicator '' '')"
   t_eq 'and so does one whose log is merely empty' '-' "$(log_indicator "$_sd/blank.err" '')"
 
