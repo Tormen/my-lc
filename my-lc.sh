@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="b4e8885"
+SCRIPT_COMMIT="d7b1eb0"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -185,12 +185,12 @@ STATUS — whatever is relevant for that kind of service
   run 4d2h pid 1869   running, with uptime
   FAIL 127 x3         last exit code, run count
   ok 12x              exited cleanly
-  every 3600 / cal    a timer that has not run yet
+  every 3600s / cal   a timer that has not run yet
   waiting             armed on a socket, path or XPC name
-  not loaded          not in the domain: nothing runs it until a reload
+  not-loaded          not in the domain: nothing runs it until a reload
                       ('start' now, or leave it for the next boot)
-  not run yet         loaded and idle - launchd has no run to report yet
-  !! CANNOT WORK      it needs a GUI login session, and the system domain
+  not-run-yet         loaded and idle - launchd has no run to report yet
+  !! CANNOT-WORK      it needs a GUI login session, and the system domain
                       has none - so no status of its own is worth showing.
                       'status <label>' gives the evidence; the fix is to
                       move the plist to /Library/LaunchAgents
@@ -983,18 +983,18 @@ discover_scope() {
       } else if (e != "" && e != "-" && e != "0") {
         status = "FAIL " e "\002" extra
       } else if (ld || st == "@off") {
-        if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); status="every " iv extra }
+        if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); status="every " iv "s" extra }
         else if (trig ~ /cal/)   status = "cal" extra
         else if (trig ~ /sock|xpc|watch|queue/) status = "waiting" extra
         else if (e == "0")       status = "ok" extra
         # loaded and armed on nothing launchd can name: it is waiting for a
         # person. '-' left the reader to work that out from two other columns
-        else                     status = "not run yet" extra
+        else                     status = "not-run-yet" extra
       }
       # Not in the domain at all, so launchd has no pid, no exit code and no
       # armed trigger to report. That is a fact worth stating: '-' reads as
       # "unknown", and this is precisely known.
-      else status = "not loaded" extra
+      else status = "not-loaded" extra
 
       # the two fields that need the filesystem are resolved afterwards,
       # and only for the handful of services that actually have paths
@@ -1642,10 +1642,10 @@ SESSION_ERRORS='communicate with a helper application|Connection to window serve
 # record cannot word it differently. The TABLE says only the cause: the exit
 # code is a symptom of it, and a 76-column status cell stretches every other
 # row to no purpose. The RECORD keeps the evidence, where width is free.
-TRAP_STATUS='CANNOT WORK - no GUI session'
+TRAP_STATUS='CANNOT-WORK no-GUI-session'
 trap_status() {
   case "$1" in
-    FAIL*) printf '%s - no GUI session' "$1" ;;
+    FAIL*) printf '%s no-GUI-session' "$1" ;;
     *)     printf '%s' "$TRAP_STATUS" ;;
   esac
 }
@@ -3446,8 +3446,8 @@ t_matrix() {
   # reader to infer it from the STATE and TRIGGER columns.
   t_run "$_lab" stop >/dev/null 2>&1
   case "$(t_run "$_lab" list)" in
-    *'not loaded'*) t_ok '@on  status         -> says it is not loaded, not "-"' ;;
-    *) t_no '@on status' 'not loaded' "$(t_run "$_lab" list)" ;;
+    *'not-loaded'*) t_ok '@on  status         -> says it is not loaded, not "-"' ;;
+    *) t_no '@on status' 'not-loaded' "$(t_run "$_lab" list)" ;;
   esac
   t_run "$_lab" start >/dev/null 2>&1
 
@@ -4383,11 +4383,11 @@ t_sessiontrap() {
   # STATUS has to say it too: the mark alone does not tell you WHY, and
   # 'waiting' on a service that can never run is simply false.
   t_eq 'the record keeps the exit code and adds the cause' \
-    'FAIL 255 - no GUI session' "$(trap_status 'FAIL 255')"
+    'FAIL 255 no-GUI-session' "$(trap_status 'FAIL 255')"
   t_eq 'a trap that has not run yet has no exit code to keep' \
-    'CANNOT WORK - no GUI session' "$(trap_status waiting)"
-  case "$_o" in *'!! CANNOT WORK - no GUI session'*) t_ok 'the table row says the cause, not the symptom' ;;
-    *) t_no 'status text' '!! CANNOT WORK - no GUI session' "$_o" ;; esac
+    'CANNOT-WORK no-GUI-session' "$(trap_status waiting)"
+  case "$_o" in *"!! $TRAP_STATUS"*) t_ok 'the table row says the cause, not the symptom' ;;
+    *) t_no 'status text' "!! $TRAP_STATUS" "$_o" ;; esac
 
   _row notyet.service system /tmp/w.plist - on watch 'waiting' - - /usr/bin/automator '' '' '' '' >> "$_trap"
   _o=$(render_table "$_trap")
@@ -4399,8 +4399,8 @@ t_sessiontrap() {
   _one="$_sd/one.db"
   _row eu.no-panic.trapped system '' - on watch 'FAIL 255 as me' - - /usr/bin/automator me '' '' '' > "$_one"
   _o=$(render_record "$_one" 2>&1)
-  case "$_o" in *'status:'*'FAIL 255 as me - no GUI session'*) t_ok 'the record status line carries the cause' ;;
-    *) t_no 'record status' 'FAIL 255 as me - no GUI session' "$_o" ;; esac
+  case "$_o" in *'status:'*'FAIL 255 as me no-GUI-session'*) t_ok 'the record status line carries the cause' ;;
+    *) t_no 'record status' 'FAIL 255 as me no-GUI-session' "$_o" ;; esac
   case "$_o" in *'needs a GUI login session'*) t_ok 'and the program block says it can never work here' ;;
     *) t_no 'record program note' 'needs a GUI login session' "$_o" ;; esac
 }
