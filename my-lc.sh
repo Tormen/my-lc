@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.2"
-SCRIPT_COMMIT="cb91164"
+SCRIPT_COMMIT="2847483"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -316,10 +316,12 @@ log_size_note() {
   if [ ! -r "$1" ]; then printf 'not readable as %s' "$(id -un)"; return; fi
   _lsz=$(stat -f '%z' "$1" 2>/dev/null)
   [ -n "$_lsz" ] || return 0
-  if [ "$_lsz" = 0 ]; then printf 'empty'; return; fi
   _lmt=$(file_epoch "$1")
   _lwhen=
   [ -n "$_lmt" ] && _lwhen=", last $(when "$_lmt")"
+  # An empty log still dates the run that truncated it - that mtime is
+  # often the only evidence left that the service ran at all.
+  if [ "$_lsz" = 0 ]; then printf 'empty%s' "$_lwhen"; return; fi
   if [ "$_lsz" -le "$BIG_DELTA" ] 2>/dev/null; then
     printf '%sL, %s%s' "$(wc -l < "$1" 2>/dev/null | tr -d ' ')" "$(human_size "$_lsz")" "$_lwhen"
   else
@@ -1256,6 +1258,27 @@ render_table() {
   fi
 }
 
+# What launchd remembers about running this service. It remembers it per
+# LOAD, not for all time, which is why a restart appears to erase the very
+# failure that sent you looking - say so rather than showing a blank.
+show_last_run() {
+  _rn=$(live_runs "$1" "$2")
+  [ -n "$_rn" ] || return 0
+  if [ "$_rn" = 0 ]; then
+    printf '  %-10s %s\n' 'last run:' \
+      'never since it was loaded - launchd forgets runs and exit codes on every (re)load'
+    return 0
+  fi
+  _xc=$(live_lastexit "$1" "$2")
+  case "$_xc" in ''|'(never'*) _xc= ;; esac
+  case "$3" in
+    run\ *) printf '  %-10s %s\n' 'last run:' \
+              "#$_rn is the one running now${_xc:+, the one before it exited $_xc}" ;;
+    *)     printf '  %-10s %s\n' 'last run:' \
+              "#$_rn${_xc:+, exited $_xc}, counting from the last (re)load" ;;
+  esac
+}
+
 # Strip the empty-field marker from a value read out of the DB.
 unmark() { [ "$1" = "$EM" ] || printf '%s' "$1"; }
 
@@ -1265,6 +1288,17 @@ render_record() {
   _tr=$(unmark "$(cut -d"$FS1" -f6 "$1")"); _su=$(unmark "$(cut -d"$FS1" -f7 "$1")")
   _pr=$(unmark "$(cut -d"$FS1" -f10 "$1")"); _us=$(unmark "$(cut -d"$FS1" -f11 "$1")")
   _ef=$(unmark "$(cut -d"$FS1" -f12 "$1")"); _of=$(unmark "$(cut -d"$FS1" -f13 "$1")")
+
+  # The plist on disk says where output WILL go; launchd is still writing
+  # where it was told at bootstrap time. While the service is loaded that
+  # is the answer to 'where is the output', so the loaded paths win, and
+  # the ones from disk are kept only to mark the rows that disagree.
+  _efd=$_ef; _ofd=$_of
+  live_print "$_d" "$_l"
+  if [ -s "$TMPD/print.live" ]; then
+    _ef=$(sed -n 's/^	stderr path = //p' "$TMPD/print.live")
+    _of=$(sed -n 's/^	stdout path = //p' "$TMPD/print.live")
+  fi
 
   printf '%s%s%s\n' "$C_HDR" "$_l" "$C_OFF"
   printf '  %-10s %s\n' 'domain:'  "$_d"
@@ -1301,6 +1335,7 @@ render_record() {
              _long=$(exit_meaning "$_code" long)
              [ -n "$_long" ] && printf '  %-10s %s\n' '' "exit $_code = $_long" ;;
   esac
+  show_last_run "$_d" "$_l" "$_su"
   if [ -n "$_p" ]; then
     printf '  %-10s %s\n' 'plist:' "$_p"
     # When a launch item was installed, and when its definition last
@@ -1402,15 +1437,13 @@ render_record() {
   fi
 
   if [ -n "$_ef" ]; then
-    _n1=$(log_size_note "$_ef")
-    printf '  %-10s %s%s\n' 'stderr:' "$_ef" "$( [ -n "$_n1" ] && printf '   (%s)' "$_n1" )"
+    printf '  %-10s %s%s\n' 'stderr:' "$_ef" "$(log_paren "$_ef" "$_efd")"
   fi
   if [ -n "$_of" ]; then
     if [ "$_of" = "$_ef" ]; then
       printf '  %-10s %s   (the same file)\n' 'stdout:' "$_of"
     else
-      _n2=$(log_size_note "$_of")
-      printf '  %-10s %s%s\n' 'stdout:' "$_of" "$( [ -n "$_n2" ] && printf '   (%s)' "$_n2" )"
+      printf '  %-10s %s%s\n' 'stdout:' "$_of" "$(log_paren "$_of" "$_ofd")"
     fi
   fi
   show_log_delta "$_l" "$_ef" "$_of"
@@ -1420,15 +1453,33 @@ render_record() {
 # plist changes the file, NOT the running service - and nothing tells you
 # they have diverged. These two render the same facts from each side so
 # they can be diffed.
+LIVE_PRINT_KEY=
+# 'launchctl print <domain>/<label>' is not cheap, and one record asks it
+# three separate questions. Fetch it once per label and cache it; the file
+# is empty when the label is not loaded.
+live_print() {
+  if [ "$1/$2" != "$LIVE_PRINT_KEY" ]; then
+    launchctl print "$1/$2" > "$TMPD/print.live" 2>/dev/null || : > "$TMPD/print.live"
+    LIVE_PRINT_KEY="$1/$2"
+  fi
+}
+
+# runs, and the exit code of the run before this one. BOTH are properties of
+# the current LOAD: bootout discards them, so a restart resets the count to
+# zero and clears the failure that made you look.
+live_runs()      { live_print "$1" "$2"; awk '/^\truns = /           { print $3; exit }' "$TMPD/print.live"; }
+live_lastexit()  { live_print "$1" "$2"; awk '/^\tlast exit code = / { print $5; exit }' "$TMPD/print.live"; }
+
 defn_from_launchctl() {
-  launchctl print "$1/$2" 2>/dev/null | awk '
+  live_print "$1" "$2"
+  awk '
     /^\tprogram = /      { sub(/^\tprogram = /, ""); print "program " $0; next }
     /^\targuments = \{/  { inargs = 1; next }
     inargs && /^\t\}/    { inargs = 0; next }
     inargs                { sub(/^\t\t/, ""); print "argument " $0; next }
     /^\tstdout path = /  { sub(/^\tstdout path = /, ""); print "stdout " $0; next }
     /^\tstderr path = /  { sub(/^\tstderr path = /, ""); print "stderr " $0; next }
-  '
+  ' "$TMPD/print.live"
 }
 
 defn_from_plist() {
@@ -1454,11 +1505,22 @@ defn_from_plist() {
 }
 
 
+# The parenthetical after a log path: what the file holds, prefixed with a
+# warning when the path shown is the one launchd is using and the plist on
+# disk names another. $1 is the path shown, $2 the path the plist gives.
+log_paren() {
+  _lp1=$(log_size_note "$1")
+  [ "$1" = "$2" ] || _lp1="as loaded${_lp1:+; $_lp1}"
+  [ -n "$_lp1" ] && printf '   (%s)' "$_lp1"
+  return 0
+}
+
 # Report how the running service differs from its plist, if at all.
 show_loaded_diff() {
   _dl=$1; _dd=$2; _dp=$3
   [ -n "$_dp" ] || return 0
-  launchctl print "$_dd/$_dl" >/dev/null 2>&1 || return 0
+  live_print "$_dd" "$_dl"
+  [ -s "$TMPD/print.live" ] || return 0
   defn_from_launchctl "$_dd" "$_dl" | sort > "$TMPD/defn.loaded"
   defn_from_plist "$_dp"            | sort > "$TMPD/defn.disk"
   # A plist my-lc cannot read yields nothing, which would look like a total
@@ -3606,7 +3668,10 @@ t_logsizes() {
     '3L, 6B, last '*) t_ok 'a small log gives lines, bytes and when it was last written' ;;
     *) t_no 'small log note' '3L, 6B, last <when>' "$(log_size_note "$_lg/three")" ;;
   esac
-  t_eq 'an empty log says so'              'empty'  "$(log_size_note "$_lg/empty")"
+  case "$(log_size_note "$_lg/empty")" in
+    'empty, last '*) t_ok 'an empty log says so, and still dates the run that emptied it' ;;
+    *) t_no 'empty log note' 'empty, last <when>' "$(log_size_note "$_lg/empty")" ;;
+  esac
   t_eq 'a missing log says so'             'does not exist yet' "$(log_size_note "$_lg/nope")"
   t_eq 'a directory is not a log'          'not a regular file' "$(log_size_note "$_lg")"
   # counting lines in a huge log means reading it all, so past BIG_DELTA it
@@ -3737,6 +3802,44 @@ t_loadeddiff() {
   _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
   case "$_o" in *'matches the plist'*) t_ok 'and --go applies it, so they match again' ;;
     *) t_no 'edit --go applied' 'matches the plist on disk' "$_o" ;; esac
+
+  # A plist edited after bootstrap moves the log paths on DISK only: launchd
+  # keeps writing where it was told. The record must answer 'where is the
+  # output going', not 'where will it go after a restart'.
+  _llab="$SELFTEST_PREFIX-livelog"
+  t_guard "$_llab"
+  _lw() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$_llab"
+      printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>exit 3</string></array>\n'
+      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$1"
+      printf '  <key>RunAtLoad</key><true/>\n'
+      printf '</dict></plist>\n'; } > "$_dd2/$_llab.plist"
+  }
+  _lw "$_dd2/live.err"
+  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_llab" enable --now >/dev/null 2>&1
+  sleep 1
+  _lw "$_dd2/afterwards.err"
+  _o=$(MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_llab" 2>&1)
+  case "$_o" in *"stderr:    $_dd2/live.err"*) t_ok 'the log path shown is the one launchd is USING' ;;
+    *) t_no 'live log path' "stderr: $_dd2/live.err" "$_o" ;; esac
+  case "$_o" in *'as loaded'*) t_ok 'and it is marked as coming from the loaded definition' ;;
+    *) t_no 'live path marked' 'as loaded' "$_o" ;; esac
+  case "$_o" in *"stderr:    $_dd2/afterwards.err"*)
+      t_no 'disk path not shown as the log' 'no stderr row for afterwards.err' "$_o" ;;
+    *) t_ok 'the path the plist has since been edited to is not offered as the log' ;; esac
+  case "$_o" in *'on disk: stderr '*'afterwards.err'*)
+      t_ok 'the edited path is still visible, in the loaded-vs-disk diff where it belongs' ;;
+    *) t_no 'edited path in the diff' 'on disk: stderr ...afterwards.err' "$_o" ;; esac
+  case "$_o" in *'last run:'*'#1'*'exited 3'*) t_ok 'the last run and its exit code are on the record' ;;
+    *) t_no 'last run line' 'last run: #1, exited 3' "$_o" ;; esac
+  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_llab" restart >/dev/null 2>&1
+  _o=$(MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_llab" 2>&1)
+  case "$_o" in *"stderr:    $_dd2/afterwards.err"*) t_ok 'a restart makes the edited path the live one' ;;
+    *) t_no 'restart applies path' "stderr: $_dd2/afterwards.err" "$_o" ;; esac
+
   cleanup_fixtures
 
   # An edit that CHANGES THE PROGRAM must be acted on with the new value.
