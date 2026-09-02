@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="fcd2224"
+SCRIPT_COMMIT="c0f9a59"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -322,13 +322,17 @@ state_render() {
   esac
 }
 
-# The one cell worth colouring, by the same rule as the table: a failure or a
-# broken program, never an ordinary status.
+# STATUS carries the outcome, so it carries the colour: green for a run that
+# ended well, red for one that did not, yellow for one still going. Anything
+# that only describes a state - NOT-RUN, NOT-STARTED, STOPPED - stays plain,
+# or the eye has nothing left to land on.
 status_colour() {
   case "$1" in
+    RUNNING*) printf '%s' "$C_WARN" ;;
+    OK*)      printf '%s' "$C_ON" ;;
+    FAILED*|CANNOT-WORK*) printf '%s' "$C_BAD" ;;
     *'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
       printf '%s' "$C_BAD" ;;
-    FAIL*) printf '%s' "$C_BAD" ;;
   esac
 }
 
@@ -416,6 +420,10 @@ human_age() {
   # seconds -> compact 4d2h / 3h12m / 45m / 12s
   _ha=$1
   [ -z "$_ha" ] && { printf '?'; return; }
+  # A process start read from ps can land a few seconds ahead of now - the
+  # start times are calibrated against pid 1, and that calibration is not
+  # exact. An age is never negative, so clamp rather than print '[-14s]'.
+  [ "$_ha" -lt 0 ] 2>/dev/null && _ha=0
   if   [ "$_ha" -ge 86400 ]; then printf '%dd%dh' $((_ha/86400)) $(((_ha%86400)/3600))
   elif [ "$_ha" -ge 3600  ]; then printf '%dh%dm' $((_ha/3600))  $(((_ha%3600)/60))
   elif [ "$_ha" -ge 60    ]; then printf '%dm'    $((_ha/60))
@@ -1168,7 +1176,7 @@ discover_scope() {
     # is not running it is the fact worth showing. A running service proves
     # its program works, so it is not re-checked there.
     case "$_su" in
-      RUN\ *) ;;
+      RUNNING*) ;;
       *) if [ -n "$_pr" ]; then
            _pw=
            case "$_dm" in
@@ -1278,7 +1286,18 @@ discover_scope() {
     _apple=0; is_apple "" "$_l" && _apple=1
     [ "$APPLE_MODE" = exclude ] && [ "$_apple" = 1 ] && continue
     [ "$APPLE_MODE" = only ]    && [ "$_apple" = 0 ] && continue
-    db_row "$_l" "$_dom" "" "$_apple" orphan manual - - - "" "" "" "" "" >> "$DB"
+    # An orphan is LOADED, so launchd knows as much about its runs as about
+    # any other service - the loaded set carries its pid and last exit code.
+    # It was the last row that still printed a bare '-' for STATUS.
+    _osu=NOT-RUN
+    if [ -n "$_p" ] && [ "$_p" != 0 ] && [ "$_p" != '-' ]; then
+      _osu="RUNNING pid $_p"
+    elif [ -n "$_x" ] && [ "$_x" != '-' ]; then
+      _om=$(exit_meaning "$_x" short)
+      if [ "$_x" = 0 ]; then _osu="OK [0]"
+      else                   _osu="FAILED [$_x${_om:+ $_om}]"; fi
+    fi
+    db_row "$_l" "$_dom" "" "$_apple" orphan manual "$_osu" - - "" "" "" "" "" >> "$DB"
   done < "$TMPD/loaded"
 }
 
@@ -1833,12 +1852,7 @@ render_table() {
     # A failure or a broken program is the most actionable cell on the
     # screen; it should not render like an ordinary status. Padding is
     # computed from the uncoloured text, since escape bytes count in %-*s.
-    _sc=
-    case "$_su" in
-      *'program MISSING'*|*'program EMPTY'*|*'program NOT EXECUTABLE'*|*'program is a DIRECTORY'*)
-        _sc=$C_BAD ;;
-      FAIL*) _sc=$C_BAD ;;
-    esac
+    _sc=$(status_colour "$_su")
     [ -n "$_tsu" ] && _sc=$C_BAD
     if [ -n "$_sc" ]; then
       _spad=$(( _ws - ${#_su} )); [ "$_spad" -lt 0 ] && _spad=0
@@ -1884,7 +1898,7 @@ show_last_run() {
   _xc=$(live_lastexit "$1" "$2")
   case "$_xc" in ''|'(never'*) _xc= ;; esac
   case "$3" in
-    RUN\ *) printf '  %-10s %s\n' 'last run:' \
+    RUNNING*) printf '  %-10s %s\n' 'last run:' \
               "#$_rn is the one running now${_xc:+, the one before it exited $_xc}" ;;
     *)     printf '  %-10s %s\n' 'last run:' \
               "#$_rn${_xc:+, exited $_xc}, counting from the last (re)load" ;;
@@ -1939,7 +1953,7 @@ render_record() {
   fi
   if [ -n "$_rl" ]; then
     case "$_su" in
-      RUN\ *) printf '  %-10s %s\n' 'last log:' \
+      RUNNING*) printf '  %-10s %s\n' 'last log:' \
                 "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
       *)      printf '  %-10s %s\n' 'dead since:' \
                 "$(date -r "$_rl" '+%Y-%m-%d %H:%M:%S') ($(human_age $(( $(now_epoch) - _rl )) ) ago)" ;;
@@ -5169,8 +5183,10 @@ t_runlog() {
     *"$C_ON"*) t_ok 'the record paints STATE like the table does' ;;
     *) t_no 'state colour' 'a colour escape' "$(state_render on)" ;;
   esac
-  t_eq 'and a failure is the one status worth colouring' "$C_BAD" "$(status_colour 'FAIL 1')"
-  t_eq 'an ordinary one is left alone'                   ''       "$(status_colour 'OK')"
+  t_eq 'a failure is red'                    "$C_BAD"  "$(status_colour 'FAILED [1]')"
+  t_eq 'a clean exit is green'                "$C_ON"   "$(status_colour 'OK [0]')"
+  t_eq 'a run still going is yellow'          "$C_WARN" "$(status_colour 'RUNNING SINCE:x')"
+  t_eq 'and a mere state is left plain'       ''        "$(status_colour 'NOT-RUN')"
   C_ON=$C_SAVE; C_OFF=$C_OFF_SAVE
 
   # the plist my-lc writes for itself must be a plist launchd accepts
@@ -5183,6 +5199,17 @@ t_runlog() {
     "$(plutil -extract ProgramArguments.0 raw -o - "$_rl/p.plist" 2>/dev/null)"
   t_eq 'with the collect verb, so the daemon IS my-lc' '--runlog-collect' \
     "$(plutil -extract ProgramArguments.1 raw -o - "$_rl/p.plist" 2>/dev/null)"
+
+  # an orphan is loaded, so it has a status like anything else - it was the
+  # last row in the tool that printed a bare '-'
+  _orph=$(awk -F"$FS1" '$5 == "orphan" { print $7 }' "$DB" | sort -u)
+  if [ -z "$_orph" ]; then t_skip 'orphan STATUS' 'no orphans on this machine'
+  else
+    case "$_orph" in
+      -|*"$(printf '\n')-"*|-"$(printf '\n')"*) t_no 'orphan STATUS' 'a word, never a dash' "$_orph" ;;
+      *) t_ok 'an orphan row carries a status like any other' ;;
+    esac
+  fi
 
   # 'install' on an installed recorder must REPORT, not re-install: a daemon
   # that is up while collecting nothing looks healthy from the pid alone.
