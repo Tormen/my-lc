@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="b28b21d"
+SCRIPT_COMMIT="de4b4b7"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1244,7 +1244,10 @@ render_table() {
   done < "$_f"
   # STATUS is sized from what is DISPLAYED: a trapped row shows the short
   # cause instead of its own text, so its text must not widen the column.
-  _ws=$(awk -F"$FS1" 'NR==FNR { t[$1]=1; next }
+  # NOT the NR==FNR idiom: with an EMPTY first file it stays true for the
+  # whole second one, which put every row in t and collapsed STATUS to its
+  # minimum on every listing with nothing flagged.
+  _ws=$(awk -F"$FS1" -v tf="$TMPD/traps" 'FILENAME == tf { t[$1]=1; next }
                       { s = ($1 in t) ? "" : $7; if (length(s)>m) m=length(s) }
                       END { print (m<6?6:m) }' "$TMPD/traps" "$_f")
   [ "$_wtrap" -gt "$_ws" ] && _ws=$_wtrap
@@ -4305,6 +4308,15 @@ t_sessiontrap() {
     *) t_ok 'a listing with nothing to flag pays nothing for the gutter' ;; esac
   case "$_o" in *'TRIGGER STATUS'*) t_ok 'and STATUS keeps its place in the header' ;;
     *) t_no 'header unchanged' 'TRIGGER STATUS' "$_o" ;; esac
+  # STATUS is sized from the rows that KEEP their text. With nothing flagged
+  # that is all of them, and an empty traps file must not change that.
+  _wide="$_sd/wide.db"
+  _row a.service system /a.plist - on boot 'run 2026-07-06_1216 pid 294' - - /bin/sh '' '' '' '' > "$_wide"
+  _row b.service system /b.plist - on boot 'ok' - - /bin/sh '' '' '' '' >> "$_wide"
+  case "$(render_table "$_wide")" in
+    *'run 2026-07-06_1216 pid 294 -'*) t_ok 'an unflagged listing still sizes STATUS from its own rows' ;;
+    *) t_no 'status width' 'the widest status sets the column' "$(render_table "$_wide")" ;;
+  esac
   _o=$(render_table "$_trap")
   case "$_o" in *"!! $TRAP_STATUS"*) t_ok 'a trapped row is marked !! and says why' ;;
     *) t_no 'row marked' "!! $TRAP_STATUS" "$_o" ;; esac
