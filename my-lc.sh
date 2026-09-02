@@ -13,8 +13,8 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0.3"
-SCRIPT_COMMIT="f4a269e"
+SCRIPT_VERSION="v1.0.4"
+SCRIPT_COMMIT="36b5a68"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -166,7 +166,7 @@ STATE — three independent truths in one column
 
 TRIGGER — why it would run, read from the plist
   boot     RunAtLoad            keep     KeepAlive
-  every<N> StartInterval        cal      StartCalendarInterval
+  every<N>s StartInterval       cal      StartCalendarInterval
   watch    WatchPaths           queue    QueueDirectories
   sock     Sockets              xpc      MachServices
   login    LimitLoadToSessionType        manual  none of the above
@@ -182,17 +182,17 @@ TRIGGER — why it would run, read from the plist
   directory is ?, never a false MISSING.
 
 STATUS — whatever is relevant for that kind of service
-  run 4d2h pid 1869   running, with uptime
+  RUN 4d2h pid 1869   running, with uptime
   FAIL 127 x3         last exit code, run count
   OK                  exited cleanly
-  every 3600s / cal   a timer that has not run yet
-  waiting             armed on a socket, path or XPC name
-  not-started         nothing runs it until you 'start' it, or until the
+  EVERY 3600s / CAL   a timer that has not run yet
+  WAITING             armed on a socket, path or XPC name
+  NOT-STARTED         nothing runs it until you 'start' it, or until the
                       next boot if its STATE is @on
-  stopped             the same, but it demonstrably ran since this boot -
+  STOPPED             the same, but it demonstrably ran since this boot -
                       it wrote a log, or my-lc started it - so it was
                       started and then stopped
-  not-run-yet         started and idle - there is no run to report yet
+  NOT-RUN             started and idle - there is no run to report yet
   !! CANNOT-WORK      it needs a GUI login session, and the system domain
                       has none - so no status of its own is worth showing.
                       'status <label>' gives the evidence; the fix is to
@@ -577,7 +577,7 @@ scan_plists() {
       t=""
       if (boot)   t=t (t==""?"":"+") "boot"
       if (keep)   t=t (t==""?"":"+") "keep"
-      if (iv!="") t=t (t==""?"":"+") "every" iv
+      if (iv!="") t=t (t==""?"":"+") "every" iv "s"
       if (cal)    t=t (t==""?"":"+") "cal"
       if (hw)     t=t (t==""?"":"+") "watch"
       if (hq)     t=t (t==""?"":"+") "queue"
@@ -981,23 +981,23 @@ discover_scope() {
 
       e = (lab in lec) ? lec[lab] : ""
       if (p != "") {
-        status = (p in start) ? ("run \003" start[p] " pid " p extra) \
-                              : ("run pid " p extra)
+        status = (p in start) ? ("RUN \003" start[p] " pid " p extra) \
+                              : ("RUN pid " p extra)
       } else if (e != "" && e != "-" && e != "0") {
         status = "FAIL " e "\002" extra
       } else if (ld || st == "@off") {
-        if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); status="every " iv "s" extra }
-        else if (trig ~ /cal/)   status = "cal" extra
-        else if (trig ~ /sock|xpc|watch|queue/) status = "waiting" extra
+        if (trig ~ /every/)      { iv=trig; sub(/.*every/,"",iv); sub(/\+.*/,"",iv); sub(/s$/,"",iv); status="EVERY " iv "s" extra }
+        else if (trig ~ /cal/)   status = "CAL" extra
+        else if (trig ~ /sock|xpc|watch|queue/) status = "WAITING" extra
         else if (e == "0")       status = "OK" extra
         # loaded and armed on nothing launchd can name: it is waiting for a
         # person. '-' left the reader to work that out from two other columns
-        else                     status = "not-run-yet" extra
+        else                     status = "NOT-RUN" extra
       }
       # Not in the domain at all, so launchd has no pid, no exit code and no
       # armed trigger to report. That is a fact worth stating: '-' reads as
       # "unknown", and this is precisely known.
-      else status = "not-started" extra
+      else status = "NOT-STARTED" extra
 
       # the two fields that need the filesystem are resolved afterwards,
       # and only for the handful of services that actually have paths
@@ -1046,7 +1046,7 @@ discover_scope() {
     # is not running it is the fact worth showing. A running service proves
     # its program works, so it is not re-checked there.
     case "$_su" in
-      run\ *) ;;
+      RUN\ *) ;;
       *) if [ -n "$_pr" ]; then
            _pw=
            case "$_dm" in
@@ -1112,14 +1112,14 @@ discover_scope() {
     # both, say the neutral thing. This can only ever UNDER-claim: a service
     # stopped without ever writing a log still reads not-started.
     case "$_su" in
-      not-started*)
+      NOT-STARTED*)
         _ev=0
         [ -n "$_last" ] && [ -n "$BOOT_EPOCH" ] && [ "$_last" -gt "$BOOT_EPOCH" ] 2>/dev/null && _ev=1
         if [ "$_ev" = 0 ]; then
           _mk=$(file_epoch "$(mark_file "$_lab")")
           [ -n "$_mk" ] && [ -n "$BOOT_EPOCH" ] && [ "$_mk" -gt "$BOOT_EPOCH" ] 2>/dev/null && _ev=1
         fi
-        [ "$_ev" = 1 ] && _su="stopped${_su#not-started}" ;;
+        [ "$_ev" = 1 ] && _su="STOPPED${_su#NOT-STARTED}" ;;
     esac
     # No log to date it by? A boot-triggered failure happened at boot.
     _since=$_last; _sincewhat=dead
@@ -1131,7 +1131,7 @@ discover_scope() {
     if [ -n "$_since" ]; then
       _lage=$(when "$_since")
       case "$_su" in
-        run\ *) ;;
+        RUN\ *) ;;
         FAIL*)  _su="$_su, $_sincewhat $_lage" ;;
         *)      [ "$VRB" = 1 ] && _su="$_su, last $_lage" ;;
       esac
@@ -3439,8 +3439,8 @@ t_matrix() {
   # never started in this boot, and nothing has written a log: the neutral
   # word is the only true one
   case "$(t_run "$_lab" list)" in
-    *not-started*) t_ok '@on  status         -> not-started, with no evidence either way' ;;
-    *) t_no 'untouched @on status' 'not-started' "$(t_run "$_lab" list)" ;;
+    *NOT-STARTED*) t_ok '@on  status         -> NOT-STARTED, with no evidence either way' ;;
+    *) t_no 'untouched @on status' 'NOT-STARTED' "$(t_run "$_lab" list)" ;;
   esac
 
   t_run "$_lab" disable >/dev/null 2>&1
@@ -3473,8 +3473,8 @@ t_matrix() {
   # worse answer than the one the evidence supports
   t_run "$_lab" stop >/dev/null 2>&1
   case "$(t_run "$_lab" list)" in
-    *stopped*) t_ok 'on   + stop           -> stopped, because it demonstrably ran' ;;
-    *) t_no 'stopped after a stop' 'stopped' "$(t_run "$_lab" list)" ;;
+    *STOPPED*) t_ok 'on   + stop           -> STOPPED, because it demonstrably ran' ;;
+    *) t_no 'stopped after a stop' 'STOPPED' "$(t_run "$_lab" list)" ;;
   esac
   t_run "$_lab" start >/dev/null 2>&1
 
@@ -4337,11 +4337,11 @@ t_sessiontrap() {
 
   # B: known from the plist alone, before it has ever run
   t_eq 'automator as a daemon is a trap on sight' \
-    'static' "$(session_trap system /usr/bin/automator waiting '')"
+    'static' "$(session_trap system /usr/bin/automator WAITING '')"
   t_eq 'and so is open' \
-    'static' "$(session_trap system /usr/bin/open waiting '')"
+    'static' "$(session_trap system /usr/bin/open WAITING '')"
   t_eq 'the same program as an AGENT is fine - it has a session' \
-    '' "$(session_trap gui /usr/bin/automator waiting '')"
+    '' "$(session_trap gui /usr/bin/automator WAITING '')"
   t_eq 'an ordinary daemon program is not a trap' \
     '' "$(session_trap system /bin/sh 'FAIL 1' '')"
 
@@ -4359,7 +4359,7 @@ t_sessiontrap() {
   t_eq 'an unrelated failure is left alone' \
     '' "$(session_trap system /usr/bin/foo 'FAIL 1' "$_sd/plain.err")"
   t_eq 'the same stderr on a service that has NOT failed says nothing' \
-    '' "$(session_trap system /usr/bin/foo waiting "$_sd/gui.err")"
+    '' "$(session_trap system /usr/bin/foo WAITING "$_sd/gui.err")"
   t_eq 'and never in the agent domain' \
     '' "$(session_trap gui /usr/bin/foo 'FAIL 255' "$_sd/gui.err")"
 
@@ -4412,18 +4412,18 @@ t_sessiontrap() {
     *) t_no 'unflagged row padded' 'manual     ok' "$_o" ;; esac
 
   # STATUS has to say it too: the mark alone does not tell you WHY, and
-  # 'waiting' on a service that can never run is simply false.
+  # 'WAITING' on a service that can never run is simply false.
   t_eq 'the record keeps the exit code and adds the cause' \
     'FAIL 255 no-GUI-session' "$(trap_status 'FAIL 255')"
   t_eq 'a trap that has not run yet has no exit code to keep' \
-    'CANNOT-WORK no-GUI-session' "$(trap_status waiting)"
+    'CANNOT-WORK no-GUI-session' "$(trap_status WAITING)"
   case "$_o" in *"!! $TRAP_STATUS"*) t_ok 'the table row says the cause, not the symptom' ;;
     *) t_no 'status text' "!! $TRAP_STATUS" "$_o" ;; esac
 
-  _row notyet.service system /tmp/w.plist - on watch 'waiting' - - /usr/bin/automator '' '' '' '' >> "$_trap"
+  _row notyet.service system /tmp/w.plist - on watch 'WAITING' - - /usr/bin/automator '' '' '' '' >> "$_trap"
   _o=$(render_table "$_trap")
-  case "$_o" in *waiting*) t_no 'waiting replaced' "no 'waiting' on a trapped row" "$_o" ;;
-    *) t_ok "and a trap that never ran does not claim to be 'waiting'" ;; esac
+  case "$_o" in *WAITING*) t_no 'WAITING replaced' "no 'WAITING' on a trapped row" "$_o" ;;
+    *) t_ok "and a trap that never ran does not claim to be 'WAITING'" ;; esac
   SCOPE=$SCOPE_SAVE
 
   # and the record says it in both places it matters
