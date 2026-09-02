@@ -257,7 +257,8 @@ a way to learn the raw commands.
              on disk: argument sleep 999
 ```
 
-  `edit` shows the same diff on leaving the editor and then offers exactly
+  `edit` re-reads the plist after you save, so a change to the program is
+  acted on with the NEW value, and shows the same diff on leaving the editor and then offers exactly
   the steps that service needs — restart to apply it now, enable so every
   boot picks it up, or both — doing nothing without the word `go`.
 - **The plist itself is checked.** launchd refuses a plist that is group- or

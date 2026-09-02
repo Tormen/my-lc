@@ -13,8 +13,8 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0.1"
-SCRIPT_COMMIT="e22e655"
+SCRIPT_VERSION="v1.0.2"
+SCRIPT_COMMIT="cb91164"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -317,10 +317,13 @@ log_size_note() {
   _lsz=$(stat -f '%z' "$1" 2>/dev/null)
   [ -n "$_lsz" ] || return 0
   if [ "$_lsz" = 0 ]; then printf 'empty'; return; fi
+  _lmt=$(file_epoch "$1")
+  _lwhen=
+  [ -n "$_lmt" ] && _lwhen=", last $(when "$_lmt")"
   if [ "$_lsz" -le "$BIG_DELTA" ] 2>/dev/null; then
-    printf '%sL, %s' "$(wc -l < "$1" 2>/dev/null | tr -d ' ')" "$(human_size "$_lsz")"
+    printf '%sL, %s%s' "$(wc -l < "$1" 2>/dev/null | tr -d ' ')" "$(human_size "$_lsz")" "$_lwhen"
   else
-    printf '%s, too big to count cheaply' "$(human_size "$_lsz")"
+    printf '%s, too big to count cheaply%s' "$(human_size "$_lsz")" "$_lwhen"
   fi
 }
 
@@ -2085,6 +2088,22 @@ v_delete() {
   msg "$_label is now stopped, disabled, and its plist is out of the way"
 }
 
+# Re-read the fields the action verbs use, straight from the plist. After an
+# edit the record built at startup is STALE: 'restart' went on using the old
+# program path and refused to start a service whose plist had just been
+# corrected - after already stopping it.
+refresh_from_plist() {
+  [ -n "$1" ] && [ -r "$1" ] || return 0
+  _np=$(plutil -extract Program raw -o - "$1" 2>/dev/null) \
+    || _np=$(plutil -extract ProgramArguments.0 raw -o - "$1" 2>/dev/null) || _np=
+  [ -n "$_np" ] && _pr=$_np
+  _ne=$(plutil -extract StandardErrorPath raw -o - "$1" 2>/dev/null) || _ne=
+  _no=$(plutil -extract StandardOutPath  raw -o - "$1" 2>/dev/null) || _no=
+  _nu=$(plutil -extract UserName         raw -o - "$1" 2>/dev/null) || _nu=
+  _ef=$_ne; _of=$_no; _us=$_nu
+  return 0
+}
+
 # Open the plist in the user's editor, then check what came back.
 v_edit() {
   [ -n "$_plist" ] || { err "$_label has no plist on disk to edit"; return 0; }
@@ -2127,6 +2146,8 @@ v_edit() {
     return 0
   fi
   msg "saved; it is a valid launchd job"
+  # Everything below acts on the NEW definition, so stop using the stale one.
+  refresh_from_plist "$_plist"
   _newlab=$(plutil -extract Label raw -o - "$_plist" 2>/dev/null)
   [ -n "$_newlab" ] && [ "$_newlab" != "$_label" ] && \
     msg "note: the Label is now '$_newlab' - the old service keeps the old name until reloaded"
@@ -3031,6 +3052,16 @@ t_static() {
     if dash -n "$0" 2>"$TMPD/dash.log"; then t_ok 'dash -n parses'
     else t_no 'dash -n parses' 'clean' "$(cat "$TMPD/dash.log")"; fi
   else t_skip 'dash -n' 'not installed'; fi
+  # Three times, an edit removed a test function and left its call behind:
+  # run_tests then failed silently to stderr and the section simply vanished
+  # from the report, with the total still looking healthy.
+  _missing=0
+  awk '/^run_tests\(\) \{/,/^\}/' "$0" | awk '$1 ~ /^t_[a-z]+$/ { print $1 }' > "$TMPD/called"
+  while IFS= read -r _fn; do
+    [ -n "$_fn" ] || continue
+    grep -q "^$_fn() {" "$0" || { printf '  called but not defined: %s\n' "$_fn"; _missing=$((_missing + 1)); }
+  done < "$TMPD/called"
+  t_eq 'every test function run_tests calls is defined' 0 "$_missing"
   "$0" -h >/dev/null 2>&1;    t_eq '-h exits 0' 0 $?
   "$0" --help >/dev/null 2>&1; t_eq '--help exits 0' 0 $?
   t_eq 'usage line follows the convention' 'usage: my-lc [OPTIONS] [FILTER ...] [VERB]' \
@@ -3571,7 +3602,10 @@ t_logsizes() {
   _lg="$TMPD/lsz"; mkdir -p "$_lg"
   printf 'a\nb\nc\n' > "$_lg/three"
   : > "$_lg/empty"
-  t_eq 'a small log gives lines and bytes' '3L, 6B' "$(log_size_note "$_lg/three")"
+  case "$(log_size_note "$_lg/three")" in
+    '3L, 6B, last '*) t_ok 'a small log gives lines, bytes and when it was last written' ;;
+    *) t_no 'small log note' '3L, 6B, last <when>' "$(log_size_note "$_lg/three")" ;;
+  esac
   t_eq 'an empty log says so'              'empty'  "$(log_size_note "$_lg/empty")"
   t_eq 'a missing log says so'             'does not exist yet' "$(log_size_note "$_lg/nope")"
   t_eq 'a directory is not a log'          'not a regular file' "$(log_size_note "$_lg")"
@@ -3644,6 +3678,95 @@ t_plistchecks() {
   _o=$(_s "$_l3")
   case "$_o" in *'the filename says'*) t_ok 'a Label that disagrees with the filename is pointed out' ;;
     *) t_no 'label mismatch' 'the filename says ...' "$_o" ;; esac
+}
+
+t_loadeddiff() {
+  t_sec 'R. the running definition versus the plist on disk'
+  # every loaded service on THIS machine must compare equal: a false
+  # positive here would cry wolf on every status
+  _bad=0; _checked=0
+  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
+    [ "$_st" = on ] || continue
+    [ -n "$_p" ] && [ "$_p" != "$EM" ] || continue
+    _checked=$((_checked + 1))
+    case "$(show_loaded_diff "$_l" "$_d" "$_p")" in
+      *DIFFERS*) _bad=$((_bad + 1)); printf '        %s\n' "$_l" ;;
+    esac
+  done < "$DB"
+  if [ "$_checked" = 0 ]; then t_skip 'loaded-vs-disk on real services' 'nothing loaded to compare'
+  else t_eq "no false differences across $_checked loaded services" 0 "$_bad"; fi
+
+  # and a real change must be detected
+  _dd2="$TMPD/ldiff"; mkdir -p "$_dd2/st"
+  _lab="$SELFTEST_PREFIX-ldiff"
+  t_guard "$_lab"
+  _w() {
+    { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+      printf '<plist version="1.0"><dict>\n'
+      printf '  <key>Label</key><string>%s</string>\n' "$_lab"
+      printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep %s</string></array>\n' "$1"
+      printf '  <key>RunAtLoad</key><true/>\n'
+      printf '</dict></plist>\n'; } > "$_dd2/$_lab.plist"
+  }
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_dd2" "$_dd2" "$_dd2" > "$_dd2/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  _w 300
+  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" enable --now >/dev/null 2>&1
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *'matches the plist'*) t_ok 'an untouched service matches' ;;
+    *) t_no 'untouched matches' 'matches the plist on disk' "$_o" ;; esac
+
+  _w 999
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *DIFFERS*) t_ok 'an edited plist is detected as different' ;;
+    *) t_no 'edit detected' 'DIFFERS from the plist on disk' "$_o" ;; esac
+  case "$_o" in *'running: argument sleep 300'*) t_ok 'the diff shows what is RUNNING' ;;
+    *) t_no 'diff shows running side' 'running: argument sleep 300' "$_o" ;; esac
+  case "$_o" in *'on disk: argument sleep 999'*) t_ok 'the diff shows what is ON DISK' ;;
+    *) t_no 'diff shows disk side' 'on disk: argument sleep 999' "$_o" ;; esac
+
+  # edit offers to apply it, and --go carries it out
+  # shellcheck disable=SC2016  # $1 belongs to the generated script
+  printf '#!/bin/sh\nsed -i "" "s|sleep 999|sleep 555|" "$1"\n' > "$_dd2/ed"
+  chmod 755 "$_dd2/ed"
+  _o=$(EDITOR="$_dd2/ed" MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_lab" edit --go 2>&1)
+  case "$_o" in *'apply it?'*'restart'*) t_ok 'edit proposes the action the service needs' ;;
+    *) t_no 'edit proposes' 'apply it? ... restart' "$_o" ;; esac
+  _o=$(show_loaded_diff "$_lab" "$DOMAIN" "$_dd2/$_lab.plist")
+  case "$_o" in *'matches the plist'*) t_ok 'and --go applies it, so they match again' ;;
+    *) t_no 'edit --go applied' 'matches the plist on disk' "$_o" ;; esac
+  cleanup_fixtures
+
+  # An edit that CHANGES THE PROGRAM must be acted on with the new value.
+  # The record is built at startup, so restart went on using the OLD path,
+  # refused to start a service whose plist had just been corrected - and had
+  # already stopped it. The worst possible outcome of an edit.
+  _sd3="$_dd2/stale"; mkdir -p "$_sd3/new" "$_sd3/old"
+  _slab="$SELFTEST_PREFIX-stale"
+  t_guard "$_slab"
+  printf '#!/bin/sh\nsleep 300\n' > "$_sd3/new/p.sh"; chmod 755 "$_sd3/new/p.sh"
+  cp "$_sd3/new/p.sh" "$_sd3/old/p.sh"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_slab"
+    printf '  <key>ProgramArguments</key><array><string>%s/old/p.sh</string></array>\n' "$_sd3"
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '</dict></plist>\n'; } > "$_dd2/$_slab.plist"
+  MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_slab" enable --now >/dev/null 2>&1
+  rm -rf "$_sd3/old"
+  # shellcheck disable=SC2016  # $1 belongs to the generated script
+  printf '#!/bin/sh\nsed -i "" "s|/old/|/new/|" "$1"\n' > "$_dd2/edstale"
+  chmod 755 "$_dd2/edstale"
+  _o=$(EDITOR="$_dd2/edstale" MY_LC_CONFIG="$_dd2/conf" "$0" $_sf "$_slab" edit --go 2>&1)
+  case "$_o" in
+    *'cannot start'*) t_no 'edit acts on the NEW definition' 'a successful restart' "$_o" ;;
+    *) t_ok 'a restart after an edit uses the edited program, not the stale one' ;;
+  esac
+  t_eq 'and the service is left RUNNING, not stopped' on "$(t_state "$_slab")"
+  cleanup_fixtures
 }
 
 t_restartrace() {
