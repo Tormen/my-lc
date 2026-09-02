@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="59b9299"
+SCRIPT_COMMIT="81858fb"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -114,8 +114,8 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
              itself, that streams launchd's own events and reduces them to
              one line per run. launchd keeps no run times, and reading them
              back from the system log costs ~15s per hour, so this is the
-             only way a run time can be free. Needs root: streaming is
-             admin-only, and one root daemon serves every domain.
+             only way a run time can be free. Needs root: reading the log
+             is admin-only, and one root daemon serves every domain.
   uninstall  remove it. --purge also deletes everything my-lc ever wrote:
              its state directories (INCLUDING plists 'delete' put aside),
              its own logs, and the zsh completion it installs.
@@ -1687,7 +1687,9 @@ runlog_program() {
 # Is it running, and is it actually collecting anything? A daemon that is up
 # but recording nothing looks identical to a healthy one from the outside,
 # so the record count and the newest timestamp are the answer, not the pid.
+RUNLOG_STALE=0
 runlog_status() {
+  RUNLOG_STALE=0
   _rp=$(runlog_plist)
   _pid=$(launchctl print "system/$RUNLOG_LABEL" 2>/dev/null | awk '/^\tpid = / { print $3; exit }')
   if [ -n "$_pid" ] && [ "$_pid" != 0 ]
@@ -1739,7 +1741,7 @@ runlog_status() {
         printf '    > %sit started %s, and %s was written %s - a deploy does not\n' \
           "$C_WARN" "$(when "$_smt")" "$_dprog" "$(when "$_pmt")"
         printf '      reach a process that is already running%s\n' "$C_OFF"
-        printf '    > %s restart %s   picks up the new one\n' "$SCRIPT_NAME" "$RUNLOG_LABEL"
+        RUNLOG_STALE=1
       fi
     fi
   fi
@@ -1756,6 +1758,25 @@ cmd_install() {
     _had=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
     if [ "$_had" = "$_prog" ]; then
       runlog_status
+      # Naming the command is not the same as offering to run it: my-lc knows
+      # the recorder is behind, and it is the one thing to do about it.
+      if [ "$RUNLOG_STALE" = 1 ]; then
+        if [ "$GO" = 1 ]; then _ans=go
+        elif [ -t 0 ]; then printf '\nrestart it now, to pick up the new one? add --go, or type go: '
+                            read -r _ans
+        else _ans=
+        fi
+        if [ "$_ans" = go ]; then
+          printf '\n'
+          # the tested path, including the bootstrap retry: launchd needs a
+          # moment to release a label after a bootout
+          DOMAIN=system
+          _label=$RUNLOG_LABEL; _plist=$_rp; _state=on; _trig=boot+keep; _ef=; _of=
+          v_restart
+        else
+          msg "left running; $SCRIPT_NAME restart $RUNLOG_LABEL picks up the new one"
+        fi
+      fi
       return 0
     else
       msg "the run recorder is installed, but names a different program"
@@ -1767,7 +1788,7 @@ cmd_install() {
   fi
   if [ "$(id -u)" != 0 ]; then
     msg "installing the run recorder needs root - it writes a LaunchDaemon"
-    printf '    > streaming launchd events is admin-only, so ONE root daemon\n' >&2
+    printf '    > reading launchd events is admin-only, so ONE root daemon\n' >&2
     printf '    > serves every domain; a per-user agent cannot do it at all\n' >&2
     printf '    > rerun as root: %s install\n' "$SCRIPT_NAME" >&2
     EXITCODE=1; return 0
