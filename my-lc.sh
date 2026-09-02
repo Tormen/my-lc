@@ -14,7 +14,7 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="bdec017"
+SCRIPT_COMMIT="a20827f"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -2571,11 +2571,16 @@ build_db() {
     daemons) load_loaded_set system; load_disabled_set system system; discover_scope daemon ;;
     agents)  load_loaded_set "gui/$DOMAIN_UID"; load_disabled_set "gui/$DOMAIN_UID" gui; discover_scope agent ;;
     both)
-      load_loaded_set system
+      # The loaded set is per DOMAIN and lives in one file, so it has to be
+      # reloaded between the two passes. Loading it only for system meant
+      # agent states were computed against the DAEMONS' loaded list: every
+      # gui orphan disappeared and the on/@on split was wrong.
       load_disabled_set system system
       load_disabled_set "gui/$DOMAIN_UID" gui
+      load_loaded_set system
       discover_scope daemon
       SEEN=' '; SEENF=' '
+      load_loaded_set "gui/$DOMAIN_UID"
       discover_scope agent ;;
   esac
 }
@@ -2950,6 +2955,7 @@ run_tests() {
   t_truncate
   t_undelete
   t_loadeddiff
+  t_verbose
   t_pstime
   t_logsizes
   t_plistchecks
@@ -3477,6 +3483,59 @@ t_truncate() {
   cleanup_fixtures
 }
 
+
+t_verbose() {
+  t_sec 'W. -V adds detail, and --both merges the domains'
+  _o=$("$0" --all list 2>&1)
+  _ov=$("$0" --all -V list 2>&1)
+
+  # -V adds the OUT column, which is informational rather than actionable
+  case "$_o"  in *' OUT'*) t_no 'OUT is not in the default view' 'no OUT column' 'it is there' ;;
+    *) t_ok 'the default table has no OUT column' ;; esac
+  case "$_ov" in *' OUT'*) t_ok '-V adds the OUT column' ;;
+    *) t_no '-V adds OUT' 'an OUT column' "$(printf '%s\n' "$_ov" | head -n 1)" ;; esac
+
+  # -V adds the plist and program under each row
+  case "$_ov" in *'    > plist:'*) t_ok '-V shows the plist path under each row' ;;
+    *) t_no '-V shows the plist' '    > plist: ...' "$(printf '%s\n' "$_ov" | head -n 3)" ;; esac
+  case "$_o"  in *'    > plist:'*) t_no 'the default view is clean' 'no plist lines' 'they are there' ;;
+    *) t_ok 'the default view stays clean' ;; esac
+
+  # -V names the user even when it IS the default, which the table omits
+  case "$_ov" in *' as root'*) t_ok '-V spells out the user even when it is the default' ;;
+    *) t_no '-V shows the default user' 'as root' "$(printf '%s\n' "$_ov" | sed -n '2p')" ;; esac
+
+  # --both merges the two domains and says which is which
+  _ob=$("$0" --all --both list 2>&1)
+  case "$_ob" in *'DOMAIN'*) t_ok '--both adds a DOMAIN column' ;;
+    *) t_no '--both DOMAIN column' 'a DOMAIN header' "$(printf '%s\n' "$_ob" | head -n 1)" ;; esac
+  _nsys=$(printf '%s\n' "$_ob" | awk 'NR>1 && $1=="system" { n++ } END { print n+0 }')
+  _ngui=$(printf '%s\n' "$_ob" | awk 'NR>1 && $1 ~ /^gui\// { n++ } END { print n+0 }')
+  if [ "$_nsys" -gt 0 ] && [ "$_ngui" -gt 0 ]; then
+    t_ok "--both lists both domains ($_nsys system, $_ngui gui)"
+  else t_no '--both merges the domains' 'rows from each' "$_nsys system, $_ngui gui"; fi
+
+  # the merge must not duplicate a label, and must not lose one
+  _dup=$(printf '%s\n' "$_ob" | awk 'NR>1 { print $1 " " $2 }' | sort | uniq -d | wc -l | tr -d ' ')
+  t_eq '--both produces no duplicate domain+label pairs' 0 "$_dup"
+  # the '? = ...' footer is not a row
+  _nd=$("$0" --all list 2>/dev/null | awk 'NR>1 && $1!="?"' | wc -l | tr -d ' ')
+  _nb=$(printf '%s\n' "$_ob" | awk 'NR>1 && $1=="system"' | wc -l | tr -d ' ')
+  t_eq '--both keeps every daemon the daemon-only view had' "$_nd" "$_nb"
+
+  # ...and every agent, with the same state. The loaded set is per domain
+  # and lives in one file, so a missing reload between the passes silently
+  # judged agents against the daemons' loaded list.
+  "$0" --all --agents list 2>/dev/null | awk 'NR>1 && $1!="?" {print $1, $2}' | sort > "$TMPD/ag.only"
+  printf '%s\n' "$_ob" | awk 'NR>1 && $1 ~ /^gui\// {print $2, $3}' | sort > "$TMPD/ag.both"
+  if cmp -s "$TMPD/ag.only" "$TMPD/ag.both"; then
+    t_ok '--both agrees with --agents on every agent and its state'
+  else
+    t_no '--both matches --agents' \
+      "$(wc -l < "$TMPD/ag.only" | tr -d ' ') rows" \
+      "$(wc -l < "$TMPD/ag.both" | tr -d ' ') rows, or different states"
+  fi
+}
 
 t_pstime() {
   t_sec 'U. process start times are in local time'
