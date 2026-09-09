@@ -582,7 +582,9 @@ find_config() {
     [ -r "$CONFIG_OVERRIDE" ] || die "no such config file: $CONFIG_OVERRIDE"
     _cfg=$CONFIG_OVERRIDE
   else
-    for _c in "/LINKS/default/$SCRIPT_NAME.conf" "$HOME/.$SCRIPT_NAME.conf" \
+    ## both spellings are accepted under /LINKS/default: .conf first, then bare
+    for _c in "/LINKS/default/$SCRIPT_NAME.conf" "/LINKS/default/$SCRIPT_NAME" \
+              "$HOME/.$SCRIPT_NAME.conf" \
               "/etc/$SCRIPT_NAME.conf" "/usr/local/etc/$SCRIPT_NAME.conf"; do
       [ -r "$_c" ] && { _cfg=$_c; break; }
     done
