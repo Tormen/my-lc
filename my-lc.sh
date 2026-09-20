@@ -13,8 +13,12 @@ SCRIPT_NAME=my-lc
 # a deploy so a binary can be traced back to a commit. It is deliberately
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
-SCRIPT_VERSION="v1.0.6"
-SCRIPT_COMMIT="5b6932b"
+SCRIPT_VERSION="v1.0.5"
+SCRIPT_COMMIT="35ec139"
+# What git said about this build when it was stamped: 'git describe --tags
+# --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
+# these bytes ARE that release or work on top of it, on a machine with no git.
+SCRIPT_RELEASE="v1.0.5-5-g35ec139"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3622,11 +3626,32 @@ script_version_string() {
   # commit is provenance only - it is stamped by hand and will silently
   # point at the wrong commit if someone edits after stamping, so it must
   # never be what two copies are compared on.
-  if [ -n "$SCRIPT_COMMIT" ]; then
-    printf '%s (build %s, from commit %s)' "$SCRIPT_VERSION" "$(build_id)" "$SCRIPT_COMMIT"
-  else
-    printf '%s (build %s)' "$SCRIPT_VERSION" "$(build_id)"
-  fi
+  #
+  # SCRIPT_VERSION names the release these bytes are BASED on; git's own
+  # describe string says whether they ARE it, and is printed verbatim:
+  # <nearest tag>-<commits since it>-g<short sha>. Git first (exact in a
+  # checkout), the stamp second (a deployed copy has no git; it lags one
+  # release step, because stamping happens before the tag exists).
+  _svs_b=$(build_id)
+  _svs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+  [ -n "$_svs_d" ] || _svs_d=$SCRIPT_RELEASE
+  case "$_svs_d" in
+    *-*-g*)
+      _svs_t=${_svs_d%-*-g*}
+      _svs_n=${_svs_d%-g*}; _svs_n=${_svs_n##*-}
+      if [ "$_svs_n" = 0 ]; then
+        printf '%s (%s: the %s tag, build %s)' "$SCRIPT_VERSION" "$_svs_d" "$_svs_t" "$_svs_b"
+      else
+        printf '%s+%s (%s: %s commit(s) past %s, unreleased, build %s)' \
+          "$SCRIPT_VERSION" "$_svs_n" "$_svs_d" "$_svs_n" "$_svs_t" "$_svs_b"
+      fi ;;
+    *)
+      if [ -n "$SCRIPT_COMMIT" ]; then
+        printf '%s (commit %s, build %s)' "$SCRIPT_VERSION" "$SCRIPT_COMMIT" "$_svs_b"
+      else
+        printf '%s (build %s, unstamped)' "$SCRIPT_VERSION" "$_svs_b"
+      fi ;;
+  esac
 }
 
 build_id() { build_id_of "$0"; }
@@ -3694,13 +3719,16 @@ stamp_version() {
 
   # Write via a temp file and mv: replacing the inode leaves the running
   # copy intact, whereas rewriting in place can corrupt a script mid-read.
+  # git's own spelling, kept verbatim so it can be pasted back into git
+  _desc=$(git -c safe.directory='*' -C "$_here" describe --tags --long 2>/dev/null)
   _tmp=$(mktemp) || die 'could not create a temp file'
-  sed "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_new\"|" "$_self" > "$_tmp" \
+  sed -e "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_new\"|" \
+      -e "s|^SCRIPT_RELEASE=\"[^\"]*\"|SCRIPT_RELEASE=\"$_desc\"|" "$_self" > "$_tmp" \
     || { rm -f "$_tmp"; die 'could not rewrite SCRIPT_COMMIT'; }
   _mode=$(stat -Lf '%Lp' "$_self" 2>/dev/null)
   mv "$_tmp" "$_self" || { rm -f "$_tmp"; die 'could not replace the file'; }
   [ -n "$_mode" ] && chmod "$_mode" "$_self"
-  printf 'stamped SCRIPT_COMMIT: %s -> %s\n' "${_cur:-<empty>}" "$_new"
+  printf 'stamped SCRIPT_COMMIT: %s -> %s  SCRIPT_RELEASE=%s\n' "${_cur:-<empty>}" "$_new" "${_desc:-<no tag yet>}"
 
   git -C "$_here" add "$_self" || die 'git add failed'
   git -C "$_here" commit --amend --no-edit --no-verify >/dev/null 2>&1 \
@@ -4423,8 +4451,8 @@ t_version() {
   t_sec 'H. --version identifies the exact build'
   _o=$("$0" --version 2>&1)
   case "$_o" in
-    "$SCRIPT_NAME $VERSION (build "*) t_ok '--version names the tool, version and build' ;;
-    *) t_no '--version format' "$SCRIPT_NAME $VERSION (build ...)" "$_o" ;;
+    "$SCRIPT_NAME $VERSION"*"build "*) t_ok '--version names the tool, version and build' ;;
+    *) t_no '--version format' "$SCRIPT_NAME $VERSION (... build ...)" "$_o" ;;
   esac
   _b=$(build_id)
   case "$_b" in
@@ -4442,27 +4470,27 @@ t_version() {
   _b3=$(/bin/dash "$TMPD/v1" --version 2>&1)
   t_eq 'an identical file reports the same build id' "$_b1" "$_b3"
 
-  # A released version number must never be reused. Once a tag exists and
-  # HEAD has moved past it, the version in the file is stale and the next
-  # release would republish a number that already means something else.
-  # This is the one check the build id cannot make: it knows the bytes
-  # differ, not that the NAME was already taken.
+  # The version NAMES the release these bytes are based on, and only a
+  # release commit sets it -- nothing bumps it in between, so the tree never
+  # claims a version with no content behind it. Whether this build IS that
+  # release is git describe's business, and '--version' prints it. So the
+  # check here is that the number still names the nearest tag.
   # The TOOL must never know where its source lives; a test may look at the
   # directory of the file it was told to run, which is not the same thing.
   _sdir=$(dirname "$0")
   if ! command -v git >/dev/null 2>&1 || ! git -C "$_sdir" rev-parse --git-dir >/dev/null 2>&1
-  then t_skip 'the version has not been released already' 'not a git checkout'
+  then t_skip 'the version names the release it is based on' 'not a git checkout'
   else
-    _tagged=$(git -C "$_sdir" tag -l "$VERSION")
-    if [ -z "$_tagged" ]; then
-      t_ok "$VERSION is not a released tag yet - nothing to reuse"
-    elif [ "$(git -C "$_sdir" rev-list -n1 "$VERSION")" \
-         = "$(git -C "$_sdir" rev-parse HEAD)" ]; then
-      t_ok "$VERSION is tagged, and HEAD is that release"
+    _near=$(git -C "$_sdir" describe --tags --abbrev=0 2>/dev/null)
+    if [ -z "$_near" ]; then
+      t_ok 'no release tag yet - nothing for the version to name'
     else
-      t_no 'the version is stale' "a version later than the tagged $VERSION" \
-        "SCRIPT_VERSION is still $VERSION, but HEAD has moved past that tag - bump it"
+      t_eq 'the version names the release it is based on' "$_near" "$VERSION"
     fi
+    case $(script_version_string) in
+      *"unreleased"*|*"the $_near tag"*) t_ok '--version says whether these bytes are that release' ;;
+      *) t_no '--version states the release state' 'the tag, or unreleased' "$(script_version_string)" ;;
+    esac
   fi
 }
 
