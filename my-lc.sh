@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="35ec139"
+SCRIPT_COMMIT="88ee79e"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-5-g35ec139"
+SCRIPT_RELEASE="v1.0.5-6-g88ee79e"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3620,6 +3620,22 @@ check_now_misuse() {
 # The authoritative identity: the stamped commit when there is one, else a
 # hash of this file's content. Either way two copies can be compared by
 # running each and diffing the output.
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
 script_version_string() {
   # The build id is ALWAYS shown and is the authoritative identity: it is
   # computed from this file's bytes, so it cannot be stale or wrong. The
@@ -3633,7 +3649,7 @@ script_version_string() {
   # checkout), the stamp second (a deployed copy has no git; it lags one
   # release step, because stamping happens before the tag exists).
   _svs_b=$(build_id)
-  _svs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+  _svs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
   [ -n "$_svs_d" ] || _svs_d=$SCRIPT_RELEASE
   case "$_svs_d" in
     *-*-g*)
