@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="0f801e7"
+SCRIPT_COMMIT="8392117"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-7-g0f801e7"
+SCRIPT_RELEASE="v1.0.5-8-g8392117"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3658,7 +3658,10 @@ script_version_string() {
      && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
     _svs_d=""
   fi
-  [ -n "$_svs_d" ] || _svs_d=$SCRIPT_RELEASE
+  # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+  # stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+  # nothing backs -- an unstamped file says so.
+  if [ -z "$_svs_d" ] && [ -n "$SCRIPT_COMMIT" ]; then _svs_d=$SCRIPT_RELEASE; fi
   case "$_svs_d" in
     *-*-g*)
       _svs_t=${_svs_d%-*-g*}
