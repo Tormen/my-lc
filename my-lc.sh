@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="8392117"
+SCRIPT_COMMIT="b464521"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-8-g8392117"
+SCRIPT_RELEASE="v1.0.5-9-gb464521"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -3721,6 +3721,12 @@ stamp_version() {
     printf '%s\n' "$_dirty" | sed 's/^/  /' >&2
     die 'commit or stash those first, then re-run --stamp-version'
   fi
+
+  # The repo may be SHARED -- other sessions commit here too -- and an amend
+  # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+  # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+  [ -n "$(git -C "$_here" show --name-only --format= HEAD -- "$(basename "$0")" 2>/dev/null)" ] \
+    || die "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)"
 
   _new=$(git -C "$_here" rev-parse --short HEAD 2>/dev/null) \
     || die 'the repository has no commits yet - commit first'
