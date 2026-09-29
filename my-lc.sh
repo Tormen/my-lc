@@ -115,9 +115,10 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
   install    install the run recorder, or - when it is already installed -
              report whether it is running and how much it has collected.
              It is a LaunchDaemon, written by my-lc
-             itself, that streams launchd's own events and reduces them to
-             one line per run. launchd keeps no run times, and reading them
-             back from the system log costs ~15s per hour, so this is the
+             itself, that reads a window of the system log every
+             RUNLOG_POLL seconds and reduces launchd's events to one line
+             per run. launchd keeps no run times, and reading them back
+             from the log on demand costs ~15s per hour, so this is the
              only way a run time can be free. Needs root: reading the log
              is admin-only, and one root daemon serves every domain.
   uninstall  remove it. --purge also deletes everything my-lc ever wrote:
@@ -221,9 +222,11 @@ STATUS — whatever is relevant for that kind of service
   NEXT~:              an ETA for an interval job: the last run plus its
                       interval, so it needs a recorded run ('install').
                       One in the past means overdue, not wrong
-  FAIL 127 x3         last exit code, run count
-  EVERY 3600s / CAL   a timer that has not run yet
-  WAITING             armed on a socket, path or XPC name
+  DUE-WAS:<when>      a calendar job whose recorded run is more than
+                      CAL_SKEW seconds from its scheduled time: late, run
+                      by hand, or the schedule changed. Agreement is silent
+  NOT-ARMED           a watch/queue service launchd is NOT watching - it
+                      will never fire. Marked !! but keeps its status
   NOT-STARTED         nothing runs it until you 'start' it, or until the
                       next boot if its STATE is @on
   STOPPED             the same, but it demonstrably ran since this boot -
@@ -514,10 +517,10 @@ CAL_SKEW=300
 RUN_WAIT=5
 
 # The run recorder ('install'). launchd keeps no run times at all, and
-# 'log show' costs ~15s per hour of history, so a daemon streams launchd's
-# own events live and reduces them to one line per event. ONE root daemon
-# serves every domain: streaming needs root, and a user agent could not do
-# it - but pid 1's events name their domain, so it demultiplexes into each
+# 'log show' costs ~15s per hour of history, so a daemon reads launchd's
+# events from the log and reduces them to one line per event. ONE root daemon
+# serves every domain: reading the log needs root, and a user agent could not
+# do it - but pid 1's events name their domain, so it demultiplexes into each
 # user's own state directory, @USER@ being that user.
 RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
 RUNLOG_PLIST_DIR="/Library/LaunchDaemons"

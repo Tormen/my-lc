@@ -80,7 +80,8 @@ WatchPaths vs StartInterval vs a socket trigger is only in the plist —
 which is often mode 0600. Yet it is the first thing you need to know when
 a daemon "is not running", because socket- and path-triggered daemons are
 *supposed* not to be running.
-→ my-lc's **TRIGGER** column, and `waiting` instead of a blank STATUS.
+→ my-lc's **TRIGGER** column, and a STATUS that says what happened to the
+run instead of a blank.
 
 **4. Errors are offstage.** `StandardErrorPath` is a plist key launchd
 writes to and never mentions again.
@@ -93,7 +94,8 @@ user's GUI session — so anything that talks to a per-user helper
 (`automator`, `open`, an app) fails there while the identical command works
 when you type it in Terminal. launchd's only comment is an exit code.
 → my-lc marks the row **`!!`** and, in the record, names it: either from the
-plist alone, or from the service's own stderr.
+plist alone (a daemon whose program is `automator` or `open`), or from the
+service's own stderr.
 
 ### What my-lc does *not* claim
 
@@ -127,7 +129,7 @@ you will find in most existing documentation.
 | `kill <sig> <d>/<L>` | `stop <L>` | `kill [SIG]` | signal the running process — a KeepAlive service comes straight back |
 | — | — | `edit` | open the plist in `$EDITOR`, then check it is still a valid launchd job |
 | — | — | `delete` | stop it, disable it, and move its plist to a dated backup (always confirms) |
-| — | — | `truncate [err\|out]` | empty its logs to 0 bytes, both streams by default (always confirms) |
+| — | — | `truncate [err\|out]` | empty its logs to 0 bytes in place (launchd holds them open), both streams by default (always confirms) |
 | — | — | `undelete` | put a deleted plist back and re-enable it; with no filter, list what can be restored |
 | — | `submit ...` | — | write a plist and `start` it instead |
 
@@ -197,14 +199,16 @@ a way to learn the raw commands.
   before you wonder why nothing happened, and names `stop` as the verb
   that makes it stay down.
 - **launchctl's numeric errors** (`Bootstrap failed: 5: Input/output
-  error`) are translated to their actual causes.
+  error`) are translated to their actual causes, with launchctl's own words
+  and exit code beside them.
 - **stderr is in the default listing, highlighted** — the volume of it
   (`386463L`). The *time* lives in STATUS as `LAST-WROTE:`, because the same
   timestamp in two columns of one row is noise.
   The one exception is a service whose stdout is the same file: an error
   cannot be told from ordinary output there, so it reads
   `merged with stdout: 90L` and is left plain rather than raising a false
-  alarm.
+  alarm. On a failed row an empty ERR is spelled out — `no path set`,
+  `no file yet` or `empty` — because that decides whether you can see why.
 - **`status <one service>`** shows the log lines added since that service
   last started, not a blind tail.
 - **File-system triggers are verified, not just listed.** A `WatchPaths`
@@ -214,6 +218,10 @@ a way to learn the raw commands.
   under an unreadable directory is `?`, never a false `MISSING`. For a
   watched **directory** it states the trap: WatchPaths fires on the
   directory's own contents changing, not on a file inside being edited.
+  A watch launchd is not actually watching never fires and otherwise looks
+  exactly like a healthy one, so STATUS says `NOT-ARMED` and marks the row
+  `!!`. Whether each path is readable by the service's user is shown in the
+  record view.
 - **Each watched path says when it last changed, and what changed** —
   that change is the event which would have fired the service, so it is
   the first thing you want when asking "why did this run?" or "why
@@ -225,16 +233,26 @@ a way to learn the raw commands.
               newest entry: scan_0042.pdf (3h12m ago)
             /some/gone/path                                      MISSING
 ```
+
+  Nothing in macOS records which path fired a run, or when: the paths carry
+  their change times and the runs (with the recorder) their own, and
+  lining them up is left to you rather than guessed.
 - **The program is checked, not assumed.** A launch item whose program is
   missing, empty, non-executable or unreachable fails with 126/127 and
   launchd says nothing about why. my-lc reports it in the table and explains
   it in the record view — and judges executability for the user the service
   **runs as** (`UserName`, else root for a daemon, else the session user),
-  not for whoever happens to be running my-lc.
+  not for whoever happens to be running my-lc. `start` refuses such a
+  service: `launchctl bootstrap` would accept it and report success.
+- **`run` reports what the run did.** `kickstart` returns as soon as the
+  program is spawned, so my-lc waits up to `RUN_WAIT` seconds for launchd to
+  record an outcome and says `exited N`, `still running as pid N`, or that
+  no outcome appeared yet.
 - **Exit codes are translated** — `FAIL 78 config error`, and in the record
   view `exit 78 = EX_CONFIG: the program rejected its own configuration`.
   `128+N` is reported as death by signal N.
-- **"dead since"** — for a failed service, when it last did anything.
+- **"dead since"** — in the record of a failed service, when it last did
+  anything.
   Normally the newest of its log files; for a service with no logs at all,
   launchd records no timestamp, but a `boot`-triggered service that ran and
   is not running failed **at boot**, so the date is recovered from
@@ -268,6 +286,10 @@ a way to learn the raw commands.
              on disk: argument sleep 999
 ```
 
+  The same holds for the logs: while a service is loaded, its log paths are
+  taken from the loaded definition, because that is where launchd is still
+  writing. A path that differs from the plist is marked `as loaded`.
+
   `edit` re-reads the plist after you save, so a change to the program is
   acted on with the NEW value, and shows the same diff on leaving the editor and then offers exactly
   the steps that service needs — restart to apply it now, enable so every
@@ -280,7 +302,8 @@ a way to learn the raw commands.
   the filename.
 - **Each log says how big it is**, behind its path — `(315L, 25KB)`, or
   just the size once it is too large to count cheaply, or `empty` /
-  `does not exist yet`.
+  `does not exist yet`. A log that is not a regular file (`/dev/console`)
+  is named, never read.
 - **`status` shows the command line, not just the program** — every
   argument as launchd would run it, quoted where needed:
   `/bin/sh -c "echo hi there"`. `program: /bin/sh` on its own says almost
@@ -299,7 +322,8 @@ a way to learn the raw commands.
   underneath for anyone who wants it.
 - **Every mutating command narrates itself** — `* stopping X ... done` —
   and a step already in the wanted state says `* X is already stopped`
-  rather than pretending it did something. `-Q` silences the narration;
+  rather than pretending it did something. `done` means the result was
+  checked, not merely that launchctl returned 0. `-Q` silences the narration;
   errors and the multi-target plan are never silenced.
 
 ## Usage
@@ -314,9 +338,14 @@ in the config says, which ships as `status` (and `status` with no filter
 renders that same list). Any word that is not a verb or an option is a case-insensitive
 filter over label, plist path and program; several words are ANDed — but
 several *exact labels* are acted on together, since no service is two labels
-at once. A verb
+at once (mixed with a substring, they narrow again). A verb
 after a filter acts on everything the filter matched, and on more than one
-service it prints the plan and stops until you add `--go`.
+service it prints the plan and stops until you answer `go` or add `--go`.
+A bare `go` among the arguments is refused rather than taken as a filter.
+
+Apple's own services — a plist under `/System/Library` or a `com.apple.*`
+label, some 400 of them — are left out unless you ask for `--with-apple` or
+`--apple`; skipping them is also what keeps the default listing fast.
 
 Service names, `system/<label>`, and absolute `.plist` paths are
 interchangeable everywhere.
@@ -339,6 +368,8 @@ TRIGGER column's answer, and saying it twice told you nothing:
 | `FAILED LAST:2026-09-02_1732[1 general error]` | so a wrong reading is visible here |
 | `NOT-RUN` / `NOT-STARTED` / `STOPPED` | states, not outcomes — left uncoloured |
 | `!! CANNOT-WORK no-GUI-session` | it cannot work where it is, and why |
+| `!! ... NOT-ARMED` | a watch launchd is not watching: it will never fire |
+| `DUE-WAS:<when>` | a calendar job whose recorded run is more than `CAL_SKEW` from its schedule: late, run by hand, or the schedule changed |
 
 Four kinds of time, each named for exactly what it is:
 
@@ -350,7 +381,10 @@ Four kinds of time, each named for exactly what it is:
   last ran: a service can run every minute and speak once an hour
 - **`NEXT:`** computed from the plist for calendar jobs, **`NEXT~:`** an ETA
   for interval ones (the last run plus the interval, so only as good as that
-  run). One in the past means overdue
+  run). One in the past means overdue. Omitted calendar keys are wildcards,
+  as launchd treats them (`Hour 3` alone is every minute from 03:00 to
+  03:59), and the current UTC offset is used, so across a DST change a
+  `NEXT:` can be an hour out
 
 ## The run recorder — `my-lc install`
 
@@ -361,7 +395,8 @@ them on demand costs ~2.3s for a five-minute window and the store only
 reaches back about sixteen hours.
 
 So `my-lc install` writes a LaunchDaemon — generated by my-lc, there is no
-file to ship — that reads a window of the log every minute and reduces each
+file to ship — that reads a window of the log every minute (`RUNLOG_POLL`)
+and reduces each
 event to one line under `/var/lib/mine/<user>/my-lc/runs.tsv`. A run time
 then costs a file read, and `status <service>` can list the recent runs,
 which is the only run history that exists anywhere.
@@ -373,13 +408,34 @@ each user's records land in that user's own directory.
 Windows **overlap**, and each read reaches back to the newest record already
 held, so a boot, a crash or a deliberate stop is read back rather than lost
 (launchd has no start ordering for daemons, so the recorder can never be
-first at boot). Duplicates are dropped by timestamp.
+first at boot). How far back it reaches is capped by `RUNLOG_BACKFILL`, and
+each file keeps at most `RUNLOG_MAX_LINES` records. Duplicates are dropped
+by timestamp.
 
 `my-lc install` again reports whether it is running, how much it has
 collected, and whether it is running code older than what is deployed —
 offering the restart. `my-lc uninstall` removes it; `--purge` removes
 everything my-lc ever wrote, naming first the plists `delete` set aside.
+The `fpath=(...)` line in your `~/.zshrc` is left alone: it is your file,
+and harmless once the completion is gone.
+
+## Limits
+
+- The `user/<uid>` domain is not modelled — only `system` and `gui/<uid>`.
+- A service's run count and last exit code are per load: a restart resets
+  them, and my-lc says so rather than showing a blank.
 
 ## Install
 
 Drop `my-lc` in the path. It installs its own zsh completion on first run.
+
+Every tunable (`RUN_WAIT`, `BOOTSTRAP_TRIES`, `CAL_SKEW`, the recorder's
+`RUNLOG_*`, `TIME_FORMAT`, ...) is in the config; `my-lc --create-config`
+prints it, annotated. `my-lc --version` names the exact build: a hash of the
+file itself, plus the commit it was stamped from.
+
+`my-lc --run-tests [agents|daemons]` runs the built-in suite against the
+real launchd — never mocked — on throwaway services labelled
+`eu.no-panic.my-lc-selftest-*`, removed again on exit; `daemons` needs root.
+Run unprivileged, it can leave `=> enabled` entries for those labels in
+launchd's override database, which only root can clear.
