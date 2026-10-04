@@ -434,7 +434,7 @@ Every tunable (`RUN_WAIT`, `BOOTSTRAP_TRIES`, `CAL_SKEW`, the recorder's
 prints it, annotated. `my-lc --version` names the exact build: a hash of the
 file itself, plus the commit it was stamped from.
 
-`my-lc --run-tests [agents|daemons]` runs the built-in suite against the
+`my-lc --run-tests [agents|daemons] [NAME]` (NAME: only the tests whose name contains it) runs the built-in suite against the
 real launchd — never mocked — on throwaway services labelled
 `eu.no-panic.my-lc-selftest-*`, removed again on exit; `daemons` needs root.
 Run unprivileged, it can leave `=> enabled` entries for those labels in

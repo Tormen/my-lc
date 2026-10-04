@@ -49,6 +49,7 @@ KILLSIG=TERM
 FILTERS=
 TESTS=0
 TESTS_SCOPE=agents
+TESTS_FILTER=
 COMPLETE=0
 COMPLETE_VERB=
 
@@ -168,8 +169,9 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
       --config FILE  use FILE as config, bypassing the search
       --create-config [FILE]
                      print the default config to stdout, or write it to FILE
-      --run-tests [agents|daemons]
-                     run the built-in self-tests
+      --run-tests [agents|daemons] [NAME]
+                     run the built-in self-tests; NAME runs only the
+                     tests whose name contains it
       --version      print the version and the exact build it came from
       --stamp-version
                      optional: record the current git HEAD sha in this file
@@ -3507,7 +3509,8 @@ parse_args() {
       --uid=*)           UID_OVERRIDE=${_a#*=} ;;
       --uid)             _want_uid=1 ;;
       --run-tests)       TESTS=1
-                         case "${2:-}" in agents|daemons) TESTS_SCOPE=$2; shift ;; esac ;;
+                         case "${2:-}" in agents|daemons) TESTS_SCOPE=$2; shift ;; esac
+                         case "${2:-}" in -*|'') ;; *) TESTS_FILTER=$2; shift ;; esac ;;
       --run-tests=*)     TESTS=1; TESTS_SCOPE=${_a#*=} ;;
       --complete-labels) COMPLETE=1
                          case "${2:-}" in -*|'') ;; *) COMPLETE_VERB=$2; shift ;; esac ;;
@@ -4143,17 +4146,73 @@ cleanup_fixtures() {
   done
 }
 
+# The run list: the tests in the order they run, one 'rt_<name>' function
+# each. It is walked twice -- once to count the plan, once to run -- so the
+# plan always comes from this same list. TESTS_FILTER picks the names that
+# contain it.
+_rt_list() {
+  _rt static       && rt_static
+  _rt readonly     && rt_readonly
+  _rt matrix       && rt_matrix
+  _rt hints        && rt_hints
+  _rt version      && rt_version
+  _rt exitcodes    && rt_exitcodes
+  _rt timefmt      && rt_timefmt
+  _rt truncate     && rt_truncate
+  _rt undelete     && rt_undelete
+  _rt loadeddiff   && rt_loadeddiff
+  _rt verbose      && rt_verbose
+  _rt pstime       && rt_pstime
+  _rt logsizes     && rt_logsizes
+  _rt sessiontrap  && rt_sessiontrap
+  _rt filters      && rt_filters
+  _rt runlog       && rt_runlog
+  _rt calendar     && rt_calendar
+  _rt stamp        && rt_stamp
+  _rt plistchecks  && rt_plistchecks
+  _rt restartrace  && rt_restartrace
+  _rt chain        && rt_chain
+  _rt failures     && rt_failures
+  _rt errcolumn    && rt_errcolumn
+  _rt editdelete   && rt_editdelete
+  _rt program      && rt_program
+  _rt watch        && rt_watch
+  _rt logs         && rt_logs
+  _rt completion   && rt_completion
+  _rt ''
+}
+
+# Open test $1 (and close the one before it with its 'ok K - name' line).
+# Returns 0 only when $1 is to run now; in the counting pass it only counts.
+_rt() {
+  if [ "$_rt_counting" = 1 ]; then
+    [ -n "$1" ] && _rt_want "$1" && _rt_n=$((_rt_n + 1))
+    return 1
+  fi
+  if [ -n "$_rt_cur" ]; then
+    if [ "$T_FAIL" = "$_rt_bad" ]; then printf 'ok %s - %s\n' "$_rt_k" "$_rt_cur"
+    else printf 'not ok %s - %s\n' "$_rt_k" "$_rt_cur"; fi
+  fi
+  _rt_cur=
+  [ -n "$1" ] && _rt_want "$1" || return 1
+  _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL
+}
+_rt_want() { case "$1" in *"$TESTS_FILTER"*) return 0 ;; esac; return 1; }
+
 run_tests() {
   setup_color
   SCOPE=$TESTS_SCOPE
+  _rt_n=0; _rt_cur=; _rt_counting=1; _rt_list; _rt_counting=0
   case "$TESTS_SCOPE" in
     daemons)
       if [ "$(id -u)" != 0 ]; then
+        printf '1..0 # SKIP the daemon-scope tests need root\n'
         printf 'the daemon-scope tests need root.\n'
         printf 'run them as root:  my-lc --run-tests daemons\n'
         T_SKIP=$((T_SKIP+1)); t_summary; return 0
       fi ;;
   esac
+  printf '1..%s\n' "$_rt_n"
   resolve_domain
   printf '%smy-lc %s self-tests — domain %s%s\n' "$C_HDR" "$VERSION" "$DOMAIN" "$C_OFF"
 
@@ -4187,34 +4246,9 @@ run_tests() {
   FILTER_STATE=all
   build_db
 
-  t_static
-  t_readonly
-  t_matrix
-  t_hints
-  t_version
-  t_exitcodes
-  t_timefmt
-  t_truncate
-  t_undelete
-  t_loadeddiff
-  t_verbose
-  t_pstime
-  t_logsizes
-  t_sessiontrap
-  t_filters
-  t_runlog
-  t_calendar
-  t_stamp
-  t_plistchecks
-  t_restartrace
-  t_chain
-  t_failures
-  t_errcolumn
-  t_editdelete
-  t_program
-  t_watch
-  t_logs
-  t_completion
+  # one line per test as it ends, numbered in list order: 'ok K - name'
+  _rt_k=0
+  _rt_list
   cleanup_fixtures
   t_residue
   t_summary
@@ -4268,7 +4302,7 @@ t_summary() {
   return 0
 }
 
-t_static() {
+rt_static() {
   t_sec 'A. static'
   if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -s dash "$0" >"$TMPD/sc.log" 2>&1; then t_ok 'shellcheck -s dash is clean'
@@ -4282,19 +4316,23 @@ t_static() {
   # run_tests then failed silently to stderr and the section simply vanished
   # from the report, with the total still looking healthy.
   _missing=0
-  awk '/^run_tests\(\) \{/,/^\}/' "$0" | awk '$1 ~ /^t_[a-z]+$/ { print $1 }' > "$TMPD/called"
-  while IFS= read -r _fn; do
-    [ -n "$_fn" ] || continue
+  awk '/^_rt_list\(\) \{/,/^\}/' "$0" | awk '$1 == "_rt" && $3 == "&&" { print $2, $4 }' > "$TMPD/called"
+  while read -r _nm _fn; do
+    [ "$_fn" = "rt_$_nm" ] || { printf '  listed as %s but calls %s\n' "$_nm" "$_fn"; _missing=$((_missing + 1)); }
     grep -q "^$_fn() {" "$0" || { printf '  called but not defined: %s\n' "$_fn"; _missing=$((_missing + 1)); }
   done < "$TMPD/called"
   t_eq 'every test function run_tests calls is defined' 0 "$_missing"
+  # ...and the other way round: a test defined but left out of the run list
+  # would never run, with the plan still looking complete.
+  t_eq 'every test function is in the run list' \
+       "$(grep -c '^rt_[a-z_]*() {$' "$0")" "$(wc -l < "$TMPD/called" | tr -d ' ')"
   "$0" -h >/dev/null 2>&1;    t_eq '-h exits 0' 0 $?
   "$0" --help >/dev/null 2>&1; t_eq '--help exits 0' 0 $?
   t_eq 'usage line follows the convention' 'usage: my-lc [OPTIONS] [FILTER ...] [VERB]' \
        "$("$0" -h 2>/dev/null | head -n 1)"
 }
 
-t_readonly() {
+rt_readonly() {
   t_sec 'B. read-only, against the real machine'
   # Only the disabled set is a valid invariant here. A full 'launchctl list'
   # snapshot changes on its own on a live machine - transient XPC services
@@ -4360,7 +4398,7 @@ t_run() {
   MY_LC_CONFIG="$T_CONF" "$0" $_scopeflag --all "$@" 2>&1
 }
 
-t_matrix() {
+rt_matrix() {
   t_sec 'C. the STATE transition matrix'
   _pl=$(t_plist plain)
   _lab="$SELFTEST_PREFIX-plain"
@@ -4437,7 +4475,7 @@ t_matrix() {
   cleanup_fixtures
 }
 
-t_hints() {
+rt_hints() {
   t_sec 'D. hints and adaptive errors'
 
   _o=$("$0" load 2>&1)
@@ -4483,7 +4521,7 @@ t_hints() {
   cleanup_fixtures
 }
 
-t_version() {
+rt_version() {
   t_sec 'H. --version identifies the exact build'
   _o=$("$0" --version 2>&1)
   case "$_o" in
@@ -4530,7 +4568,7 @@ t_version() {
   fi
 }
 
-t_program() {
+rt_program() {
   t_sec 'J. the program is checked, not assumed'
   _pd="$TMPD/prog"; mkdir -p "$_pd/sub"
   printf '#!/bin/sh\ntrue\n' > "$_pd/good";   chmod 755 "$_pd/good"
@@ -4586,7 +4624,7 @@ t_program() {
   t_eq 'root reaches everything' 'ok (root)' "$(program_access "$_pd/good" root)"
 }
 
-t_editdelete() {
+rt_editdelete() {
   t_sec 'K. edit and delete'
   _ed="$TMPD/ed"; mkdir -p "$_ed"
   _lab="$SELFTEST_PREFIX-editme"
@@ -4711,7 +4749,7 @@ t_editdelete() {
   cleanup_fixtures
 }
 
-t_truncate() {
+rt_truncate() {
   t_sec 'N. truncate'
   _td="$TMPD/trunc"; mkdir -p "$_td/st"
   _lab="$SELFTEST_PREFIX-trunc"
@@ -4781,7 +4819,7 @@ t_truncate() {
 }
 
 
-t_verbose() {
+rt_verbose() {
   t_sec 'W. -V adds detail, and --both merges the domains'
   _o=$("$0" --all list 2>&1)
   _ov=$("$0" --all -V list 2>&1)
@@ -4834,7 +4872,7 @@ t_verbose() {
   fi
 }
 
-t_pstime() {
+rt_pstime() {
   t_sec 'U. process start times are in local time'
   # 'ps -o lstart' prints local time with no offset, and the civil-days
   # arithmetic treats it as UTC - every start time came out shifted by the
@@ -4863,7 +4901,7 @@ t_pstime() {
   else t_skip 'cross-check against date(1)' 'nothing running'; fi
 }
 
-t_logsizes() {
+rt_logsizes() {
   t_sec 'V. each log says how big it is'
   _lg="$TMPD/lsz"; mkdir -p "$_lg"
   printf 'a\nb\nc\n' > "$_lg/three"
@@ -4935,7 +4973,7 @@ t_logsizes() {
   BIG_DELTA=$_sv
 }
 
-t_plistchecks() {
+rt_plistchecks() {
   t_sec 'T. the plist itself is checked, and the command line shown'
   _pd2="$TMPD/plchk"; mkdir -p "$_pd2/st"
   printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
@@ -4996,7 +5034,7 @@ t_plistchecks() {
     *) t_no 'label mismatch' 'the filename says ...' "$_o" ;; esac
 }
 
-t_loadeddiff() {
+rt_loadeddiff() {
   t_sec 'R. the running definition versus the plist on disk'
   # every loaded service on THIS machine must compare equal: a false
   # positive here would cry wolf on every status
@@ -5123,7 +5161,7 @@ t_loadeddiff() {
   cleanup_fixtures
 }
 
-t_restartrace() {
+rt_restartrace() {
   t_sec 'S. restart must not leave the service stopped'
   _rd="$TMPD/race"; mkdir -p "$_rd/st"
   _lab="$SELFTEST_PREFIX-race"
@@ -5164,7 +5202,7 @@ t_restartrace() {
   cleanup_fixtures
 }
 
-t_chain() {
+rt_chain() {
   t_sec 'Q. verbs chain, in the order typed'
   _cd2="$TMPD/chain"; mkdir -p "$_cd2/st"
   _lab="$SELFTEST_PREFIX-chain"
@@ -5222,7 +5260,7 @@ t_chain() {
   cleanup_fixtures
 }
 
-t_failures() {
+rt_failures() {
   t_sec 'P. done means it worked, and a failure shows its evidence'
   _fd="$TMPD/fail"; mkdir -p "$_fd/st"
   _sf=; [ "$SCOPE" = agents ] && _sf=--agents
@@ -5315,7 +5353,7 @@ t_failures() {
   cleanup_fixtures
 }
 
-t_sessiontrap() {
+rt_sessiontrap() {
   t_sec 'X. the daemon/session trap'
   _sd="$TMPD/sess"; mkdir -p "$_sd"
 
@@ -5432,7 +5470,7 @@ t_sessiontrap() {
     *) t_no 'record program note' 'needs a GUI login session' "$_o" ;; esac
 }
 
-t_filters() {
+rt_filters() {
   t_sec 'Y. several filter words'
   _fd2="$TMPD/filt"; mkdir -p "$_fd2"
   _r() { printf '%s\t' "$@"; printf '\n'; }
@@ -5461,7 +5499,7 @@ t_filters() {
   APPLE_MODE=$APPLE_SAVE; FILTER_STATE=$FILTER_STATE_SAVE; DB=$DB_SAVE
 }
 
-t_runlog() {
+rt_runlog() {
   t_sec 'Z. the run recorder'
   _rl="$TMPD/runlog"; mkdir -p "$_rl"
   RUNLOG_STATE_SAVE=$RUNLOG_STATE; RUNLOG_STATE="$_rl/@USER@/my-lc"
@@ -5594,7 +5632,7 @@ t_runlog() {
   fi
 }
 
-t_calendar() {
+rt_calendar() {
   t_sec 'AA. NEXT: for a calendar job'
   _cl="$TMPD/cal"; mkdir -p "$_cl"
   _mkcal() {
@@ -5702,7 +5740,7 @@ t_calendar() {
   cleanup_fixtures
 }
 
-t_stamp() {
+rt_stamp() {
   t_sec 'AB. --stamp-version never rewrites published history'
   if ! command -v git >/dev/null 2>&1; then
     t_skip 'the stamp guard' 'git is not on PATH'; return 0
@@ -5737,7 +5775,7 @@ t_stamp() {
     *) t_no 'stamp works' 'stamped SCRIPT_COMMIT: ...' "$_o" ;; esac
 }
 
-t_undelete() {
+rt_undelete() {
   t_sec 'O. undelete'
   _ud="$TMPD/ud"; mkdir -p "$_ud/dir" "$_ud/st"
   _lab="$SELFTEST_PREFIX-ud"
@@ -5798,7 +5836,7 @@ t_undelete() {
   cleanup_fixtures
 }
 
-t_errcolumn() {
+rt_errcolumn() {
   t_sec 'M. the ERR column tells the truth about itself'
   _cd="$TMPD/errcol"; mkdir -p "$_cd/st"
   printf 'a\nb\nc\n' > "$_cd/both.log"
@@ -5850,7 +5888,7 @@ t_errcolumn() {
   esac
 }
 
-t_timefmt() {
+rt_timefmt() {
   t_sec 'L. time rendering follows the config'
   _now=$(now_epoch)
   _then=$(( _now - 90000 ))
@@ -5895,7 +5933,7 @@ t_timefmt() {
   TIME_FORMAT=relative
 }
 
-t_exitcodes() {
+rt_exitcodes() {
   t_sec 'I. exit codes are explained, not just numbered'
   # launchd writes 'last exit code = 78: EX_CONFIG'; my-lc renders the
   # meaning itself, so the number must come out of that line alone.
@@ -5922,7 +5960,7 @@ t_exitcodes() {
   else t_no 'short and long differ' 'two different strings' 'identical'; fi
 }
 
-t_watch() {
+rt_watch() {
   t_sec 'E. WatchPaths — MISSING and ? are never conflated'
   _wd="$TMPD/wtest"; mkdir -p "$_wd/open" "$_wd/closed"
   : > "$_wd/open/there"
@@ -5949,7 +5987,7 @@ t_watch() {
   chmod 755 "$_wd/closed"
 }
 
-t_logs() {
+rt_logs() {
   t_sec 'F. the log delta'
   _ld="$TMPD/logs"; mkdir -p "$_ld"
   _el="$_ld/err"; _ol="$_ld/out"
@@ -6056,7 +6094,7 @@ t_logs() {
   t_eq 'log_indicator reports - for a missing log' '-' "$(log_indicator "$_ld/nope")"
 }
 
-t_completion() {
+rt_completion() {
   t_sec 'G. completion'
   _scopeflag=
   [ "$SCOPE" = agents ] && _scopeflag=--agents
