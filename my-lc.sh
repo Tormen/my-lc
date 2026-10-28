@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="b464521"
+SCRIPT_COMMIT="c11f93b"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-9-gb464521"
+SCRIPT_RELEASE="v1.0.5-13-gc11f93b"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -1672,6 +1672,10 @@ cmd_runlog_collect() {
 runlog_plist_content() {
   printf '<?xml version="1.0" encoding="UTF-8"?>\n'
   printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+  # who installed it, when and how: my-rollout reads this line to know the
+  # job is my-lc's; comparing two plists ignores it
+  printf '<!-- installed by %s install (%s) on %s, %s: generated, build %s -->\n' "$SCRIPT_NAME" \
+    "$(id -un)" "$(hostname -s 2>/dev/null || hostname)" "$(date '+%Y-%m-%d %H:%M %z')" "$(build_id)"
   printf '<plist version="1.0">\n<dict>\n'
   printf '  <key>Label</key>\n  <string>%s</string>\n' "$RUNLOG_LABEL"
   printf '  <key>ProgramArguments</key>\n  <array>\n'
@@ -1762,6 +1766,24 @@ runlog_status() {
   fi
 }
 
+# An installed plist without the installer comment, but otherwise the job this
+# copy would write: root writes it again WITH the comment -- the job does not
+# change, so it is not reloaded. Any other difference is left alone, and said.
+runlog_plist_comment() {
+  grep -q '^<!-- installed by ' "$1" 2>/dev/null && return 0
+  runlog_plist_content "$2" > "$TMPD/runlog.plist"
+  if [ "$(grep -v '^<!-- installed by ' "$TMPD/runlog.plist")" != "$(cat "$1")" ]; then
+    printf "    > %s has no installer comment, and differs from what this my-lc writes -- '%s uninstall', then install\n" \
+      "$1" "$SCRIPT_NAME"
+  elif [ "$(id -u)" != 0 ]; then
+    printf "    > %s has no installer comment -- '%s install' as root writes it\n" "$1" "$SCRIPT_NAME"
+  elif mv "$TMPD/runlog.plist" "$1" && chmod 644 "$1" && chown root:wheel "$1"; then
+    printf '    > %s: written again with its installer comment (it had none) -- the same job, not reloaded\n' "$1"
+  else
+    printf '    > %s: has no installer comment, and writing it again failed\n' "$1" >&2
+  fi
+}
+
 cmd_install() {
   _rp=$(runlog_plist)
   _prog=$(runlog_program)
@@ -1769,6 +1791,7 @@ cmd_install() {
     _had=$(plutil -extract ProgramArguments.0 raw -o - "$_rp" 2>/dev/null)
     if [ "$_had" = "$_prog" ]; then
       runlog_status
+      runlog_plist_comment "$_rp" "$_prog"
       # Naming the command is not the same as offering to run it: my-lc knows
       # the recorder is behind, and it is the one thing to do about it.
       if [ "$RUNLOG_STALE" = 1 ]; then
@@ -5611,6 +5634,9 @@ rt_runlog() {
   RUNLOG_PLIST_DIR_SAVE=$RUNLOG_PLIST_DIR; RUNLOG_PLIST_DIR="$_fake"
   RUNLOG_STATE_SAVE2=$RUNLOG_STATE; RUNLOG_STATE="$_rl/@USER@/my-lc"
   runlog_plist_content "$(runlog_program)" > "$(runlog_plist)"
+  t_eq 'the plist names who installed it, right after the DOCTYPE' \
+    "<!-- installed by $SCRIPT_NAME install ($(id -un)) on" \
+    "$(sed -n 3p "$(runlog_plist)" | cut -d' ' -f1-7)"
   _o=$(cmd_install 2>&1)
   case "$_o" in *'already installed'*) t_no 'install reports' 'a status, not a bare line' "$_o" ;;
     *'run recorder is installed'*) t_ok 'install on an installed recorder reports its state' ;;
@@ -5618,6 +5644,19 @@ rt_runlog() {
   case "$_o" in *'record(s)'*) t_ok 'and says how much it has actually collected' ;;
     *'no records yet'*) t_ok 'and says plainly that it has collected nothing yet' ;;
     *) t_no 'install status counts' 'record(s) or "no records yet"' "$_o" ;; esac
+  # a plist from before the comment: the same job otherwise, so it is only
+  # named (root writes it again); one that differs otherwise is left alone
+  grep -v '^<!-- installed by ' "$(runlog_plist)" > "$_rl/bare" && cat "$_rl/bare" > "$(runlog_plist)"
+  _o=$(cmd_install 2>&1)
+  if [ "$(id -u)" = 0 ]; then t_skip 'a plist without the comment' 'running as root'
+  else case "$_o" in *"has no installer comment -- '$SCRIPT_NAME install' as root writes it"*)
+         t_ok 'a plist without the installer comment is named, for root to write again' ;;
+       *) t_no 'no installer comment' "has no installer comment -- ... as root writes it" "$_o" ;; esac
+  fi
+  printf '<!-- x -->\n' >> "$(runlog_plist)"
+  _o=$(cmd_install 2>&1)
+  case "$_o" in *'differs from what this my-lc writes'*) t_ok '...and one that differs otherwise is left alone, and said' ;;
+    *) t_no 'differs otherwise' 'differs from what this my-lc writes' "$_o" ;; esac
   RUNLOG_PLIST_DIR=$RUNLOG_PLIST_DIR_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE2
 
   # and it must refuse politely rather than half-installing
