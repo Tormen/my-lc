@@ -4288,33 +4288,45 @@ t_residue() {
   # the flag but leaves the entry, and one per fixture label accumulates in
   # the domain's override database run after run. The file is root-owned, so
   # this only works when the suite runs as root; otherwise say what is left.
+  # the system domain's file has no uid component; a gui domain's does
   if [ "$DOMAIN" = system ]; then _dbf=/var/db/com.apple.xpc.launchd/disabled.plist
   else _dbf=/var/db/com.apple.xpc.launchd/disabled.$DOMAIN_UID.plist; fi
+  t_residue_list "$_dbf" > "$TMPD/residue"
   if [ -w "$_dbf" ]; then
     _removed=0
-    for _rl in $(launchctl print-disabled "$DOMAIN" 2>/dev/null \
-                 | awk -F'"' -v p="$SELFTEST_PREFIX" '$2 ~ p { print $2 }'); do
+    while IFS= read -r _rl; do
       t_guard "$_rl"
-      plutil -remove "$_rl" "$_dbf" >/dev/null 2>&1 && _removed=$((_removed + 1))
-    done
+      sh -c "$(t_undisable_cmd "$_rl" "$_dbf")" >/dev/null 2>&1 && _removed=$((_removed + 1))
+    done < "$TMPD/residue"
     [ "$_removed" -gt 0 ] && printf '\ncleaned up %s selftest entr%s from %s\n' \
       "$_removed" "$( [ "$_removed" = 1 ] && printf 'y' || printf 'ies' )" "$_dbf"
+    t_residue_list "$_dbf" > "$TMPD/residue"
   fi
-  _res=$(launchctl print-disabled "$DOMAIN" 2>/dev/null \
-         | grep -c "$SELFTEST_PREFIX" 2>/dev/null)
-  [ "${_res:-0}" -gt 0 ] 2>/dev/null || return 0
+  _res=$(wc -l < "$TMPD/residue" | tr -d ' ')
+  [ "$_res" -gt 0 ] || return 0
   printf '\n%sleft behind%s: %s selftest label(s) remain listed in the %s\n' \
     "$C_WARN" "$C_OFF" "$_res" "override database"
   printf '  as "=> enabled", which disables nothing. The suite removes these\n'
   printf '  itself when it can write the file, but it is root-owned. As root:\n'
-  # the system domain's file has no uid component; a gui domain's does
-  if [ "$DOMAIN" = system ]; then _dbf=/var/db/com.apple.xpc.launchd/disabled.plist
-  else _dbf=/var/db/com.apple.xpc.launchd/disabled.$DOMAIN_UID.plist; fi
-  launchctl print-disabled "$DOMAIN" 2>/dev/null \
-    | awk -F'"' -v p="$SELFTEST_PREFIX" -v f="$_dbf" \
-        '$2 ~ p { print "    plutil -remove " $2 " " f }'
+  while IFS= read -r _rl; do
+    printf '    %s\n' "$(t_undisable_cmd "$_rl" "$_dbf")"
+  done < "$TMPD/residue"
   printf '  followed by a reboot, since launchd caches the file in memory.\n'
 }
+
+# The selftest labels in launchd's disabled-database file $1. The FILE, not
+# 'launchctl print-disabled': launchd keeps its own copy until the next boot,
+# so an entry already removed from the file would still be listed there.
+t_residue_list() {
+  plutil -p -- "$1" 2>/dev/null \
+    | awk -F'"' -v p="$SELFTEST_PREFIX" 'index($2, p) == 1 { print $2 }'
+}
+
+# The command that removes label $1 from launchd's disabled-database file $2:
+# the suite runs it as root and prints it for root otherwise. PlistBuddy, not
+# 'plutil -remove' -- plutil reads the dots in a label as a key path and
+# removes nothing.
+t_undisable_cmd() { printf "/usr/libexec/PlistBuddy -c 'Delete :%s' %s" "$1" "$2"; }
 
 t_summary() {
   printf '\n%s%s%s  passed %s  failed %s  skipped %s\n' \
@@ -4349,6 +4361,13 @@ rt_static() {
   # would never run, with the plan still looking complete.
   t_eq 'every test function is in the run list' \
        "$(grep -c '^rt_[a-z_]*() {$' "$0")" "$(wc -l < "$TMPD/called" | tr -d ' ')"
+  # the removal command for a leftover label must work on a label with dots
+  # in it -- every label has them -- and remove nothing else
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>%s-x</key><false/><key>com.x.keep</key><true/></dict></plist>\n' \
+    "$SELFTEST_PREFIX" > "$TMPD/dis.plist"
+  sh -c "$(t_undisable_cmd "$SELFTEST_PREFIX-x" "$TMPD/dis.plist")" >/dev/null 2>&1
+  t_eq 'the leftover-label removal deletes that dotted label, and only it' \
+       '"com.x.keep" => true' "$(plutil -p -- "$TMPD/dis.plist" | awk '/=>/ { $1 = $1; print }')"
   "$0" -h >/dev/null 2>&1;    t_eq '-h exits 0' 0 $?
   "$0" --help >/dev/null 2>&1; t_eq '--help exits 0' 0 $?
   t_eq 'usage line follows the convention' 'usage: my-lc [OPTIONS] [FILTER ...] [VERB]' \
