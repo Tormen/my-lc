@@ -4219,17 +4219,22 @@ _rt() {
     return 1
   fi
   if [ -n "$_rt_cur" ]; then
-    if [ "$T_FAIL" = "$_rt_bad" ]; then printf 'ok %s - %s\n' "$_rt_k" "$_rt_cur"
-    else printf 'not ok %s - %s\n' "$_rt_k" "$_rt_cur"; fi
+    if [ "$T_FAIL" = "$_rt_bad" ]; then _rt_v=ok; else _rt_v='not ok'; fi
+    _rt_tap "$_rt_v" "$_rt_k" "$_rt_cur" $(( $(date +%s) - _rt_t0 ))
   fi
   _rt_cur=; SELFTEST_PREFIX=$SELFTEST_BASE; TMPD=$T_ROOT
   [ -n "$1" ] && _rt_want "$1" || return 1
-  _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL
+  _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL; _rt_t0=$(date +%s)
   # a world of its own: its labels, its dir, its config
   SELFTEST_PREFIX="$SELFTEST_BASE-$1"
   TMPD="$T_ROOT/$1"; mkdir "$TMPD"
   t_conf
 }
+
+# A test's result: its TAP line ($1 ok / not ok, $2 number, $3 name), then
+# a TAP comment with how long it took ($4 seconds) -- what tells the slow
+# tests from the fast ones.
+_rt_tap() { printf '%s %s - %s\n# %ss %s\n' "$1" "$2" "$3" "$4" "$3"; }
 
 # Child my-lc runs must discover the fixture plists, which live in the
 # test's dir rather than a real LaunchAgents directory - so hand them a
@@ -4382,6 +4387,8 @@ rt_static() {
   sh -c "$(t_undisable_cmd "$SELFTEST_PREFIX-x" "$TMPD/dis.plist")" >/dev/null 2>&1
   t_eq 'the leftover-label removal deletes that dotted label, and only it' \
        '"com.x.keep" => true' "$(plutil -p -- "$TMPD/dis.plist" | awk '/=>/ { $1 = $1; print }')"
+  t_eq 'a test result is its TAP line, then its time as a TAP comment' \
+       "$(printf 'not ok 3 - x\n# 7s x')" "$(_rt_tap 'not ok' 3 x 7)"
   "$0" -h >/dev/null 2>&1;    t_eq '-h exits 0' 0 $?
   "$0" --help >/dev/null 2>&1; t_eq '--help exits 0' 0 $?
   t_eq 'usage line follows the convention' 'usage: my-lc [OPTIONS] [FILTER ...] [VERB]' \
