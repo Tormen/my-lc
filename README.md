@@ -308,11 +308,12 @@ a way to learn the raw commands.
   argument as launchd would run it, quoted where needed:
   `/bin/sh -c "echo hi there"`. `program: /bin/sh` on its own says almost
   nothing.
-- **`restart` retries the bootstrap.** `bootout` returns before launchd has
-  released the label, so an immediate `bootstrap` can fail with
+- **Every stop waits for launchd to let go.** `bootout` returns before
+  launchd has released the label, so an immediate `bootstrap` can fail with
   `Input/output error` — leaving the service stopped, the opposite of what
-  a restart is for. If a start really cannot succeed, my-lc says the service
-  is now stopped rather than leaving you to notice.
+  a restart is for. my-lc waits until the label is gone (`RELEASE_WAIT`,
+  10s). If a start still fails, my-lc says the service is now stopped and
+  exits non-zero.
 - **`status` dates the plist itself** — when it was written and whether it
   has changed since. An old plist edited yesterday is a different story
   from one untouched since it was installed.
@@ -429,7 +430,7 @@ and harmless once the completion is gone.
 
 Drop `my-lc` in the path. It installs its own zsh completion on first run.
 
-Every tunable (`RUN_WAIT`, `BOOTSTRAP_TRIES`, `CAL_SKEW`, the recorder's
+Every tunable (`RUN_WAIT`, `RELEASE_WAIT`, `CAL_SKEW`, the recorder's
 `RUNLOG_*`, `TIME_FORMAT`, ...) is in the config; `my-lc --create-config`
 prints it, annotated. `my-lc --version` names the exact build: a hash of the
 file itself, plus the commit it was stamped from.

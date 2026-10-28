@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="c11f93b"
+SCRIPT_COMMIT="372ab99"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-13-gc11f93b"
+SCRIPT_RELEASE="v1.0.5-23-g372ab99"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -63,7 +63,7 @@ AGENT_DIRS=
 STATE_DIR=
 ERR_TAIL=10
 BIG_DELTA=1048576
-BOOTSTRAP_TRIES=3
+RELEASE_WAIT=10
 RUN_WAIT=5
 CAL_SKEW=300
 RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
@@ -498,10 +498,11 @@ STATE_DIR="/var/lib/mine/$(id -un)/my-lc"
 # Lines of stderr/stdout shown by 'status' when no watermark exists yet.
 ERR_TAIL=10
 
-# How many times to try a bootstrap. launchd can still be tearing the old
-# instance down straight after a bootout, and reports 'Input/output error'
-# until it is done; one retry a second apart clears it.
-BOOTSTRAP_TRIES=3
+# How long (seconds) a bootout waits for launchd to let go of the service.
+# bootout returns BEFORE launchd has released the label, and a bootstrap in
+# that window fails with 'Input/output error' and leaves the service stopped.
+# Every bootout therefore waits until the label is gone; past this it fails.
+RELEASE_WAIT=10
 
 # How far a calendar job may run from its scheduled minute before my-lc says
 # so. Two INDEPENDENT sources answer "when did it last run" for such a job:
@@ -1802,8 +1803,8 @@ cmd_install() {
         fi
         if [ "$_ans" = go ]; then
           printf '\n'
-          # the tested path, including the bootstrap retry: launchd needs a
-          # moment to release a label after a bootout
+          # the tested path, including the wait for launchd to let go of the
+          # label after the bootout
           # every variable v_restart reads about the service, not just the
           # ones that were obvious: it stops FIRST, so a missing one is not a
           # refusal, it is a service left stopped
@@ -1894,7 +1895,7 @@ cmd_uninstall() {
     printf '\n'
   fi
   msgn "stopping $RUNLOG_LABEL ..."; [ "$VRB" = 1 ] && printf '\n'
-  if lc bootout "system/$RUNLOG_LABEL"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+  if lc_bootout "system/$RUNLOG_LABEL"; then step_ok; else step_fail "$(translate_lc_error)"; fi
   if [ -f "$_rp" ]; then
     msgn "deleting $_rp ..."; [ "$VRB" = 1 ] && printf '\n'
     if run rm -f "$_rp"; then step_ok; else step_fail 'could not remove the plist'; fi
@@ -2807,6 +2808,25 @@ lc() {
   return "$_rc"
 }
 
+# Boot out $1 (<domain>/<label>) and return once launchd has LET GO of it.
+# bootout returns before that, and a bootstrap in between fails with
+# 'Input/output error' -- on ada (2026-10-28) the run recorder was held for
+# more than two seconds, and a restart left it stopped. So every bootout
+# waits, up to RELEASE_WAIT seconds, until 'launchctl print' no longer finds
+# it; still held after that is a failure, reported like any other.
+lc_bootout() {
+  lc bootout "$1" || return
+  _lbw=$((RELEASE_WAIT * 5))
+  while launchctl print "$1" >/dev/null 2>&1; do
+    if [ "$_lbw" -le 0 ]; then
+      printf 'bootout returned 0, but launchd still had %s %ss later\n' "$1" "$RELEASE_WAIT" > "$TMPD/lcerr"
+      printf '0' > "$TMPD/lcrc"
+      return 1
+    fi
+    _lbw=$((_lbw - 1)); sleep 0.2
+  done
+}
+
 # Turn launchctl's numeric complaints into the actual cause.
 translate_lc_error() {
   _e=$(cat "$TMPD/lcerr" 2>/dev/null)
@@ -2816,6 +2836,7 @@ translate_lc_error() {
     *"Service is disabled"*)        printf 'the service is disabled; enable it first' ;;
     *"Could not find service"*)     printf 'not loaded in this domain' ;;
     *"Operation not permitted"*)    printf 'not permitted (SIP, or not root)' ;;
+    *"but launchd still had"*)     printf 'launchd did not let go of it in time (RELEASE_WAIT)' ;;
     *"Input/output error"*)         printf 'launchd refused it - see the plist checks in "status"' ;;
     *"Bootstrap failed: 37"*)       printf 'already bootstrapped' ;;
     *"already loaded"*)             printf 'already loaded' ;;
@@ -2833,7 +2854,7 @@ step_fail() {
   if [ -s "$TMPD/lcerr" ]; then
     _rc=$(cat "$TMPD/lcrc" 2>/dev/null)
     printf '    > launchctl exited %s and said:\n' "${_rc:-non-zero}" >&2
-    sed 's/^/      /' "$TMPD/lcerr" >&2
+    awk '{ print "      " $0 }' "$TMPD/lcerr" >&2
     : > "$TMPD/lcerr"
   fi
   EXITCODE=1
@@ -2891,31 +2912,19 @@ v_start() {
   write_mark "$_label" "$_ef" "$_of" exact
   msgn "starting $_label ..."; [ "$VRB" = 1 ] && printf '\n'
   det "bootstrap puts the service into the $DOMAIN domain for this boot"
-  # bootout returns before launchd has finished releasing the label, so a
-  # bootstrap straight afterwards can fail with 'Input/output error' even
-  # though nothing is wrong. Give it a moment and try again rather than
-  # leaving the service stopped, which is the worst outcome of a 'restart'.
-  _try=1
-  while :; do
-    if lc bootstrap "$DOMAIN" "$_plist"; then
-      # 'done' has to mean it worked, not merely that launchctl returned 0.
-      if launchctl print "$DOMAIN/$_label" >/dev/null 2>&1; then
-        step_ok
-        [ "$_try" -gt 1 ] && msg "(it took $_try attempts; launchd was still releasing the old instance)"
-      else step_fail 'launchctl reported success, but the service is not in the domain'; fi
-      break
-    fi
-    if [ "$_try" -ge "$BOOTSTRAP_TRIES" ]; then
-      step_fail "$(translate_lc_error)"
-      # A failed start leaves the service DOWN. Say so plainly: it is not
-      # obvious, and after a restart it is the opposite of what was wanted.
-      printf '    > %s is now STOPPED. Try: %s %s start\n' \
-        "$_label" "$SCRIPT_NAME" "$_label" >&2
-      break
-    fi
-    _try=$((_try + 1))
-    sleep 1
-  done
+  # A restart's bootout has already waited for launchd to let go of the old
+  # instance (lc_bootout), so one bootstrap is all it takes.
+  if lc bootstrap "$DOMAIN" "$_plist"; then
+    # 'done' has to mean it worked, not merely that launchctl returned 0.
+    if launchctl print "$DOMAIN/$_label" >/dev/null 2>&1; then step_ok
+    else step_fail 'launchctl reported success, but the service is not in the domain'; fi
+  else
+    step_fail "$(translate_lc_error)"
+    # A failed start leaves the service DOWN. Say so plainly: it is not
+    # obvious, and after a restart it is the opposite of what was wanted.
+    printf '    > %s is now STOPPED. Try: %s %s start\n' \
+      "$_label" "$SCRIPT_NAME" "$_label" >&2
+  fi
 }
 
 v_stop() {
@@ -2924,7 +2933,7 @@ v_stop() {
   esac
   msgn "stopping $_label ..."; [ "$VRB" = 1 ] && printf '\n'
   det "bootout removes it from the running domain; it returns at the next boot"
-  if lc bootout "$DOMAIN/$_label"; then
+  if lc_bootout "$DOMAIN/$_label"; then
     step_ok
     case "$_trig" in
       *boot*) det "this one has RunAtLoad, so it will be back after a reboot; 'disable' is the permanent form" ;;
@@ -3053,7 +3062,7 @@ v_disable() {
   if [ "$NOW" = 1 ] && { [ "$_state" = on ] || [ "$_state" = '@off' ]; }; then
     msgn "stopping $_label ..."; [ "$VRB" = 1 ] && printf '\n'
     det "bootout first, so the running instance goes away too"
-    if lc bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+    if lc_bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
   fi
   case "$_state" in
     off|@off) msg "$_label is already disabled"; return 0 ;;
@@ -3208,7 +3217,7 @@ v_delete() {
   esac
   if [ "$_state" = on ] || [ "$_state" = '@off' ]; then
     msgn "stopping $_label ..."; [ "$VRB" = 1 ] && printf '\n'
-    if lc bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
+    if lc_bootout "$DOMAIN/$_label"; then step_ok; else step_fail "$(translate_lc_error)"; fi
   fi
   # Disable as well as remove: if whatever installed this plist puts it back
   # - an app re-blessing its helper, say - the flag keeps the service off,
@@ -4284,7 +4293,7 @@ t_conf() {
     printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
     printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
     printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nBOOTSTRAP_TRIES=3\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nRELEASE_WAIT=10\nWIDTH_LABEL=auto\nCOLOR=never\n'
     printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 }
@@ -5333,17 +5342,40 @@ rt_restartrace() {
   done
   t_eq 'eight restarts in a row all end with the service running' 0 "$_fails"
 
-  # and if a start really cannot succeed, it must SAY the service is down
-  _bad="$SELFTEST_PREFIX-race2"; t_guard "$_bad"
-  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-    printf '<plist version="1.0"><dict>\n'
-    printf '  <key>Label</key><string>%s</string>\n' "$_bad"
-    printf '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
-    printf '</dict></plist>\n'; } > "$_rd/$_bad.plist"
-  BOOTSTRAP_TRIES_SAVE=$BOOTSTRAP_TRIES
-  t_eq 'the retry count is configurable' '3' "$("$0" --create-config | awk -F= '/^BOOTSTRAP_TRIES=/ {print $2}')"
-  BOOTSTRAP_TRIES=$BOOTSTRAP_TRIES_SAVE
+  # A label launchd lets go of LATE: the real launchctl, except that after a
+  # bootout of this label it still prints it, and refuses a bootstrap with
+  # rc 5, for $T_LAG seconds -- ada's run recorder, 2026-10-28, was held
+  # longer than three bootstraps a second apart could wait out.
+  _sd="$TMPD/stub"; mkdir "$_sd"
+  cat > "$_sd/launchctl" <<STUB
+#!/bin/dash
+case "\$1" in
+  print)     [ -e "$_rd/held" ] && [ "\$2" = "$DOMAIN/$_lab" ] && exit 0 ;;
+  bootstrap) [ -e "$_rd/held" ] && { echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; } ;;
+  bootout)   if [ "\$2" = "$DOMAIN/$_lab" ]; then
+               /bin/launchctl "\$@" || exit; : > "$_rd/held"
+               ( sleep "\$T_LAG"; rm -f "$_rd/held" ) >/dev/null 2>&1 &
+               exit 0
+             fi ;;
+esac
+exec /bin/launchctl "\$@"
+STUB
+  chmod 755 "$_sd/launchctl"
+  _o=$(T_LAG=3 PATH="$_sd:$PATH" MY_LC_CONFIG="$_rd/conf" "$0" $_sf "$_lab" restart --go 2>&1)
+  t_eq 'a restart waits until launchd has let go of the old instance [rc]' 0 "$?"
+  t_eq '...and leaves the service running' on "$(t_state "$_lab")"
+  # and when it is held past RELEASE_WAIT, the restart FAILS, and says so --
+  # from a RUNNING service, whatever the case above left
+  sleep 3; MY_LC_CONFIG="$_rd/conf" "$0" $_sf "$_lab" start >/dev/null 2>&1
+  printf 'RELEASE_WAIT=1\n' >> "$_rd/conf"
+  _o=$(T_LAG=3 PATH="$_sd:$PATH" MY_LC_CONFIG="$_rd/conf" "$0" $_sf "$_lab" restart --go 2>&1)
+  _rc=$?
+  case "$_rc" in 0) t_no 'a restart that cannot start it exits non-zero' 'rc != 0' "rc 0: $_o" ;;
+                 *) t_ok "a restart that cannot start it exits non-zero [rc $_rc]" ;; esac
+  case "$_o" in *'did not let go'*'is now STOPPED'*) t_ok '...and says launchd held it, and that it is now STOPPED' ;;
+    *) t_no 'the failure is explained' "launchd did not let go ... is now STOPPED" "$_o" ;; esac
+  sleep 3
+  t_eq 'the release wait is configurable' '10' "$("$0" --create-config | awk -F= '/^RELEASE_WAIT=/ {print $2}')"
   cleanup_fixtures
 }
 
