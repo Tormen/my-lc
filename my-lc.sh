@@ -4107,7 +4107,10 @@ main() {
 # ======================================================================
 
 T_PASS=0; T_FAIL=0; T_SKIP=0
-SELFTEST_PREFIX=eu.no-panic.my-lc-selftest
+# Every fixture label starts with the BASE; inside a test, with the test's
+# own prefix (base-<test name>), so a test acts only on its own labels.
+SELFTEST_BASE=eu.no-panic.my-lc-selftest
+SELFTEST_PREFIX=$SELFTEST_BASE
 
 t_ok()   { T_PASS=$((T_PASS+1)); printf '  PASS  %s\n' "$1"; }
 t_no()   { T_FAIL=$((T_FAIL+1)); EXITCODE=1
@@ -4121,10 +4124,10 @@ t_sec()  { printf '\n%s%s%s\n' "$C_HDR" "$1" "$C_OFF"; }
 # Nothing may ever act on a label that is not ours.
 t_guard() {
   case "$1" in
-    "$SELFTEST_PREFIX"*) return 0 ;;
+    "$SELFTEST_BASE"-*) return 0 ;;
   esac
   printf '\nABORT: a test tried to act on %s, which is not a selftest label\n' "$1" >&2
-  cleanup_fixtures; exit 2
+  cleanup_fixtures "$SELFTEST_BASE"; exit 2
 }
 
 t_plist() {
@@ -4159,10 +4162,13 @@ t_state() {
   else                                       printf 'off'; fi
 }
 
+# Boot out and re-enable every fixture under prefix $1 -- by default the
+# current test's own, so one test never takes down another's.
 cleanup_fixtures() {
+  _cfp="${1:-$SELFTEST_PREFIX}-"
   for _l in $(launchctl print-disabled "$DOMAIN" 2>/dev/null \
-              | awk -F'"' '{print $2}' | grep "^$SELFTEST_PREFIX" ; \
-              launchctl list 2>/dev/null | awk '{print $3}' | grep "^$SELFTEST_PREFIX"); do
+              | awk -F'"' -v p="$_cfp" 'index($2, p) == 1 { print $2 }' ; \
+              launchctl list 2>/dev/null | awk -v p="$_cfp" 'index($3, p) == 1 { print $3 }'); do
     t_guard "$_l"
     launchctl bootout "$DOMAIN/$_l" >/dev/null 2>&1
     launchctl enable  "$DOMAIN/$_l" >/dev/null 2>&1
@@ -4216,9 +4222,32 @@ _rt() {
     if [ "$T_FAIL" = "$_rt_bad" ]; then printf 'ok %s - %s\n' "$_rt_k" "$_rt_cur"
     else printf 'not ok %s - %s\n' "$_rt_k" "$_rt_cur"; fi
   fi
-  _rt_cur=
+  _rt_cur=; SELFTEST_PREFIX=$SELFTEST_BASE; TMPD=$T_ROOT
   [ -n "$1" ] && _rt_want "$1" || return 1
   _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL
+  # a world of its own: its labels, its dir, its config
+  SELFTEST_PREFIX="$SELFTEST_BASE-$1"
+  TMPD="$T_ROOT/$1"; mkdir "$TMPD"
+  t_conf
+}
+
+# Child my-lc runs must discover the fixture plists, which live in the
+# test's dir rather than a real LaunchAgents directory - so hand them a
+# config that adds it. This keeps the suite self-contained: nothing is
+# ever written into the user's own LaunchAgents.
+t_conf() {
+  T_CONF="$TMPD/test.conf"
+  {
+    printf 'DEFAULT_COMMAND=status\n'
+    printf 'DEFAULT_FILTER_STATE=all\n'
+    printf 'DEFAULT_SCOPE=%s\n' "$TESTS_SCOPE"
+    printf 'ALL_MEANS=non-apple\n'
+    printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
+    printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
+    printf 'STATE_DIR="%s/state"\n' "$TMPD"
+    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nBOOTSTRAP_TRIES=3\nWIDTH_LABEL=auto\nCOLOR=never\n'
+    printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
+  } > "$T_CONF"
 }
 _rt_want() { case "$1" in *"$TESTS_FILTER"*) return 0 ;; esac; return 1; }
 
@@ -4240,31 +4269,16 @@ run_tests() {
   printf '%smy-lc %s self-tests — domain %s%s\n' "$C_HDR" "$VERSION" "$DOMAIN" "$C_OFF"
 
   # refuse to run if a stale fixture is lying around
-  if launchctl list 2>/dev/null | awk '{print $3}' | grep -q "^$SELFTEST_PREFIX"; then
+  if launchctl list 2>/dev/null | awk -v p="$SELFTEST_BASE-" 'index($3, p) == 1' | grep -q .; then
     printf '\na selftest service is already loaded; booting it out first\n'
-    cleanup_fixtures
+    cleanup_fixtures "$SELFTEST_BASE"
   fi
-  trap 'cleanup_fixtures; cleanup' EXIT
+  trap 'cleanup_fixtures "$SELFTEST_BASE"; TMPD=$T_ROOT; cleanup' EXIT
   ensure_state_dir || true
 
-  # Child my-lc runs must discover the fixture plists, which live in the
-  # temp dir rather than a real LaunchAgents directory - so hand them a
-  # config that adds it. This keeps the suite self-contained: nothing is
-  # ever written into the user's own LaunchAgents.
-  T_CONF="$TMPD/test.conf"
-  {
-    printf 'DEFAULT_COMMAND=status\n'
-    printf 'DEFAULT_FILTER_STATE=all\n'
-    printf 'DEFAULT_SCOPE=%s\n' "$TESTS_SCOPE"
-    printf 'ALL_MEANS=non-apple\n'
-    printf 'DAEMON_DIRS="%s /Library/LaunchDaemons"\n' "$TMPD"
-    printf 'AGENT_DIRS="%s %s/Library/LaunchAgents"\n' "$TMPD" "$HOME"
-    printf 'STATE_DIR="%s/state"\n' "$TMPD"
-    printf 'ERR_TAIL=10\nBIG_DELTA=1048576\nBOOTSTRAP_TRIES=3\nWIDTH_LABEL=auto\nCOLOR=never\n'
-    printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
-  } > "$T_CONF"
-
-  # and the suite's own view of the machine
+  # the suite's own view of the machine, taken once in the run's own dir
+  # (T_ROOT); each test then works in a dir of its own below it
+  T_ROOT=$TMPD
   APPLE_MODE=exclude
   FILTER_STATE=all
   build_db
@@ -4272,7 +4286,7 @@ run_tests() {
   # one line per test as it ends, numbered in list order: 'ok K - name'
   _rt_k=0
   _rt_list
-  cleanup_fixtures
+  cleanup_fixtures "$SELFTEST_BASE"
   t_residue
   t_summary
 }
@@ -4319,7 +4333,7 @@ t_residue() {
 # so an entry already removed from the file would still be listed there.
 t_residue_list() {
   plutil -p -- "$1" 2>/dev/null \
-    | awk -F'"' -v p="$SELFTEST_PREFIX" 'index($2, p) == 1 { print $2 }'
+    | awk -F'"' -v p="$SELFTEST_BASE-" 'index($2, p) == 1 { print $2 }'
 }
 
 # The command that removes label $1 from launchd's disabled-database file $2:
@@ -4374,13 +4388,20 @@ rt_static() {
        "$("$0" -h 2>/dev/null | head -n 1)"
 }
 
+# The domain's disabled set, without the fixtures of OTHER tests: those come
+# and go while this one runs, and are not its business.
+t_disabled_but_others() {
+  launchctl print-disabled "$DOMAIN" 2>/dev/null \
+    | awk -v b="\"$SELFTEST_BASE-" -v o="\"$SELFTEST_PREFIX-" 'index($0, b) && !index($0, o) { next } { print }'
+}
+
 rt_readonly() {
   t_sec 'B. read-only, against the real machine'
   # Only the disabled set is a valid invariant here. A full 'launchctl list'
   # snapshot changes on its own on a live machine - transient XPC services
   # come and go and pids move - so comparing it made this assertion flaky
   # and told us nothing about my-lc.
-  _before=$(launchctl print-disabled "$DOMAIN" 2>/dev/null)
+  _before=$(t_disabled_but_others)
 
   # every service lands in exactly one state, none dropped or duplicated
   _tot=$(wc -l < "$DB" | tr -d ' ')
@@ -4423,13 +4444,13 @@ rt_readonly() {
   t_eq 'a .plist path resolves to the label'    "$_one" "$(resolve_target "$_onep")"
   t_eq 'domain/label resolves to the label'     "$_one" "$(resolve_target "$DOMAIN/$_one")"
 
-  _after=$(launchctl print-disabled "$DOMAIN" 2>/dev/null)
+  _after=$(t_disabled_but_others)
   if [ "$_before" = "$_after" ]; then t_ok 'read-only work left every enable/disable flag untouched'
   else t_no 'read-only work mutated nothing' 'an identical disabled set' 'the disabled set changed'; fi
   # and no selftest service is LOADED during the read-only block. Counting
   # every mention of the prefix was wrong: leftover '=> enabled' entries in
   # the disabled database also match, and those are not loaded services.
-  _leak=$(grep -c "$SELFTEST_PREFIX" "$TMPD/loaded" 2>/dev/null)
+  _leak=$(grep -c "$SELFTEST_BASE" "$T_ROOT/loaded" 2>/dev/null)
   t_eq 'no selftest service is loaded during the read-only block' 0 "${_leak:-0}"
 }
 
@@ -4920,8 +4941,8 @@ rt_pstime() {
   # arithmetic treats it as UTC - every start time came out shifted by the
   # timezone (two hours here). pid 1 calibrates it: launchd starts at boot,
   # and kern.boottime gives that as a true epoch.
-  [ -s "$TMPD/psmap" ] || { t_no 'a ps map exists' 'entries' 'empty'; return; }
-  _p1=$(awk -F"$FS1" '$1==1 { print $2; exit }' "$TMPD/psmap")
+  [ -s "$T_ROOT/psmap" ] || { t_no 'a ps map exists' 'entries' 'empty'; return; }
+  _p1=$(awk -F"$FS1" '$1==1 { print $2; exit }' "$T_ROOT/psmap")
   if [ -z "$_p1" ]; then t_skip 'pid 1 calibration' 'pid 1 not in the ps map'; return; fi
   if [ -z "$BOOT_EPOCH" ]; then t_skip 'pid 1 calibration' 'no boot time'; return; fi
   _skew=$(( _p1 - BOOT_EPOCH ))
@@ -4934,7 +4955,7 @@ rt_pstime() {
   # and a running service's start must agree with ps, not be hours off
   _rp=$(awk -F"$FS1" '$7 ~ /^run / { print $7; exit }' "$DB" | sed 's/.*pid //; s/ .*//')
   if [ -n "$_rp" ]; then
-    _mine=$(awk -F"$FS1" -v p="$_rp" '$1==p { print $2; exit }' "$TMPD/psmap")
+    _mine=$(awk -F"$FS1" -v p="$_rp" '$1==p { print $2; exit }' "$T_ROOT/psmap")
     _real=$(date -j -f '%a %b %d %T %Y' "$(ps -o lstart= -p "$_rp" 2>/dev/null)" '+%s' 2>/dev/null)
     if [ -n "$_mine" ] && [ -n "$_real" ]; then
       _d=$(( _mine - _real )); [ "$_d" -lt 0 ] && _d=$(( -_d ))
