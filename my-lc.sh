@@ -4175,10 +4175,10 @@ cleanup_fixtures() {
   done
 }
 
-# The run list: the tests in the order they run, one 'rt_<name>' function
-# each. It is walked twice -- once to count the plan, once to run -- so the
-# plan always comes from this same list. TESTS_FILTER picks the names that
-# contain it.
+# The run list: the tests in their order, one 'rt_<name>' function each. It
+# is read once to select and number the tests -- the plan '1..N' comes from
+# this same list -- and run_tests then runs them in lanes. TESTS_FILTER picks
+# the names that contain it.
 _rt_list() {
   _rt static       && rt_static
   _rt readonly     && rt_readonly
@@ -4211,26 +4211,58 @@ _rt_list() {
   _rt ''
 }
 
-# Open test $1 (and close the one before it with its 'ok K - name' line).
-# Returns 0 only when $1 is to run now; in the counting pass it only counts.
+# Select test $1 when its name contains the filter: it gets the next number,
+# its place in the list. Always returns 1 -- the list is only READ here; the
+# tests run in lanes (run_tests).
 _rt() {
-  if [ "$_rt_counting" = 1 ]; then
-    [ -n "$1" ] && _rt_want "$1" && _rt_n=$((_rt_n + 1))
-    return 1
-  fi
-  if [ -n "$_rt_cur" ]; then
-    if [ "$T_FAIL" = "$_rt_bad" ]; then _rt_v=ok; else _rt_v='not ok'; fi
-    _rt_tap "$_rt_v" "$_rt_k" "$_rt_cur" $(( $(date +%s) - _rt_t0 ))
-  fi
-  _rt_cur=; SELFTEST_PREFIX=$SELFTEST_BASE; TMPD=$T_ROOT
   [ -n "$1" ] && _rt_want "$1" || return 1
-  _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL; _rt_t0=$(date +%s)
-  # a world of its own: its labels, its dir, its config -- and plain output
-  # whatever the terminal, since tests compare rendered text
+  _rt_n=$((_rt_n + 1)); _rt_sel="$_rt_sel $_rt_n:$1"
+  return 1
+}
+
+# Test $2, number $1, in a world of its own -- its labels, its dir, its config,
+# plain output whatever the terminal (tests compare rendered text) -- and a
+# shell of its own, so nothing it sets reaches the next test. Its detail and
+# its TAP line go out as ONE piece when it ends: lanes side by side never
+# interleave. A test whose shell dies is 'not ok'.
+_rt_one() {
+  ( _rt_body "$1" "$2" ) > "$T_ROOT/.out.$1" 2>&1
+  _rt_el='?'; _rt_f=1
+  [ -s "$T_ROOT/.cnt.$1" ] && read -r _ _rt_f _ _rt_el < "$T_ROOT/.cnt.$1"
+  if [ "$_rt_f" = 0 ]; then _rt_v=ok; else _rt_v='not ok'; fi
+  until mkdir "$T_ROOT/.print" 2>/dev/null; do sleep 0.05; done
+  cat "$T_ROOT/.out.$1"; _rt_tap "$_rt_v" "$1" "$2" "$_rt_el"
+  rmdir "$T_ROOT/.print"
+  : > "$T_ROOT/.done.$1"
+}
+
+# _rt_one's test $2, number $1, inside the shell of its own: its counts
+# and its time go to a file, since nothing set here reaches the caller.
+_rt_body() {
+  T_PASS=0; T_FAIL=0; T_SKIP=0
   COLOR=never; setup_color
-  SELFTEST_PREFIX="$SELFTEST_BASE-$1"
-  TMPD="$T_ROOT/$1"; mkdir "$TMPD"
-  t_conf
+  SELFTEST_PREFIX="$SELFTEST_BASE-$2"
+  TMPD="$T_ROOT/$2"; mkdir "$TMPD"; t_conf
+  _t0=$(date +%s)
+  "rt_$2"
+  cleanup_fixtures
+  printf '%s %s %s %s\n' "$T_PASS" "$T_FAIL" "$T_SKIP" $(( $(date +%s) - _t0 )) > "$T_ROOT/.cnt.$1"
+}
+
+# Ctrl-C or a TERM (my-rollout's time limit): every lane stops; the EXIT trap
+# then boots out every fixture and removes the temp dir.
+# shellcheck disable=SC2329  # called from the INT/TERM traps in run_tests
+_rt_abort() {
+  for _rt_pid in $_rt_pids; do _rt_kill_tree "$_rt_pid"; done
+  printf '%s --run-tests: interrupted -- no verdict\n' "$SCRIPT_NAME" >&2
+  exit "$1"
+}
+# shellcheck disable=SC2329  # called by _rt_abort, itself trap-invoked
+_rt_kill_tree() {
+  for _rt_c in $(ps -ax -o pid= -o ppid= | awk -v p="$1" '$2 == p { print $1 }'); do
+    _rt_kill_tree "$_rt_c"
+  done
+  kill "$1" 2>/dev/null
 }
 
 # A test's result: its TAP line ($1 ok / not ok, $2 number, $3 name), then
@@ -4261,7 +4293,7 @@ _rt_want() { case "$1" in *"$TESTS_FILTER"*) return 0 ;; esac; return 1; }
 run_tests() {
   setup_color
   SCOPE=$TESTS_SCOPE
-  _rt_n=0; _rt_cur=; _rt_counting=1; _rt_list; _rt_counting=0
+  _rt_n=0; _rt_sel=; _rt_list
   case "$TESTS_SCOPE" in
     daemons)
       if [ "$(id -u)" != 0 ]; then
@@ -4290,9 +4322,42 @@ run_tests() {
   FILTER_STATE=all
   build_db
 
-  # one line per test as it ends, numbered in list order: 'ok K - name'
-  _rt_k=0
-  _rt_list
+  # Lanes: one per core, the tests dealt round-robin (which spreads the slow
+  # ones). A test keeps its number from the list, so its 'ok K - name' line
+  # is the same whatever order the lanes finish in. No test needs a lane of
+  # its own: the ones that time something passed three runs in a row beside
+  # all the others.
+  _rt_w=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+  case "$_rt_w" in ''|*[!0-9]*|0) _rt_w=1 ;; esac
+  _rt_i=0
+  for _rt_e in $_rt_sel; do
+    _rt_l=$((_rt_i % _rt_w)); _rt_i=$((_rt_i + 1))
+    eval "_rt_lane_$_rt_l=\"\${_rt_lane_$_rt_l:-} \$_rt_e\""
+  done
+  _rt_pids=
+  trap '_rt_abort 130' INT; trap '_rt_abort 143' TERM
+  _rt_l=0
+  while [ "$_rt_l" -lt "$_rt_w" ]; do
+    eval "_rt_lane=\${_rt_lane_$_rt_l:-}"
+    _rt_l=$((_rt_l + 1))
+    [ -n "$_rt_lane" ] || continue
+    ( for _rt_e in $_rt_lane; do _rt_one "${_rt_e%%:*}" "${_rt_e#*:}"; done ) &
+    _rt_pids="$_rt_pids $!"
+  done
+  wait
+  trap - INT TERM
+
+  # the totals, and a line for each test whose lane died before it
+  T_PASS=0; T_FAIL=0; T_SKIP=0
+  for _rt_e in $_rt_sel; do
+    _rt_k=${_rt_e%%:*}
+    if [ -s "$T_ROOT/.cnt.$_rt_k" ] && read -r _rt_p _rt_f _rt_s _ < "$T_ROOT/.cnt.$_rt_k"; then
+      T_PASS=$((T_PASS + _rt_p)); T_FAIL=$((T_FAIL + _rt_f)); T_SKIP=$((T_SKIP + _rt_s))
+    else
+      T_FAIL=$((T_FAIL + 1))
+      [ -e "$T_ROOT/.done.$_rt_k" ] || printf 'not ok %s - %s (its lane ended before it)\n' "$_rt_k" "${_rt_e#*:}"
+    fi
+  done
   cleanup_fixtures "$SELFTEST_BASE"
   t_residue
   t_summary
@@ -4928,16 +4993,17 @@ rt_verbose() {
   # the merge must not duplicate a label, and must not lose one
   _dup=$(printf '%s\n' "$_ob" | awk 'NR>1 { print $1 " " $2 }' | sort | uniq -d | wc -l | tr -d ' ')
   t_eq '--both produces no duplicate domain+label pairs' 0 "$_dup"
-  # the '? = ...' footer is not a row
-  _nd=$("$0" --all list 2>/dev/null | awk 'NR>1 && $1!="?"' | wc -l | tr -d ' ')
-  _nb=$(printf '%s\n' "$_ob" | awk 'NR>1 && $1=="system"' | wc -l | tr -d ' ')
+  # the '? = ...' footer is not a row, and the suite's own fixtures are left
+  # out: other tests load and unload them between the two listings
+  _nd=$("$0" --all list 2>/dev/null | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1' | wc -l | tr -d ' ')
+  _nb=$(printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1=="system" && index($2, b) != 1' | wc -l | tr -d ' ')
   t_eq '--both keeps every daemon the daemon-only view had' "$_nd" "$_nb"
 
   # ...and every agent, with the same state. The loaded set is per domain
   # and lives in one file, so a missing reload between the passes silently
   # judged agents against the daemons' loaded list.
-  "$0" --all --agents list 2>/dev/null | awk 'NR>1 && $1!="?" {print $1, $2}' | sort > "$TMPD/ag.only"
-  printf '%s\n' "$_ob" | awk 'NR>1 && $1 ~ /^gui\// {print $2, $3}' | sort > "$TMPD/ag.both"
+  "$0" --all --agents list 2>/dev/null | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1 {print $1, $2}' | sort > "$TMPD/ag.only"
+  printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1 ~ /^gui\// && index($2, b) != 1 {print $2, $3}' | sort > "$TMPD/ag.both"
   if cmp -s "$TMPD/ag.only" "$TMPD/ag.both"; then
     t_ok '--both agrees with --agents on every agent and its state'
   else
@@ -5000,9 +5066,13 @@ rt_logsizes() {
   _wf="$_wd/root/my-lc/runs.tsv"
   t_eq 'with nothing recorded it reads the backfill window' 900 "$(runlog_window)"
   printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 30 ))" > "$_wf"
-  t_eq 'a fresh record still reads a whole poll plus the overlap' 70 "$(runlog_window)"
+  # the record is dated now, and runlog_window reads the clock again: a second
+  # boundary in between adds one, so one tick over is the same answer
+  case "$(runlog_window)" in 70|71) t_ok 'a fresh record still reads a whole poll plus the overlap' ;;
+    *) t_no 'a fresh record' 70 "$(runlog_window)" ;; esac
   printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 400 ))" > "$_wf"
-  t_eq 'a gap is covered to its far end' 410 "$(runlog_window)"
+  case "$(runlog_window)" in 410|411) t_ok 'a gap is covered to its far end' ;;
+    *) t_no 'a gap is covered to its far end' 410 "$(runlog_window)" ;; esac
   printf '%s\troot\tx\tEND\t-\n' "$(( $(now_epoch) - 99999 ))" > "$_wf"
   t_eq 'and a very long gap is capped, not paid for' 900 "$(runlog_window)"
   RUNLOG_POLL=$POLL_SAVE; RUNLOG_BACKFILL=$BF_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE4
