@@ -436,6 +436,12 @@ file itself, plus the commit it was stamped from.
 
 `my-lc --run-tests [agents|daemons] [NAME]` (NAME: only the tests whose name contains it) runs the built-in suite against the
 real launchd — never mocked — on throwaway services labelled
-`eu.no-panic.my-lc-selftest-*`, removed again on exit; `daemons` needs root.
-Run unprivileged, it can leave `=> enabled` entries for those labels in
-launchd's override database, which only root can clear.
+`eu.no-panic.my-lc-selftest-<test>-*`, removed again on exit; `daemons` needs root.
+Each test works in a world of its own — its labels, its temp dir, its config,
+plain output — and never reads what is installed for real, so the tests run in
+parallel, one lane per core (ada: 39 s one after another, 9 s in lanes). Each
+reports `ok K - name` (K is its place in the list, whatever order the lanes
+finish in) and then `# <N>s name`, its time.
+Run unprivileged, it leaves `=> enabled` entries for those labels in
+launchd's override database — a fixed set, one per fixture label — which only
+root can clear; the suite prints the commands.
