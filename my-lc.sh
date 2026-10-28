@@ -4450,8 +4450,11 @@ rt_readonly() {
   # and no selftest service is LOADED during the read-only block. Counting
   # every mention of the prefix was wrong: leftover '=> enabled' entries in
   # the disabled database also match, and those are not loaded services.
-  _leak=$(grep -c "$SELFTEST_BASE" "$T_ROOT/loaded" 2>/dev/null)
-  t_eq 'no selftest service is loaded during the read-only block' 0 "${_leak:-0}"
+  # A missing snapshot must FAIL: counted as 0, a wrong path passed silently.
+  if [ -s "$T_ROOT/loaded" ]; then
+    t_eq 'no selftest service is loaded during the read-only block' 0 \
+         "$(grep -c "$SELFTEST_BASE" "$T_ROOT/loaded")"
+  else t_no 'the loaded snapshot exists' 'a non-empty list' "nothing at $T_ROOT/loaded"; fi
 }
 
 # Drive my-lc itself, in the same scope, and return its output.
