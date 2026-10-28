@@ -5681,6 +5681,9 @@ rt_runlog() {
   # 'install' on an installed recorder must REPORT, not re-install: a daemon
   # that is up while collecting nothing looks healthy from the pid alone.
   _fake="$_rl/plistdir"; mkdir -p "$_fake"
+  # ...and a label of its own: the real one would ask launchd about the REAL
+  # recorder, and a stale one there makes install wait at its restart prompt
+  RUNLOG_LABEL_SAVE=$RUNLOG_LABEL; RUNLOG_LABEL="$SELFTEST_PREFIX-runlog"
   RUNLOG_PLIST_DIR_SAVE=$RUNLOG_PLIST_DIR; RUNLOG_PLIST_DIR="$_fake"
   RUNLOG_STATE_SAVE2=$RUNLOG_STATE; RUNLOG_STATE="$_rl/@USER@/my-lc"
   runlog_plist_content "$(runlog_program)" > "$(runlog_plist)"
@@ -5688,6 +5691,8 @@ rt_runlog() {
     "<!-- installed by $SCRIPT_NAME install ($(id -un)) on" \
     "$(sed -n 3p "$(runlog_plist)" | cut -d' ' -f1-7)"
   _o=$(cmd_install 2>&1)
+  case "$_o" in *"$RUNLOG_LABEL_SAVE"*) t_no 'install asks about the fixture recorder' "$RUNLOG_LABEL" "$_o" ;;
+    *) t_ok 'install asks about the fixture recorder, never the real one' ;; esac
   case "$_o" in *'already installed'*) t_no 'install reports' 'a status, not a bare line' "$_o" ;;
     *'run recorder is installed'*) t_ok 'install on an installed recorder reports its state' ;;
     *) t_no 'install status' 'the run recorder is installed...' "$_o" ;; esac
@@ -5707,7 +5712,7 @@ rt_runlog() {
   _o=$(cmd_install 2>&1)
   case "$_o" in *'differs from what this my-lc writes'*) t_ok '...and one that differs otherwise is left alone, and said' ;;
     *) t_no 'differs otherwise' 'differs from what this my-lc writes' "$_o" ;; esac
-  RUNLOG_PLIST_DIR=$RUNLOG_PLIST_DIR_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE2
+  RUNLOG_PLIST_DIR=$RUNLOG_PLIST_DIR_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE2; RUNLOG_LABEL=$RUNLOG_LABEL_SAVE
 
   # and it must refuse politely rather than half-installing -- against an
   # empty plist dir: a machine with the real recorder installed would answer
