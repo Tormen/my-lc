@@ -5659,11 +5659,15 @@ rt_runlog() {
     *) t_no 'differs otherwise' 'differs from what this my-lc writes' "$_o" ;; esac
   RUNLOG_PLIST_DIR=$RUNLOG_PLIST_DIR_SAVE; RUNLOG_STATE=$RUNLOG_STATE_SAVE2
 
-  # and it must refuse politely rather than half-installing
+  # and it must refuse politely rather than half-installing -- against an
+  # empty plist dir: a machine with the real recorder installed would answer
+  # about THAT one instead
   if [ "$(id -u)" = 0 ]; then
     t_skip 'install refuses without root' 'running as root'
   else
-    _o=$(MY_LC_CONFIG="$T_CONF" "$0" install 2>&1)
+    mkdir "$_rl/noplist"
+    { cat "$T_CONF"; printf 'RUNLOG_PLIST_DIR="%s"\n' "$_rl/noplist"; } > "$_rl/noplist.conf"
+    _o=$(MY_LC_CONFIG="$_rl/noplist.conf" "$0" install 2>&1)
     case "$_o" in *'needs root'*) t_ok 'install without root says so, and why' ;;
       *) t_no 'install without root' 'needs root' "$_o" ;; esac
     case "$_o" in *'admin-only'*) t_ok 'and explains that one root daemon serves every domain' ;;
