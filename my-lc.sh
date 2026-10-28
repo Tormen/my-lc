@@ -4225,7 +4225,9 @@ _rt() {
   _rt_cur=; SELFTEST_PREFIX=$SELFTEST_BASE; TMPD=$T_ROOT
   [ -n "$1" ] && _rt_want "$1" || return 1
   _rt_k=$((_rt_k + 1)); _rt_cur=$1; _rt_bad=$T_FAIL; _rt_t0=$(date +%s)
-  # a world of its own: its labels, its dir, its config
+  # a world of its own: its labels, its dir, its config -- and plain output
+  # whatever the terminal, since tests compare rendered text
+  COLOR=never; setup_color
   SELFTEST_PREFIX="$SELFTEST_BASE-$1"
   TMPD="$T_ROOT/$1"; mkdir "$TMPD"
   t_conf
@@ -5618,18 +5620,19 @@ rt_runlog() {
     'processID == 1' "$(runlog_predicate)"
 
   # colour is decided by setup_color alone: COLOR=auto tests [ -t 1 ], so a
-  # piped run is plain and nothing else strips it
-  C_SAVE=$C_ON; C_OFF_SAVE=$C_OFF
-  C_ON=$(printf '\033[32m'); C_OFF=$(printf '\033[0m')
+  # piped run is plain and nothing else strips it. Switched on here, and
+  # compared with the escapes themselves: against the C_* variables, a plain
+  # run compared empty with empty and passed without testing anything.
+  COLOR=always; setup_color
   case "$(state_render on)" in
-    *"$C_ON"*) t_ok 'the record paints STATE like the table does' ;;
+    *"$(printf '\033[32m')"*) t_ok 'the record paints STATE like the table does' ;;
     *) t_no 'state colour' 'a colour escape' "$(state_render on)" ;;
   esac
-  t_eq 'a failure is red'                    "$C_BAD"  "$(status_colour 'FAILED [1]')"
-  t_eq 'a clean exit is green'                "$C_ON"   "$(status_colour 'OK [0]')"
-  t_eq 'a run still going is yellow'          "$C_WARN" "$(status_colour 'RUNNING SINCE:x')"
-  t_eq 'and a mere state is left plain'       ''        "$(status_colour 'NOT-RUN')"
-  C_ON=$C_SAVE; C_OFF=$C_OFF_SAVE
+  t_eq 'a failure is red'               "$(printf '\033[31m')" "$(status_colour 'FAILED [1]')"
+  t_eq 'a clean exit is green'          "$(printf '\033[32m')" "$(status_colour 'OK [0]')"
+  t_eq 'a run still going is yellow'    "$(printf '\033[33m')" "$(status_colour 'RUNNING SINCE:x')"
+  t_eq 'and a mere state is left plain' ''                     "$(status_colour 'NOT-RUN')"
+  COLOR=never; setup_color
 
   # A caller that knows the plist but not the program must not be refused:
   # 'restart' stops FIRST, so a refusal there leaves the service stopped -
