@@ -4119,6 +4119,16 @@ T_PASS=0; T_FAIL=0; T_SKIP=0
 # Every fixture label starts with the BASE; inside a test, with the test's
 # own prefix (base-<test name>), so a test acts only on its own labels.
 SELFTEST_BASE=eu.no-panic.my-lc-selftest
+# a nested --run-tests (the suite's own Ctrl-C test) gets a base BELOW this
+# one, so it sweeps only its own fixtures -- never the other lanes' -- and
+# the outer run's sweep still catches whatever it leaves
+case "${MY_LC_SELFTEST_BASE:-}" in
+  '') ;;
+  "$SELFTEST_BASE"-*) SELFTEST_BASE=$MY_LC_SELFTEST_BASE ;;
+  *) printf '%s: MY_LC_SELFTEST_BASE=%s is not below %s -- refused: the suite would sweep its labels\n' \
+       "${0##*/}" "$MY_LC_SELFTEST_BASE" "$SELFTEST_BASE" >&2
+     exit 2 ;;
+esac
 SELFTEST_PREFIX=$SELFTEST_BASE
 
 t_ok()   { T_PASS=$((T_PASS+1)); printf '  PASS  %s\n' "$1"; }
@@ -4209,6 +4219,7 @@ _rt_list() {
   _rt stamp        && rt_stamp
   _rt plistchecks  && rt_plistchecks
   _rt restartrace  && rt_restartrace
+  _rt ctrlc        && rt_ctrlc
   _rt chain        && rt_chain
   _rt failures     && rt_failures
   _rt errcolumn    && rt_errcolumn
@@ -5313,6 +5324,49 @@ rt_loadeddiff() {
   esac
   t_eq 'and the service is left RUNNING, not stopped' on "$(t_state "$_slab")"
   cleanup_fixtures
+}
+
+rt_ctrlc() {
+  t_sec 'C. Ctrl-C ends the suite: exit 130, one line, its fixtures and its temp dir gone'
+  _cd="$TMPD/cc"; mkdir "$_cd" "$_cd/st"
+  _keep="$SELFTEST_PREFIX-keep"; _nb="$SELFTEST_PREFIX-nested"
+  t_guard "$_keep"
+  { printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0"><dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$_keep"
+    printf '  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>sleep 300</string></array>\n'
+    printf '  <key>RunAtLoad</key><true/>\n'
+    printf '</dict></plist>\n'; } > "$_cd/$_keep.plist"
+  printf 'AGENT_DIRS="%s"\nDAEMON_DIRS="%s"\nSTATE_DIR="%s/st"\nDEFAULT_FILTER_STATE=all\nCOLOR=never\n' \
+    "$_cd" "$_cd" "$_cd" > "$_cd/conf"
+  _sf=; [ "$SCOPE" = agents ] && _sf=--agents
+  MY_LC_CONFIG="$_cd/conf" "$0" $_sf "$_keep" enable --now >/dev/null 2>&1
+
+  # a background job of a non-interactive shell starts with SIGINT IGNORED,
+  # and an ignored signal cannot be trapped: perl puts it back to default
+  MY_LC_SELFTEST_BASE="$_nb" perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+    "$0" --run-tests "$SCOPE" restartrace > "$_cd/out" 2> "$_cd/err" &
+  _np=$!
+  _i=0; _nd=
+  while [ "$_i" -lt 100 ]; do
+    launchctl list 2>/dev/null | awk -v p="$_nb-" 'index($3, p) == 1' | grep -q . && break
+    sleep 0.2; _i=$((_i + 1))
+  done
+  for _d in /tmp/"$SCRIPT_NAME".*/restartrace; do
+    [ -d "$_d" ] && [ "${_d%/restartrace}" != "$T_ROOT" ] && _nd="${_d%/restartrace}"
+  done
+  t_eq 'the nested run got as far as a fixture of its own' yes "$( [ "$_i" -lt 100 ] && echo yes )"
+  kill -INT "$_np"; wait "$_np"; _rc=$?
+  t_eq 'exit 130' 130 "$_rc"
+  t_eq 'ONE line on stderr: interrupted, no verdict' '1:1' \
+    "$(grep -c . "$_cd/err"):$(grep -c 'interrupted -- no verdict' "$_cd/err")"
+  t_eq 'its fixtures: none left' 0 \
+    "$(launchctl list 2>/dev/null | awk -v p="$_nb-" 'index($3, p) == 1' | wc -l | tr -d ' ')"
+  t_eq 'its temp dir: gone' gone "$( [ -n "$_nd" ] && [ ! -e "$_nd" ] && echo gone )"
+  t_eq 'and a fixture of the OUTER run: still loaded -- the nested run swept only its own base' on "$(t_state "$_keep")"
+  t_eq 'a base outside the selftest prefix is refused: the suite would sweep it' 2 \
+    "$(MY_LC_SELFTEST_BASE=com.apple.x "$0" --run-tests "$SCOPE" static >/dev/null 2>&1; echo $?)"
 }
 
 rt_restartrace() {
