@@ -5201,19 +5201,10 @@ rt_plistchecks() {
 
 rt_loadeddiff() {
   t_sec 'R. the running definition versus the plist on disk'
-  # every loaded service on THIS machine must compare equal: a false
-  # positive here would cry wolf on every status
-  _bad=0; _checked=0
-  while IFS="$FS1" read -r _l _d _p _a _st _tr _su _er _ou _pr _us _ef _of _wat; do
-    [ "$_st" = on ] || continue
-    [ -n "$_p" ] && [ "$_p" != "$EM" ] || continue
-    _checked=$((_checked + 1))
-    case "$(show_loaded_diff "$_l" "$_d" "$_p")" in
-      *DIFFERS*) _bad=$((_bad + 1)); printf '        %s\n' "$_l" ;;
-    esac
-  done < "$DB"
-  if [ "$_checked" = 0 ]; then t_skip 'loaded-vs-disk on real services' 'nothing loaded to compare'
-  else t_eq "no false differences across $_checked loaded services" 0 "$_bad"; fi
+  # only the suite's own fixtures: the machine's real services are no test's
+  # business -- an agent whose plist changed since it loaded (macado,
+  # 2026-10-30: one installed at night, loaded at the next login) DIFFERS for
+  # real, and a check over them failed the suite for it
 
   # and a real change must be detected
   _dd2="$TMPD/ldiff"; mkdir -p "$_dd2/st"
