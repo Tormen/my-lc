@@ -5059,8 +5059,13 @@ rt_verbose() {
   case "$_ov" in *' as root'*) t_ok '-V spells out the user even when it is the default' ;;
     *) t_no '-V shows the default user' 'as root' "$(printf '%s\n' "$_ov" | sed -n '2p')" ;; esac
 
-  # --both merges the two domains and says which is which
+  # --both merges the two domains and says which is which. Each one-domain
+  # view is taken just before AND just after it: the machine changes while
+  # the suite runs (other tests, other suites, real jobs), so --both is held
+  # only to what the two views agree on (t_bracket).
+  t_view daemons > "$TMPD/d.before"; t_view agents > "$TMPD/a.before"
   _ob=$("$0" --all --both list 2>&1)
+  t_view daemons > "$TMPD/d.after";  t_view agents > "$TMPD/a.after"
   case "$_ob" in *'DOMAIN'*) t_ok '--both adds a DOMAIN column' ;;
     *) t_no '--both DOMAIN column' 'a DOMAIN header' "$(printf '%s\n' "$_ob" | head -n 1)" ;; esac
   _nsys=$(printf '%s\n' "$_ob" | awk 'NR>1 && $1=="system" { n++ } END { print n+0 }')
@@ -5072,24 +5077,36 @@ rt_verbose() {
   # the merge must not duplicate a label, and must not lose one
   _dup=$(printf '%s\n' "$_ob" | awk 'NR>1 { print $1 " " $2 }' | sort | uniq -d | wc -l | tr -d ' ')
   t_eq '--both produces no duplicate domain+label pairs' 0 "$_dup"
-  # the '? = ...' footer is not a row, and the suite's own fixtures are left
-  # out: other tests load and unload them between the two listings
-  _nd=$("$0" --all list 2>/dev/null | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1' | wc -l | tr -d ' ')
-  _nb=$(printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1=="system" && index($2, b) != 1' | wc -l | tr -d ' ')
-  t_eq '--both keeps every daemon the daemon-only view had' "$_nd" "$_nb"
+  printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1=="system" && index($2, b) != 1 {print $2}' | sort > "$TMPD/d.both"
+  t_eq '--both keeps every daemon the daemon-only view had, and invents none' '' \
+       "$(t_bracket "$TMPD/d.before" "$TMPD/d.after" "$TMPD/d.both")"
 
   # ...and every agent, with the same state. The loaded set is per domain
   # and lives in one file, so a missing reload between the passes silently
   # judged agents against the daemons' loaded list.
-  "$0" --all --agents list 2>/dev/null | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1 {print $1, $2}' | sort > "$TMPD/ag.only"
-  printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1 ~ /^gui\// && index($2, b) != 1 {print $2, $3}' | sort > "$TMPD/ag.both"
-  if cmp -s "$TMPD/ag.only" "$TMPD/ag.both"; then
-    t_ok '--both agrees with --agents on every agent and its state'
-  else
-    t_no '--both matches --agents' \
-      "$(wc -l < "$TMPD/ag.only" | tr -d ' ') rows" \
-      "$(wc -l < "$TMPD/ag.both" | tr -d ' ') rows, or different states"
-  fi
+  printf '%s\n' "$_ob" | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1 ~ /^gui\// && index($2, b) != 1 {print $2, $3}' | sort > "$TMPD/a.both"
+  t_eq '--both agrees with --agents on every agent and its state' '' \
+       "$(t_bracket "$TMPD/a.before" "$TMPD/a.after" "$TMPD/a.both")"
+}
+
+# One domain's rows as my-lc lists them -- daemons: the label; agents: the
+# label and its state -- sorted, without the '? = ...' footer and without the
+# suite's own fixtures, which other tests load and unload all the time.
+t_view() {
+  case "$1" in
+    daemons) "$0" --all list 2>/dev/null \
+               | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1 {print $1}' ;;
+    agents)  "$0" --all --agents list 2>/dev/null \
+               | awk -v b="$SELFTEST_BASE-" 'NR>1 && $1!="?" && index($1, b) != 1 {print $1, $2}' ;;
+  esac | sort
+}
+
+# What --both ($3) gets wrong against one domain's view taken before ($1) and
+# after ($2) it: a row both views held and --both lacks ('lost: ...'), a row
+# --both holds and neither view had ('invented: ...'). Nothing when it is right.
+t_bracket() {
+  comm -12 "$1" "$2" | comm -23 - "$3" | sed 's/^/lost: /'
+  sort -u "$1" "$2" | comm -13 - "$3" | sed 's/^/invented: /'
 }
 
 rt_pstime() {
