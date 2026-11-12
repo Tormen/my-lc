@@ -14,11 +14,11 @@ SCRIPT_NAME=my-lc
 # NOT authoritative: it is stamped by hand and goes stale silently if the
 # file is edited afterwards.
 SCRIPT_VERSION="v1.0.5"
-SCRIPT_COMMIT="372ab99"
+SCRIPT_COMMIT="0724fd7"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long' -- <nearest tag>-<commits since it>-g<short sha>. It says whether
 # these bytes ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0.5-23-g372ab99"
+SCRIPT_RELEASE="v1.0.5-26-g0724fd7"
 VERSION="$SCRIPT_VERSION"
 
 # --- runtime flags -----------------------------------------------------
@@ -53,6 +53,10 @@ TESTS_FILTER=
 COMPLETE=0
 COMPLETE_VERB=
 
+# The ONE site path in this tool: read_site. Everything else that names the
+# site comes from this file, or from my-lc's own config.
+SITE_CONF="/LINKS/default/site.conf"
+
 # --- config defaults (every one of these is overridable in the config) --
 DEFAULT_COMMAND=status
 DEFAULT_FILTER_STATE=enabled
@@ -68,7 +72,7 @@ RUN_WAIT=5
 CAL_SKEW=300
 RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
 RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
-RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
+RUNLOG_STATE=
 RUNLOG_MAX_LINES=20000
 RUNLOG_POLL=60
 RUNLOG_BACKFILL=900
@@ -269,12 +273,20 @@ MULTIPLE TARGETS
   A verb that matches more than one service prints the plan and stops,
   asking for the word 'go'. --go carries it out without asking.
 
+EOF
+  cat <<EOF
+
 CONFIG
-  Searched as $MY_LC_CONFIG, --config FILE, /LINKS/default/my-lc.conf,
-  ~/.my-lc.conf, /etc/my-lc.conf, /usr/local/etc/my-lc.conf.
-  DEFAULT_COMMAND (status) is what a bare 'my-lc' runs, ALL_MEANS
-  (non-apple) is what --all includes, STATE_DIR (/var/lib/mine/<user>/my-lc)
-  holds the log watermarks. --create-config prints the annotated default.
+  Searched as \$MY_LC_CONFIG, --config FILE, \$CONFIG_SEARCH_DIR/my-lc.conf,
+  then \$CONFIG_SEARCH_DIR/my-lc, ~/.my-lc.conf, /etc/my-lc.conf,
+  /usr/local/etc/my-lc.conf; none is needed.
+  $SITE_CONF, when there, is read first: the site's
+  CONFIG_SEARCH_DIR, DATA_BASE_DIR (/var/db without it) and LOG_BASE_DIR
+  (/var/log). STATE_DIR and RUNLOG_STATE, the log watermarks and the run
+  records, default to DATA_BASE_DIR/<user>/my-lc; the recorder logs to
+  LOG_BASE_DIR/root/my-lc-runlog.err|.out. DEFAULT_COMMAND (status) is what
+  a bare 'my-lc' runs, ALL_MEANS (non-apple) is what --all includes.
+  --create-config prints the annotated default.
 EOF
 }
 
@@ -492,8 +504,9 @@ DAEMON_DIRS="/Library/LaunchDaemons /System/Library/LaunchDaemons"
 # $HOME here is the acting user's home, resolved at runtime.
 AGENT_DIRS="$HOME/Library/LaunchAgents /Library/LaunchAgents /System/Library/LaunchAgents"
 
-# Log watermarks — STATE, not logs, so this belongs under /var/lib.
-STATE_DIR="/var/lib/mine/$(id -un)/my-lc"
+# Log watermarks — STATE, not logs: under the site's DATA_BASE_DIR
+# (site.conf; /var/db without it), read before this file.
+STATE_DIR="$DATA_BASE_DIR/$(id -un)/my-lc"
 
 # Lines of stderr/stdout shown by 'status' when no watermark exists yet.
 ERR_TAIL=10
@@ -524,10 +537,11 @@ RUN_WAIT=5
 # events from the log and reduces them to one line per event. ONE root daemon
 # serves every domain: reading the log needs root, and a user agent could not
 # do it - but pid 1's events name their domain, so it demultiplexes into each
-# user's own state directory, @USER@ being that user.
+# user's own state directory, @USER@ being that user. Its own stderr/stdout
+# go to LOG_BASE_DIR/root/my-lc-runlog.err|.out (site.conf; /var/log without).
 RUNLOG_LABEL="eu.no-panic.my-lc-runlog"
 RUNLOG_PLIST_DIR="/Library/LaunchDaemons"
-RUNLOG_STATE="/var/lib/mine/@USER@/my-lc"
+RUNLOG_STATE="$DATA_BASE_DIR/@USER@/my-lc"
 
 # Records kept per file before the oldest are dropped. One line is ~50
 # bytes, so the default is about a megabyte per user.
@@ -583,7 +597,31 @@ COLOR=auto
 CFG_EOF
 }
 
+# The site's values for every tool, from SITE_CONF, read before the config:
+# the base directories and where a config is searched. The neutral values
+# first, so an exported variable never takes their place; then the file,
+# plain KEY="value" lines, when it is there. The file's CONFIG_OFFER_DIR and
+# CONFIG_OFFER_NOTE go unused: my-lc runs without a config, so it never
+# offers to write one.
+read_site() {
+  DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"; CONFIG_SEARCH_DIR=""
+  [ -e "$SITE_CONF" ] || return 0
+  # there but unreadable: an error, never the neutral values -- they would
+  # keep this user's state apart from everyone else's
+  [ -r "$SITE_CONF" ] || die "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+  # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
+  . "$SITE_CONF" || die "'$SITE_CONF' failed to load"
+}
+
+# Where a config is looked for, first found wins. Both spellings in the
+# site's search directory: .conf first, then the bare name.
+config_search_paths() {
+  [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/$SCRIPT_NAME.conf" "$CONFIG_SEARCH_DIR/$SCRIPT_NAME"
+  printf '%s\n' "$HOME/.$SCRIPT_NAME.conf" "/etc/$SCRIPT_NAME.conf" "/usr/local/etc/$SCRIPT_NAME.conf"
+}
+
 find_config() {
+  read_site
   _cfg=
   if [ -n "${MY_LC_CONFIG:-}" ]; then
     [ -r "$MY_LC_CONFIG" ] || die "\$MY_LC_CONFIG points to a missing file: $MY_LC_CONFIG"
@@ -592,12 +630,11 @@ find_config() {
     [ -r "$CONFIG_OVERRIDE" ] || die "no such config file: $CONFIG_OVERRIDE"
     _cfg=$CONFIG_OVERRIDE
   else
-    ## both spellings are accepted under /LINKS/default: .conf first, then bare
-    for _c in "/LINKS/default/$SCRIPT_NAME.conf" "/LINKS/default/$SCRIPT_NAME" \
-              "$HOME/.$SCRIPT_NAME.conf" \
-              "/etc/$SCRIPT_NAME.conf" "/usr/local/etc/$SCRIPT_NAME.conf"; do
+    while IFS= read -r _c; do
       [ -r "$_c" ] && { _cfg=$_c; break; }
-    done
+    done <<_EOF
+$(config_search_paths)
+_EOF
   fi
   if [ -n "$_cfg" ]; then
     dbg "config: $_cfg"
@@ -608,7 +645,10 @@ find_config() {
   fi
   # Anything the config did not set gets the built-in default.
   [ -n "$AGENT_DIRS" ] || AGENT_DIRS="$HOME/Library/LaunchAgents /Library/LaunchAgents /System/Library/LaunchAgents"
-  [ -n "$STATE_DIR" ]  || STATE_DIR="/var/lib/mine/$(id -un)/$SCRIPT_NAME"
+  [ -n "$STATE_DIR" ]  || STATE_DIR="$DATA_BASE_DIR/$(id -un)/$SCRIPT_NAME"
+  [ -n "$RUNLOG_STATE" ] || RUNLOG_STATE="$DATA_BASE_DIR/@USER@/$SCRIPT_NAME"
+  # the recorder is a root daemon: its own stderr/stdout are root's logs
+  RUNLOG_LOG="$LOG_BASE_DIR/root/$SCRIPT_NAME-runlog"
 }
 
 create_config() {
@@ -1685,8 +1725,8 @@ runlog_plist_content() {
   printf '  </array>\n'
   printf '  <key>RunAtLoad</key>\n  <true/>\n'
   printf '  <key>KeepAlive</key>\n  <true/>\n'
-  printf '  <key>StandardErrorPath</key>\n  <string>/var/log/mine/root/%s.err</string>\n' "$SCRIPT_NAME-runlog"
-  printf '  <key>StandardOutPath</key>\n  <string>/var/log/mine/root/%s.out</string>\n' "$SCRIPT_NAME-runlog"
+  printf '  <key>StandardErrorPath</key>\n  <string>%s.err</string>\n' "$RUNLOG_LOG"
+  printf '  <key>StandardOutPath</key>\n  <string>%s.out</string>\n' "$RUNLOG_LOG"
   printf '</dict>\n</plist>\n'
 }
 
@@ -1761,7 +1801,7 @@ runlog_status() {
       fi
     fi
   fi
-  _el="/var/log/mine/root/$SCRIPT_NAME-runlog.err"
+  _el="$RUNLOG_LOG.err"
   if [ -s "$_el" ]; then
     printf '    > %s%s: %s%s\n' "$C_BAD" "$_el" "$(log_size_note "$_el")" "$C_OFF"
   fi
@@ -1939,7 +1979,7 @@ purge_traces() {
       else run rm -f "$_cmp"; fi
     fi
   done
-  for _lf in "/var/log/mine/root/$SCRIPT_NAME-runlog.err" "/var/log/mine/root/$SCRIPT_NAME-runlog.out"; do
+  for _lf in "$RUNLOG_LOG.err" "$RUNLOG_LOG.out"; do
     [ -f "$_lf" ] || continue
     if [ "$_mode" = plan ]; then printf '      - delete %s\n' "$_lf"
     else run rm -f "$_lf"; fi
@@ -4228,6 +4268,7 @@ _rt_list() {
   _rt watch        && rt_watch
   _rt logs         && rt_logs
   _rt completion   && rt_completion
+  _rt siteconf     && rt_siteconf
   _rt ''
 }
 
@@ -6235,6 +6276,60 @@ rt_watch() {
   chmod 755 "$_wd/closed"
 }
 
+# The site file, the one site path: its values when it is there, the neutral
+# ones when it is not -- an exported variable never in their place -- and an
+# error when it is there but unreadable. Read BEFORE the config, so the
+# generated default config, found in the site's search directory under the
+# bare name, puts the state, the run records and the recorder's logs under
+# the site's bases; a key the config sets still wins.
+# Each check is a function run in $(...): what it sets stays in that shell.
+rt_siteconf() {
+  t_sec 'S. site.conf'
+  _sc="$TMPD/site"; mkdir -p -- "$_sc/farm" "$_sc/home"
+  SITE_CONF="$_sc/site.conf"
+  _env() { DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; read_site
+           printf '%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR"; }
+  t_eq 'without the file: /var/db, /var/log, no search dir -- never the environment' \
+       '/var/db|/var/log|' "$(_env 2>&1)"
+
+  printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' \
+    "CONFIG_SEARCH_DIR=\"$_sc/farm\"" 'CONFIG_OFFER_DIR="/srv/offer"' > "$SITE_CONF"
+  # the bare name marks itself (ERR_TAIL 9): without it the built-in
+  # fallback would give the same directories, and the search would go untested
+  { default_config_content; printf 'ERR_TAIL=9\n'; } > "$_sc/farm/my-lc"
+  _find() { HOME="$_sc/home"; MY_LC_CONFIG=; CONFIG_OVERRIDE=; STATE_DIR=; RUNLOG_STATE=; RUNLOG_LOG=
+            find_config; printf '%s|%s|%s|%s' "$STATE_DIR" "$RUNLOG_STATE" "$RUNLOG_LOG" "$ERR_TAIL"; }
+  t_eq 'the default config, as the bare name in the search dir, lies under the site bases' \
+       "/srv/data/$(id -un)/my-lc|/srv/data/@USER@/my-lc|/srv/log/root/my-lc-runlog|9" "$(_find 2>&1)"
+  printf 'ERR_TAIL=7\nSTATE_DIR=/kept\n' > "$_sc/farm/my-lc.conf"
+  t_eq 'my-lc.conf before the bare name; a key the config sets wins' \
+       "/kept|/srv/data/@USER@/my-lc|/srv/log/root/my-lc-runlog|7" "$(_find 2>&1)"
+  _plist() { read_site; RUNLOG_LOG="$LOG_BASE_DIR/root/my-lc-runlog"; runlog_plist_content /x; }
+  _o=$(_plist 2>&1)
+  case "$_o" in
+    *'<string>/srv/log/root/my-lc-runlog.err</string>'*'<string>/srv/log/root/my-lc-runlog.out</string>'*)
+      t_ok "the recorder's plist names its logs under the site's log base" ;;
+    *) t_no "the recorder's plist logs" '/srv/log/root/my-lc-runlog.err|.out' "$_o" ;;
+  esac
+  _search() { read_site; config_search_paths; }
+  _o=$(_search 2>&1)
+  case "$_o" in *offer*) t_no 'the offer dir is never searched' 'no /srv/offer' "$_o" ;;
+    *) t_ok 'the offer dir is never searched' ;; esac
+
+  if [ "$(id -u)" = 0 ]; then
+    t_skip 'there but unreadable is an error' 'root reads a mode-000 file'
+  else
+    chmod 000 "$SITE_CONF"
+    _unreadable() { read_site; printf 'fell back to %s' "$DATA_BASE_DIR"; }
+    _o=$(_unreadable 2>&1); _rc=$?
+    chmod 600 "$SITE_CONF"
+    case "$_rc|$_o" in
+      1"|$SCRIPT_NAME: cannot read '$SITE_CONF'"*) t_ok 'there but unreadable is an error, never the fallback' ;;
+      *) t_no 'unreadable site.conf' "1|$SCRIPT_NAME: cannot read ..." "$_rc|$_o" ;;
+    esac
+  fi
+}
+
 rt_logs() {
   t_sec 'F. the log delta'
   _ld="$TMPD/logs"; mkdir -p "$_ld"
@@ -6244,8 +6339,8 @@ rt_logs() {
   _lab="$SELFTEST_PREFIX-logs"
   DOMAIN_SAVE=$DOMAIN
 
-  t_eq 'the watermark lives under /var/lib, not /var/log' \
-       "1" "$(case "$STATE_DIR" in /var/lib/*) echo 1 ;; *) echo 0 ;; esac)"
+  t_eq 'the watermark lives under the state base, not the log base' \
+       "1" "$(case "$STATE_DIR" in "$DATA_BASE_DIR"/*) echo 1 ;; *) echo 0 ;; esac)"
 
   write_mark "$_lab" "$_el" "$_ol" exact
   if [ -r "$(mark_file "$_lab")" ]; then
