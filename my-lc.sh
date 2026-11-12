@@ -597,6 +597,22 @@ COLOR=auto
 CFG_EOF
 }
 
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
+
 # The site's values for every tool, from SITE_CONF, read before the config:
 # the base directories and where a config is searched. The neutral values
 # first, so an exported variable never takes their place; then the file,
@@ -605,10 +621,12 @@ CFG_EOF
 # offers to write one.
 read_site() {
   DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"; CONFIG_SEARCH_DIR=""
-  [ -e "$SITE_CONF" ] || return 0
-  # there but unreadable: an error, never the neutral values -- they would
-  # keep this user's state apart from everyone else's
-  [ -r "$SITE_CONF" ] || die "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+  # there but unreadable, or cannot tell (a folder on the way it cannot search,
+  # a link to nothing): an error, never the neutral values -- they would keep
+  # this user's state apart from everyone else's
+  _rs_a=0; site_absent "$SITE_CONF" || _rs_a=$?
+  [ "$_rs_a" = 0 ] && return 0
+  { [ "$_rs_a" = 1 ] && [ -r "$SITE_CONF" ]; } || die "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
   # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
   . "$SITE_CONF" || die "'$SITE_CONF' failed to load"
 }
@@ -6327,6 +6345,24 @@ rt_siteconf() {
       1"|$SCRIPT_NAME: cannot read '$SITE_CONF'"*) t_ok 'there but unreadable is an error, never the fallback' ;;
       *) t_no 'unreadable site.conf' "1|$SCRIPT_NAME: cannot read ..." "$_rc|$_o" ;;
     esac
+    # "does it exist?" answers no behind a folder it cannot search, and for
+    # a link to nothing: both an error, never the fallback
+    mkdir -p -- "$_sc/locked"; cp -p -- "$SITE_CONF" "$_sc/locked/site.conf"
+    SITE_CONF="$_sc/locked/site.conf"; chmod 000 "$_sc/locked"
+    _o=$(_unreadable 2>&1); _rc=$?
+    chmod 700 "$_sc/locked"
+    case "$_rc|$_o" in
+      1"|$SCRIPT_NAME: cannot read '$SITE_CONF'"*) t_ok 'behind a mode-000 folder is an error, never the fallback' ;;
+      *) t_no 'site.conf behind a mode-000 folder' "1|$SCRIPT_NAME: cannot read ..." "$_rc|$_o" ;;
+    esac
+    SITE_CONF="$_sc/dangling.conf"; ln -s "$_sc/nowhere" "$SITE_CONF"
+    _o=$(_unreadable 2>&1); _rc=$?
+    case "$_rc|$_o" in
+      1"|$SCRIPT_NAME: cannot read '$SITE_CONF'"*) t_ok 'a link to nothing is an error, never the fallback' ;;
+      *) t_no 'site.conf a link to nothing' "1|$SCRIPT_NAME: cannot read ..." "$_rc|$_o" ;;
+    esac
+    SITE_CONF="$_sc/absent.conf"
+    t_eq 'plainly absent: the neutral values' 'fell back to /var/db' "$(_unreadable 2>&1)"
   fi
 }
 
