@@ -312,7 +312,7 @@ det()  { [ "$VRB"   = 1 ] && printf '    > %s\n' "$*"; return 0; }
 
 # The ONLY place a launchctl command is both echoed and executed, so the
 # echoed line can never drift from the executed one.
-run() {
+run_echoed() {
   [ "$VRB" = 1 ] && printf ' >>> %s\n' "$*"
   "$@"
 }
@@ -1004,7 +1004,7 @@ db_row() {
 # One launchctl call for the whole flag axis, kept as a shell string so
 # the per-service lookup is a 'case' match rather than a fork.
 load_disabled_set() {
-  run launchctl print-disabled "$1" 2>/dev/null \
+  run_echoed launchctl print-disabled "$1" 2>/dev/null \
     | awk -F'"' '/=> *disabled/ { print $2 }' > "$TMPD/disabled.$2"
 }
 
@@ -1014,7 +1014,7 @@ load_disabled_set() {
 # 'launchctl print <domain>' lists the domain's services with their pid
 # and last exit status, and works without root.
 load_loaded_set() {
-  run launchctl print "$1" 2>/dev/null | awk -v S="$FS1" '
+  run_echoed launchctl print "$1" 2>/dev/null | awk -v S="$FS1" '
     BEGIN { OFS=S }
     /^\tservices = \{/ { inb=1; next }
     inb && /^\t\}/     { inb=0 }
@@ -1907,7 +1907,7 @@ cmd_install() {
     msgn "writing $_rp ..."; [ "$VRB" = 1 ] && printf '\n'
     _tmp="$TMPD/runlog.plist"
     runlog_plist_content "$_prog" > "$_tmp"
-    if run mv "$_tmp" "$_rp" && chmod 644 "$_rp" && chown root:wheel "$_rp"; then step_ok
+    if run_echoed mv "$_tmp" "$_rp" && chmod 644 "$_rp" && chown root:wheel "$_rp"; then step_ok
     else step_fail 'could not write the plist'; return 0; fi
   }
   msgn "starting $RUNLOG_LABEL ..."; [ "$VRB" = 1 ] && printf '\n'
@@ -1956,7 +1956,7 @@ cmd_uninstall() {
   if lc_bootout "system/$RUNLOG_LABEL"; then step_ok; else step_fail "$(translate_lc_error)"; fi
   if [ -f "$_rp" ]; then
     msgn "deleting $_rp ..."; [ "$VRB" = 1 ] && printf '\n'
-    if run rm -f "$_rp"; then step_ok; else step_fail 'could not remove the plist'; fi
+    if run_echoed rm -f "$_rp"; then step_ok; else step_fail 'could not remove the plist'; fi
   fi
   if [ "$PURGE" = 1 ]; then
     purge_traces apply
@@ -1989,18 +1989,18 @@ purge_traces() {
       [ "$_nd" -gt 0 ] 2>/dev/null && printf '        %s%s%s\n' "$C_BAD" \
         "including $_nd plist(s) put aside by 'delete' - undelete could no longer restore them" "$C_OFF"
     else
-      run rm -rf "$_sd"
+      run_echoed rm -rf "$_sd"
     fi
     _cmp=$(purge_completion_path "$_u")
     if [ -n "$_cmp" ] && [ -f "$_cmp" ]; then
       if [ "$_mode" = plan ]; then printf '      - delete %s\n' "$_cmp"
-      else run rm -f "$_cmp"; fi
+      else run_echoed rm -f "$_cmp"; fi
     fi
   done
   for _lf in "$RUNLOG_LOG.err" "$RUNLOG_LOG.out"; do
     [ -f "$_lf" ] || continue
     if [ "$_mode" = plan ]; then printf '      - delete %s\n' "$_lf"
-    else run rm -f "$_lf"; fi
+    else run_echoed rm -f "$_lf"; fi
   done
   if [ "$_mode" = plan ]; then
     printf '      %s\n' "the 'fpath=(...)' line in each ~/.zshrc is left alone - it is yours,"
@@ -2857,7 +2857,7 @@ lc() {
     printf '90' > "$TMPD/lcrc"
     return 90
   fi
-  _o=$(run launchctl "$@" 2>&1); _rc=$?
+  _o=$(run_echoed launchctl "$@" 2>&1); _rc=$?
   # Keep whatever it said either way: on success so a stale message from an
   # earlier call cannot be reprinted later, on failure so it can be shown.
   printf '%s' "$_o" > "$TMPD/lcerr"
@@ -3159,7 +3159,7 @@ v_truncate() {
     [ "$VRB" = 1 ] && printf '\n'
     det "$_tf"
     det "truncated in place: launchd holds it open, so unlinking would orphan it"
-    if run truncate -s 0 "$_tf"; then _did=1; step_ok
+    if run_echoed truncate -s 0 "$_tf"; then _did=1; step_ok
     else step_fail 'could not truncate (needs root?)'; fi
   done
   # The watermark's offsets point past the end of an emptied file, so reset
@@ -3219,7 +3219,7 @@ v_undelete() {
   msgn "putting $_label back ..."; [ "$VRB" = 1 ] && printf '\n'
   det "$_bf"
   det "-> $_origin"
-  if run mv "$_bf" "$_origin"; then step_ok
+  if run_echoed mv "$_bf" "$_origin"; then step_ok
   else step_fail 'could not move it back (needs root?)'; return 0; fi
   rm -f "$_bf.origin" 2>/dev/null
   # delete disabled it, so undelete must clear that or it stays off
@@ -3291,7 +3291,7 @@ v_delete() {
     msgn "moving the plist to $(delete_where) ..."; [ "$VRB" = 1 ] && printf '\n'
     det "$_plist"
     det "-> $_dest"
-    if run mv "$_plist" "$_dest"; then
+    if run_echoed mv "$_plist" "$_dest"; then
       step_ok
       # Remember where it came from: the backup name carries the label and
       # a date, not the directory, and 'undelete' must put it back exactly
@@ -3301,7 +3301,7 @@ v_delete() {
     else step_fail 'could not move the plist (needs root?)'; fi
   else
     msgn "removing $_plist ..."; [ "$VRB" = 1 ] && printf '\n'
-    if run rm -f "$_plist"; then step_ok; else step_fail 'could not remove the plist (needs root?)'; fi
+    if run_echoed rm -f "$_plist"; then step_ok; else step_fail 'could not remove the plist (needs root?)'; fi
   fi
   msg "$_label is now stopped, disabled, and its plist is out of the way"
 }
@@ -3341,7 +3341,7 @@ v_edit() {
   # a terminal", and left the terminal mode broken afterwards. Redirecting
   # from /dev/tty here instead would fail outright where there is no
   # controlling terminal, e.g. under a test harness or from cron.
-  run "$_ed" "$_plist"
+  run_echoed "$_ed" "$_plist"
   _after=$(shasum -a 256 "$_plist" 2>/dev/null | cut -d' ' -f1)
   if [ "$_before" = "$_after" ]; then
     msg "unchanged"
@@ -4098,7 +4098,7 @@ plan_raw() {
   esac
 }
 
-main() {
+my_lc_main() {
   parse_args "$@"
 
   # The implication chain, enforced once, right here.
@@ -6571,4 +6571,4 @@ STUB
   wc -l < "$TMPD/lc.count" | tr -d ' '
 }
 
-main "$@"
+my_lc_main "$@"
