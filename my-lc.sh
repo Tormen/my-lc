@@ -50,6 +50,8 @@ FILTERS=
 TESTS=0
 TESTS_SCOPE=agents
 TESTS_FILTER=
+TESTS_MODE=filter
+TESTS_TITLES=
 COMPLETE=0
 COMPLETE_VERB=
 
@@ -175,7 +177,14 @@ usage: $SCRIPT_NAME [OPTIONS] [FILTER ...] [VERB]
                      print the default config to stdout, or write it to FILE
       --run-tests [agents|daemons] [NAME]
                      run the built-in self-tests; NAME runs only the
-                     tests whose name contains it
+                     tests whose title contains it
+      --run-tests [agents|daemons] --titles FILE
+                     run exactly the tests whose titles FILE lists, one
+                     per line; a title no test has is said and fails the
+                     run
+      --run-tests --list
+                     print the run list, one "<title> TAB <its function>"
+                     per test; nothing runs
       --version      print the version and the exact build it came from
       --stamp-version
                      optional: record the current git HEAD sha in this file
@@ -3600,7 +3609,13 @@ parse_args() {
       --uid)             _want_uid=1 ;;
       --run-tests)       TESTS=1
                          case "${2:-}" in agents|daemons) TESTS_SCOPE=$2; shift ;; esac
-                         case "${2:-}" in -*|'') ;; *) TESTS_FILTER=$2; shift ;; esac ;;
+                         case "${2:-}" in
+                           --list)   TESTS_MODE=list; shift ;;
+                           --titles) [ -n "${3:-}" ] || die "--run-tests --titles takes a FILE of test titles, one per line"
+                                     TESTS_MODE=titles; TESTS_TITLES=$3; shift 2 ;;
+                           -*|'') ;;
+                           *) TESTS_FILTER=$2; shift ;;
+                         esac ;;
       --run-tests=*)     TESTS=1; TESTS_SCOPE=${_a#*=} ;;
       --complete-labels) COMPLETE=1
                          case "${2:-}" in -*|'') ;; *) COMPLETE_VERB=$2; shift ;; esac ;;
@@ -4252,78 +4267,92 @@ cleanup_fixtures() {
   done
 }
 
-# The run list: the tests in their order, one 'rt_<name>' function each. It
-# is read once to select and number the tests -- the plan '1..N' comes from
-# this same list -- and run_tests then runs them in lanes. TESTS_FILTER picks
-# the names that contain it.
+# The run list: each test once, in its order -- its title, then its function
+# rt_<name> (<name> names its labels and its dir). --run-tests --list prints
+# it; a run reads it once to select and number the tests -- the plan '1..N'
+# comes from it -- and run_tests then runs them in lanes. A title starting
+# 'the suite:' reads the source only: my-rollout's commit gate runs it with
+# every change. _rt returns 1, so '&& rt_<name>' never runs here: it is the
+# call shellcheck sees -- a function it sees no call of is dead code to it,
+# and it stops checking that function's variables.
 _rt_list() {
-  _rt static       && rt_static
-  _rt readonly     && rt_readonly
-  _rt matrix       && rt_matrix
-  _rt hints        && rt_hints
-  _rt version      && rt_version
-  _rt exitcodes    && rt_exitcodes
-  _rt timefmt      && rt_timefmt
-  _rt truncate     && rt_truncate
-  _rt undelete     && rt_undelete
-  _rt loadeddiff   && rt_loadeddiff
-  _rt verbose      && rt_verbose
-  _rt pstime       && rt_pstime
-  _rt logsizes     && rt_logsizes
-  _rt sessiontrap  && rt_sessiontrap
-  _rt filters      && rt_filters
-  _rt runlog       && rt_runlog
-  _rt calendar     && rt_calendar
-  _rt stamp        && rt_stamp
-  _rt plistchecks  && rt_plistchecks
-  _rt restartrace  && rt_restartrace
-  _rt ctrlc        && rt_ctrlc
-  _rt chain        && rt_chain
-  _rt failures     && rt_failures
-  _rt errcolumn    && rt_errcolumn
-  _rt editdelete   && rt_editdelete
-  _rt program      && rt_program
-  _rt watch        && rt_watch
-  _rt logs         && rt_logs
-  _rt completion   && rt_completion
-  _rt siteconf     && rt_siteconf
-  _rt ''
+  _rt 'the suite: static' rt_static && rt_static
+  _rt readonly            rt_readonly && rt_readonly
+  _rt matrix              rt_matrix && rt_matrix
+  _rt hints               rt_hints && rt_hints
+  _rt version             rt_version && rt_version
+  _rt exitcodes           rt_exitcodes && rt_exitcodes
+  _rt timefmt             rt_timefmt && rt_timefmt
+  _rt truncate            rt_truncate && rt_truncate
+  _rt undelete            rt_undelete && rt_undelete
+  _rt loadeddiff          rt_loadeddiff && rt_loadeddiff
+  _rt verbose             rt_verbose && rt_verbose
+  _rt pstime              rt_pstime && rt_pstime
+  _rt logsizes            rt_logsizes && rt_logsizes
+  _rt sessiontrap         rt_sessiontrap && rt_sessiontrap
+  _rt filters             rt_filters && rt_filters
+  _rt runlog              rt_runlog && rt_runlog
+  _rt calendar            rt_calendar && rt_calendar
+  _rt stamp               rt_stamp && rt_stamp
+  _rt plistchecks         rt_plistchecks && rt_plistchecks
+  _rt restartrace         rt_restartrace && rt_restartrace
+  _rt ctrlc               rt_ctrlc && rt_ctrlc
+  _rt chain               rt_chain && rt_chain
+  _rt failures            rt_failures && rt_failures
+  _rt errcolumn           rt_errcolumn && rt_errcolumn
+  _rt editdelete          rt_editdelete && rt_editdelete
+  _rt program             rt_program && rt_program
+  _rt watch               rt_watch && rt_watch
+  _rt logs                rt_logs && rt_logs
+  _rt completion          rt_completion && rt_completion
+  _rt siteconf            rt_siteconf && rt_siteconf
+  _rt titles              rt_titles && rt_titles
 }
 
-# Select test $1 when its name contains the filter: it gets the next number,
-# its place in the list. Always returns 1 -- the list is only READ here; the
-# tests run in lanes (run_tests).
+# Test $1 (its title), function $2. --list prints it; a run selects it when
+# its title contains the NAME filter, or is a line of the --titles FILE, and
+# gives it the next number, its place in the list. Always returns 1 -- the
+# list is only READ here; the tests run in lanes (run_tests).
 _rt() {
-  [ -n "$1" ] && _rt_want "$1" || return 1
-  _rt_n=$((_rt_n + 1)); _rt_sel="$_rt_sel $_rt_n:$1"
+  case "$TESTS_MODE" in
+    list)   printf '%s\t%s\n' "$1" "$2"; return 1 ;;
+    titles) grep -qxF -- "$1" "$TESTS_TITLES" || return 1 ;;
+    *)      case "$1" in *"$TESTS_FILTER"*) ;; *) return 1 ;; esac ;;
+  esac
+  _rt_n=$((_rt_n + 1)); _rt_sel="$_rt_sel $_rt_n:$2"
+  eval "_rt_title_$_rt_n=\$1"
   return 1
 }
 
-# Test $2, number $1, in a world of its own -- its labels, its dir, its config,
-# plain output whatever the terminal (tests compare rendered text) -- and a
-# shell of its own, so nothing it sets reaches the next test. Its detail and
-# its TAP line go out as ONE piece when it ends: lanes side by side never
-# interleave. A test whose shell dies is 'not ok'.
+# The title of selected test number $1.
+_rt_title() { eval "printf '%s' \"\$_rt_title_$1\""; }
+
+# Test function $2, number $1, in a world of its own -- its labels, its dir,
+# its config, plain output whatever the terminal (tests compare rendered
+# text) -- and a shell of its own, so nothing it sets reaches the next test.
+# Its detail and its TAP line go out as ONE piece when it ends: lanes side by
+# side never interleave. A test whose shell dies is 'not ok'.
 _rt_one() {
   ( _rt_body "$1" "$2" ) > "$T_ROOT/.out.$1" 2>&1
   _rt_el='?'; _rt_f=1
   [ -s "$T_ROOT/.cnt.$1" ] && read -r _ _rt_f _ _rt_el < "$T_ROOT/.cnt.$1"
   if [ "$_rt_f" = 0 ]; then _rt_v=ok; else _rt_v='not ok'; fi
+  _rt_t=$(_rt_title "$1")
   until mkdir "$T_ROOT/.print" 2>/dev/null; do sleep 0.05; done
-  cat "$T_ROOT/.out.$1"; _rt_tap "$_rt_v" "$1" "$2" "$_rt_el"
+  cat "$T_ROOT/.out.$1"; _rt_tap "$_rt_v" "$1" "$_rt_t" "$_rt_el"
   rmdir "$T_ROOT/.print"
   : > "$T_ROOT/.done.$1"
 }
 
-# _rt_one's test $2, number $1, inside the shell of its own: its counts
-# and its time go to a file, since nothing set here reaches the caller.
+# _rt_one's test function $2, number $1, inside the shell of its own: its
+# counts and its time go to a file, since nothing set here reaches the caller.
 _rt_body() {
   T_PASS=0; T_FAIL=0; T_SKIP=0
   COLOR=never; setup_color
-  SELFTEST_PREFIX="$SELFTEST_BASE-$2"
-  TMPD="$T_ROOT/$2"; mkdir "$TMPD"; t_conf
+  SELFTEST_PREFIX="$SELFTEST_BASE-${2#rt_}"
+  TMPD="$T_ROOT/${2#rt_}"; mkdir "$TMPD"; t_conf
   _t0=$(date +%s)
-  "rt_$2"
+  "$2"
   cleanup_fixtures
   printf '%s %s %s %s\n' "$T_PASS" "$T_FAIL" "$T_SKIP" $(( $(date +%s) - _t0 )) > "$T_ROOT/.cnt.$1"
 }
@@ -4367,9 +4396,14 @@ t_conf() {
     printf 'EDITOR_CMD=""\nDELETE_MODE=backup\nTIME_FORMAT=absolute\nTIME_FMT="%%Y-%%m-%%d_%%H%%M"\n'
   } > "$T_CONF"
 }
-_rt_want() { case "$1" in *"$TESTS_FILTER"*) return 0 ;; esac; return 1; }
 
+# --run-tests: the tests the NAME filter or the --titles FILE selects, in
+# lanes, TAP; --list: the run list, nothing runs.
 run_tests() {
+  if [ "$TESTS_MODE" = list ]; then _rt_list; return 0; fi
+  if [ "$TESTS_MODE" = titles ] && ! { [ -f "$TESTS_TITLES" ] && [ -r "$TESTS_TITLES" ]; }; then
+    die "--run-tests --titles: '$TESTS_TITLES' cannot be read -- name a file of test titles, one per line"
+  fi
   setup_color
   SCOPE=$TESTS_SCOPE
   _rt_n=0; _rt_sel=; _rt_list
@@ -4434,12 +4468,27 @@ run_tests() {
       T_PASS=$((T_PASS + _rt_p)); T_FAIL=$((T_FAIL + _rt_f)); T_SKIP=$((T_SKIP + _rt_s))
     else
       T_FAIL=$((T_FAIL + 1))
-      [ -e "$T_ROOT/.done.$_rt_k" ] || printf 'not ok %s - %s (its lane ended before it)\n' "$_rt_k" "${_rt_e#*:}"
+      _rt_t=$(_rt_title "$_rt_k")
+      [ -e "$T_ROOT/.done.$_rt_k" ] || printf 'not ok %s - %s (its lane ended before it)\n' "$_rt_k" "$_rt_t"
     fi
   done
   cleanup_fixtures "$SELFTEST_BASE"
   t_residue
   t_summary
+  [ "$TESTS_MODE" = titles ] && _rt_unknown_titles
+  return 0
+}
+
+# --titles FILE naming a title the run list does not hold: said, and the run
+# fails -- a gate never passes on a test it did not run.
+_rt_unknown_titles() {
+  ( TESTS_MODE=list; _rt_list ) | cut -f 1 > "$T_ROOT/.titles"
+  grep . "$TESTS_TITLES" | grep -vxF -f "$T_ROOT/.titles" > "$T_ROOT/.unknown"
+  _rt_u=$(grep -c . "$T_ROOT/.unknown")
+  [ "$_rt_u" = 0 ] && return 0
+  printf ' >>> --titles: %s title(s) name no test of the run list -- %s\n' "$_rt_u" \
+    "$(head -n 3 "$T_ROOT/.unknown" | sed "s/.*/'&'/" | paste -s -d ';' - | sed 's/;/; /g')"
+  EXITCODE=1
 }
 
 # Say plainly what the suite could not take back. 'launchctl enable' clears
@@ -4516,16 +4565,25 @@ rt_static() {
   # run_tests then failed silently to stderr and the section simply vanished
   # from the report, with the total still looking healthy.
   _missing=0
-  awk '/^_rt_list\(\) \{/,/^\}/' "$0" | awk '$1 == "_rt" && $3 == "&&" { print $2, $4 }' > "$TMPD/called"
-  while read -r _nm _fn; do
-    [ "$_fn" = "rt_$_nm" ] || { printf '  listed as %s but calls %s\n' "$_nm" "$_fn"; _missing=$((_missing + 1)); }
+  "$0" --run-tests --list > "$TMPD/called" 2>&1
+  while IFS="$(printf '\t')" read -r _nm _fn; do
+    case "$_fn" in rt_*) ;; *) printf '  %s runs %s, not an rt_ function\n' "$_nm" "$_fn"; _missing=$((_missing + 1)) ;; esac
     grep -q "^$_fn() {" "$0" || { printf '  called but not defined: %s\n' "$_fn"; _missing=$((_missing + 1)); }
   done < "$TMPD/called"
+  # a line whose shellcheck-visible call names another function than it lists
+  awk '/^_rt_list\(\) \{/,/^\}/' "$0" \
+    | awk '$1 == "_rt" && !($(NF-1) == "&&" && $NF == $(NF-2)) { $1 = $1; print }' > "$TMPD/mismatch"
+  while IFS= read -r _ml; do
+    printf '  its call is not the function it lists: %s\n' "$_ml"; _missing=$((_missing + 1))
+  done < "$TMPD/mismatch"
   t_eq 'every test function run_tests calls is defined' 0 "$_missing"
   # ...and the other way round: a test defined but left out of the run list
   # would never run, with the plan still looking complete.
-  t_eq 'every test function is in the run list' \
-       "$(grep -c '^rt_[a-z_]*() {$' "$0")" "$(wc -l < "$TMPD/called" | tr -d ' ')"
+  t_eq 'every test function is in the run list, once' \
+       "$(grep -c '^rt_[a-z_]*() {$' "$0")" "$(cut -f 2 "$TMPD/called" | sort -u | wc -l | tr -d ' ')"
+  # my-rollout's commit gate runs tests BY TITLE: two of one title would
+  # run as one
+  t_eq 'every title in the run list is unique' '' "$(cut -f 1 "$TMPD/called" | sort | uniq -d)"
   # the removal command for a leftover label must work on a label with dots
   # in it -- every label has them -- and remove nothing else
   printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>%s-x</key><false/><key>com.x.keep</key><true/></dict></plist>\n' \
@@ -6569,6 +6627,36 @@ STUB
   [ "$SCOPE" = agents ] && _scopeflag=--agents
   PATH="$_sd:$PATH" MY_LC_CONFIG="$T_CONF" "$0" $_scopeflag --complete-labels enable >/dev/null 2>&1
   wc -l < "$TMPD/lc.count" | tr -d ' '
+}
+
+# my-rollout's commit gate asks for the run list and then runs titles from
+# it: --list must be the whole list, and --titles exactly what it names --
+# a gate that passed on fewer tests than it asked for would pass untested.
+rt_titles() {
+  t_sec 'T. --run-tests --list and --titles FILE, as the commit gate calls them'
+  "$0" --run-tests --list > "$TMPD/list" 2>&1; _rc=$?
+  t_eq '--list: one "<title> TAB <function>" line per test function, rc 0' \
+       "$(grep -c '^rt_[a-z_]*() {$' "$0"):0" \
+       "$(grep -c "$(printf '^[^\t][^\t]*\trt_[a-z_]*$')" "$TMPD/list"):$_rc"
+  printf 'exitcodes\n' > "$TMPD/one"
+  MY_LC_SELFTEST_BASE="$SELFTEST_PREFIX-one" "$0" --run-tests "$SCOPE" --titles "$TMPD/one" > "$TMPD/one.out" 2>&1
+  _rc=$?
+  t_eq 'ADVERSARIAL: --titles with ONE title runs exactly that test -- the plan 1, its ok line, no other, rc 0' \
+       "1..1|ok 1 - exitcodes|0" \
+       "$(grep '^1\.\.' "$TMPD/one.out")|$(grep -E '^(not )?ok ' "$TMPD/one.out" | paste -s -d '/' -)|$_rc"
+  printf 'exitcodes\nno such test\n' > "$TMPD/unknown"
+  MY_LC_SELFTEST_BASE="$SELFTEST_PREFIX-unknown" "$0" --run-tests "$SCOPE" --titles "$TMPD/unknown" > "$TMPD/unknown.out" 2>&1
+  _rc=$?
+  t_eq 'a title no test has: the known one runs, the unknown is said, and the run FAILS' \
+       "ok 1 - exitcodes| >>> --titles: 1 title(s) name no test of the run list -- 'no such test'|1" \
+       "$(grep -E '^(not )?ok ' "$TMPD/unknown.out")|$(grep '^ >>> --titles' "$TMPD/unknown.out")|$_rc"
+  : > "$TMPD/none"
+  MY_LC_SELFTEST_BASE="$SELFTEST_PREFIX-none" "$0" --run-tests "$SCOPE" --titles "$TMPD/none" > "$TMPD/none.out" 2>&1
+  _rc=$?
+  t_eq 'an empty FILE: the plan 1..0, rc 0' '1..0|0' "$(grep '^1\.\.' "$TMPD/none.out")|$_rc"
+  "$0" --run-tests "$SCOPE" --titles "$TMPD/missing" > "$TMPD/missing.out" 2>&1; _rc=$?
+  t_eq 'a FILE that cannot be read: said, rc 1, nothing runs' "1|1|0" \
+       "$_rc|$(grep -c 'cannot be read' "$TMPD/missing.out")|$(grep -c '^1\.\.' "$TMPD/missing.out")"
 }
 
 my_lc_main "$@"

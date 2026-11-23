@@ -448,14 +448,22 @@ above. There but unreadable is an error, never the fallback. A key the config
 sets (`STATE_DIR`, `RUNLOG_STATE`) still wins. `my-lc --version` names the exact build: a hash of the
 file itself, plus the commit it was stamped from.
 
-`my-lc --run-tests [agents|daemons] [NAME]` (NAME: only the tests whose name contains it) runs the built-in suite against the
+`my-lc --run-tests [agents|daemons] [NAME]` (NAME: only the tests whose title contains it) runs the built-in suite against the
 real launchd — never mocked — on throwaway services labelled
 `eu.no-panic.my-lc-selftest-<test>-*`, removed again on exit; `daemons` needs root.
 Each test works in a world of its own — its labels, its temp dir, its config,
 plain output — and never reads what is installed for real, so the tests run in
 parallel, one lane per core (ada: 39 s one after another, 9 s in lanes). Each
-reports `ok K - name` (K is its place in the list, whatever order the lanes
-finish in) and then `# <N>s name`, its time.
+reports `ok K - title` (K is its place in the list, whatever order the lanes
+finish in) and then `# <N>s title`, its time.
 Run unprivileged, it leaves `=> enabled` entries for those labels in
 launchd's override database — a fixed set, one per fixture label — which only
 root can clear; the suite prints the commands.
+
+`my-lc --run-tests --list` prints the run list, one `<title> TAB <its
+function>` per test, and runs nothing; `my-lc --run-tests [agents|daemons]
+--titles FILE` runs exactly the tests whose titles FILE lists, one per line — a
+title no test has is said and fails the run. These are the two calls through
+which my-rollout's commit gate runs only the tests a change needs (py/my-rollout's
+README, "A tool adopts the commit gate"). `the suite: static` (shellcheck, the
+run list's guard) reads the source only, so the gate runs it with every change.
