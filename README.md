@@ -467,3 +467,6 @@ title no test has is said and fails the run. These are the two calls through
 which my-rollout's commit gate runs only the tests a change needs (py/my-rollout's
 README, "A tool adopts the commit gate"). `the suite: static` (shellcheck, the
 run list's guard) reads the source only, so the gate runs it with every change.
+`my-lc.sh.tests.links` ties the tests that run my-lc as a program to the
+dispatch and to the verb each drives, which their text does not name. With it
+in the tree, every commit of this folder needs `my-rollout gate sh/my-lc` first.

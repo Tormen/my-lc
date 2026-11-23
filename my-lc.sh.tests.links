@@ -1,0 +1,116 @@
+# my-lc.sh --run-tests --titles: tests tied to a definition they reach only by running
+# my-lc as a program (its own path), so their text names none of it.
+# <definition> TAB <test title> TAB <the case> -- py/my-rollout README, "The commit gate"
+launcher	matrix	runs my-lc as a program: the dispatch and its options
+launcher	hints	runs my-lc as a program: the dispatch and its options
+launcher	version	runs my-lc as a program: the dispatch and its options
+launcher	editdelete	runs my-lc as a program: the dispatch and its options
+launcher	truncate	runs my-lc as a program: the dispatch and its options
+launcher	verbose	runs my-lc as a program: the dispatch and its options
+launcher	plistchecks	runs my-lc as a program: the dispatch and its options
+launcher	loadeddiff	runs my-lc as a program: the dispatch and its options
+launcher	ctrlc	runs my-lc as a program: the dispatch and its options
+launcher	restartrace	runs my-lc as a program: the dispatch and its options
+launcher	chain	runs my-lc as a program: the dispatch and its options
+launcher	failures	runs my-lc as a program: the dispatch and its options
+launcher	sessiontrap	runs my-lc as a program: the dispatch and its options
+launcher	runlog	runs my-lc as a program: the dispatch and its options
+launcher	calendar	runs my-lc as a program: the dispatch and its options
+launcher	stamp	runs my-lc as a program: the dispatch and its options
+launcher	undelete	runs my-lc as a program: the dispatch and its options
+launcher	errcolumn	runs my-lc as a program: the dispatch and its options
+launcher	timefmt	runs my-lc as a program: the dispatch and its options
+launcher	completion	runs my-lc as a program: the dispatch and its options
+launcher	titles	runs my-lc as a program: the dispatch and its options
+my_lc_main	matrix	runs my-lc as a program: the dispatch and its options
+my_lc_main	hints	runs my-lc as a program: the dispatch and its options
+my_lc_main	version	runs my-lc as a program: the dispatch and its options
+my_lc_main	editdelete	runs my-lc as a program: the dispatch and its options
+my_lc_main	truncate	runs my-lc as a program: the dispatch and its options
+my_lc_main	verbose	runs my-lc as a program: the dispatch and its options
+my_lc_main	plistchecks	runs my-lc as a program: the dispatch and its options
+my_lc_main	loadeddiff	runs my-lc as a program: the dispatch and its options
+my_lc_main	ctrlc	runs my-lc as a program: the dispatch and its options
+my_lc_main	restartrace	runs my-lc as a program: the dispatch and its options
+my_lc_main	chain	runs my-lc as a program: the dispatch and its options
+my_lc_main	failures	runs my-lc as a program: the dispatch and its options
+my_lc_main	sessiontrap	runs my-lc as a program: the dispatch and its options
+my_lc_main	runlog	runs my-lc as a program: the dispatch and its options
+my_lc_main	calendar	runs my-lc as a program: the dispatch and its options
+my_lc_main	stamp	runs my-lc as a program: the dispatch and its options
+my_lc_main	undelete	runs my-lc as a program: the dispatch and its options
+my_lc_main	errcolumn	runs my-lc as a program: the dispatch and its options
+my_lc_main	timefmt	runs my-lc as a program: the dispatch and its options
+my_lc_main	completion	runs my-lc as a program: the dispatch and its options
+my_lc_main	titles	runs my-lc as a program: the dispatch and its options
+parse_args	matrix	runs my-lc as a program: the dispatch and its options
+parse_args	hints	runs my-lc as a program: the dispatch and its options
+parse_args	version	runs my-lc as a program: the dispatch and its options
+parse_args	editdelete	runs my-lc as a program: the dispatch and its options
+parse_args	truncate	runs my-lc as a program: the dispatch and its options
+parse_args	verbose	runs my-lc as a program: the dispatch and its options
+parse_args	plistchecks	runs my-lc as a program: the dispatch and its options
+parse_args	loadeddiff	runs my-lc as a program: the dispatch and its options
+parse_args	ctrlc	runs my-lc as a program: the dispatch and its options
+parse_args	restartrace	runs my-lc as a program: the dispatch and its options
+parse_args	chain	runs my-lc as a program: the dispatch and its options
+parse_args	failures	runs my-lc as a program: the dispatch and its options
+parse_args	sessiontrap	runs my-lc as a program: the dispatch and its options
+parse_args	runlog	runs my-lc as a program: the dispatch and its options
+parse_args	calendar	runs my-lc as a program: the dispatch and its options
+parse_args	stamp	runs my-lc as a program: the dispatch and its options
+parse_args	undelete	runs my-lc as a program: the dispatch and its options
+parse_args	errcolumn	runs my-lc as a program: the dispatch and its options
+parse_args	timefmt	runs my-lc as a program: the dispatch and its options
+parse_args	completion	runs my-lc as a program: the dispatch and its options
+parse_args	titles	runs my-lc as a program: the dispatch and its options
+v_start	matrix	runs the start verb through the program
+v_start	hints	runs the start verb through the program
+v_start	loadeddiff	runs the start verb through the program
+v_start	restartrace	runs the start verb through the program
+v_start	failures	runs the start verb through the program
+v_stop	matrix	runs the stop verb through the program
+v_stop	editdelete	runs the stop verb through the program
+v_stop	completion	runs the stop verb through the program
+v_restart	matrix	runs the restart verb through the program
+v_restart	loadeddiff	runs the restart verb through the program
+v_restart	restartrace	runs the restart verb through the program
+v_restart	chain	runs the restart verb through the program
+v_restart	runlog	runs the restart verb through the program
+v_restart	completion	runs the restart verb through the program
+v_run	matrix	runs the run verb through the program
+v_run	plistchecks	runs the run verb through the program
+v_run	loadeddiff	runs the run verb through the program
+v_run	ctrlc	runs the run verb through the program
+v_run	restartrace	runs the run verb through the program
+v_run	failures	runs the run verb through the program
+v_run	sessiontrap	runs the run verb through the program
+v_run	runlog	runs the run verb through the program
+v_run	calendar	runs the run verb through the program
+v_run	completion	runs the run verb through the program
+v_kill	hints	runs the kill verb through the program
+v_kill	ctrlc	runs the kill verb through the program
+v_enable	matrix	runs the enable verb through the program
+v_enable	hints	runs the enable verb through the program
+v_enable	loadeddiff	runs the enable verb through the program
+v_enable	ctrlc	runs the enable verb through the program
+v_enable	restartrace	runs the enable verb through the program
+v_enable	chain	runs the enable verb through the program
+v_enable	failures	runs the enable verb through the program
+v_enable	calendar	runs the enable verb through the program
+v_enable	completion	runs the enable verb through the program
+v_disable	matrix	runs the disable verb through the program
+v_disable	editdelete	runs the disable verb through the program
+v_disable	undelete	runs the disable verb through the program
+v_disable	completion	runs the disable verb through the program
+v_truncate	truncate	runs the truncate verb through the program
+v_truncate	chain	runs the truncate verb through the program
+v_undelete	undelete	runs the undelete verb through the program
+v_delete	editdelete	runs the delete verb through the program
+v_delete	undelete	runs the delete verb through the program
+v_delete	timefmt	runs the delete verb through the program
+v_edit	editdelete	runs the edit verb through the program
+v_edit	loadeddiff	runs the edit verb through the program
+cmd_install	runlog	runs install / uninstall / the collector through the program
+cmd_uninstall	runlog	runs install / uninstall / the collector through the program
+cmd_runlog_collect	runlog	runs install / uninstall / the collector through the program
